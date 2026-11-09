@@ -212,6 +212,12 @@ void GpuSplit::Stop() {
     synced_writer_position = 0;
     last_entry_start = 0;
     back_entry_start = 0;
+    {
+        std::scoped_lock lock{fenced_entries_mutex};
+        fenced_entries.clear();
+        fenced_sealed = 0;
+        fenced_landed.store(0, std::memory_order_release);
+    }
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
     last_any_write = 0;
@@ -237,6 +243,54 @@ void GpuSplit::Stop() {
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
+}
+
+GpuSplit::FencedEntry::~FencedEntry() {
+    split.CompleteFencedEntry(tag);
+}
+
+std::shared_ptr<void> GpuSplit::TrackFencedWrite() {
+    if (!on_back_thread) {
+        return {};
+    }
+    if (!back_fenced_entry) {
+        const u64 tag = EntryTag(back_entry_start);
+        std::scoped_lock lock{fenced_entries_mutex};
+        fenced_entries.push_back({tag});
+        back_fenced_entry = std::make_shared<FencedEntry>(*this, tag);
+    }
+    return back_fenced_entry;
+}
+
+void GpuSplit::PublishFencedEntries() {
+    while (!fenced_entries.empty() && fenced_entries.front().complete) {
+        fenced_entries.pop_front();
+    }
+    // FenceManager normally completes reports in FIFO order. Do not rely on it: a completed
+    // later entry must never retire an earlier unfinished report, even across fence managers.
+    // sealed also covers entries with no deferred reports (including a query dropped on entry).
+    const u64 landed = fenced_entries.empty() ? fenced_sealed
+                                              : std::min(fenced_sealed, fenced_entries.front().tag);
+    fenced_landed.store(landed, std::memory_order_release);
+}
+
+void GpuSplit::CompleteFencedEntry(u64 tag) {
+    std::scoped_lock lock{fenced_entries_mutex};
+    const auto it =
+        std::lower_bound(fenced_entries.begin(), fenced_entries.end(), tag,
+                         [](const auto& pending, u64 value) { return pending.tag < value; });
+    // Stop clears the queue; a callback retained by an earlier start cannot land a new record.
+    if (it == fenced_entries.end() || it->tag != tag) {
+        return;
+    }
+    it->complete = true;
+    PublishFencedEntries();
+}
+
+void GpuSplit::SealFencedEntries(u64 position) {
+    std::scoped_lock lock{fenced_entries_mutex};
+    fenced_sealed = EntryTag(position);
+    PublishFencedEntries();
 }
 
 u64* GpuSplit::ReserveSlow(size_t words) {
@@ -851,6 +905,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
+            // Keep registration open through Execute: an entry can send several reports, and
+            // the first fence can finish before the back has even sent the last one.
+            back_fenced_entry.reset();
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
@@ -863,11 +920,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                SealFencedEntries(read_position);
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
             }
         }
+        SealFencedEntries(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }

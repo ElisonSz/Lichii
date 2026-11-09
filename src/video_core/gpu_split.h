@@ -8,8 +8,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -160,23 +162,17 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
-    /// Back thread: the entry it runs, as NoteFencedWrite takes it; elsewhere nothing.
+    /// Back thread: the entry it runs; elsewhere nothing.
     [[nodiscard]] std::optional<u64> BackEntry() const {
         if (!on_back_thread) {
             return std::nullopt;
         }
         return EntryTag(back_entry_start);
     }
-    /// Any thread: the operation of a report the back sent in `entry` (BackEntry) ran with its
-    /// fence, so the report is in memory, and so are those of the entries before it: fences run
-    /// their operations in order (QueryCacheBase::CounterReport, FenceManager::SignalFence).
-    void NoteFencedWrite(u64 entry) {
-        u64 landed = fenced_landed.load(std::memory_order_relaxed);
-        while (landed <= entry &&
-               !fenced_landed.compare_exchange_weak(landed, entry + 1, std::memory_order_release,
-                                                    std::memory_order_relaxed)) {
-        }
-    }
+    /// Back thread: retain this in each deferred report operation until it finishes or is
+    /// discarded. The entry stays pending until all its reports complete and Execute returns,
+    /// so an early fence cannot land a report the same entry has yet to send.
+    [[nodiscard]] std::shared_ptr<void> TrackFencedWrite();
     /// Marks the calling thread as the GPU thread (the front, or the only one without the split).
     static void MarkGpuThread() {
         on_gpu_thread = true;
@@ -750,7 +746,7 @@ private:
     u64 last_entry_start{}; ///< Where the last entry sent starts
     struct SemaphoreWrite {
         u64 position; ///< write_position once it was sent
-        /// `fenced`: the entry (EntryTag) whose fenced writes must have landed (NoteFencedWrite)
+        /// `fenced`: the entry (EntryTag) whose deferred reports must all have completed
         u64 entry;
         u32 payload;
         bool known;
@@ -784,6 +780,25 @@ private:
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
     u64 back_entry_start{}; ///< Where the entry the back runs starts (BackEntry)
+    struct FencedEntry {
+        FencedEntry(GpuSplit& owner, u64 entry) : split{owner}, tag{entry} {}
+        GpuSplit& split;
+        u64 tag;
+        ~FencedEntry();
+    };
+    std::shared_ptr<FencedEntry> back_fenced_entry;
+    struct PendingFencedEntry {
+        u64 tag;
+        bool complete{};
+    };
+    /// Registration is on the back; completion can run on any fence or cancellation thread.
+    /// The front only reads fenced_landed, never this lock or queue.
+    std::mutex fenced_entries_mutex;
+    std::deque<PendingFencedEntry> fenced_entries;
+    u64 fenced_sealed{}; ///< EntryTag of the position after the last published consumed entry
+    void CompleteFencedEntry(u64 tag);
+    void SealFencedEntries(u64 position);
+    void PublishFencedEntries(); ///< With fenced_entries_mutex held
 
     /// An entry's position as fenced writes name it: with this start of the split in the high
     /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions
@@ -826,8 +841,8 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
-    /// One past the last entry (EntryTag) whose fenced writes landed (NoteFencedWrite): the
-    /// fencing thread writes it, the front reads it.
+    /// Entries before this EntryTag have finished every deferred report or discarded them.
+    /// Published under fenced_entries_mutex, never beyond the back's sealed position.
     alignas(128) std::atomic<u64> fenced_landed{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};

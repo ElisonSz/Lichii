@@ -53,6 +53,7 @@ struct GpuSplitTestAccess {
 
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
+        ++split.starts;
         split.active = true;
         split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
     }
@@ -983,14 +984,14 @@ TEST_CASE("Split counts a fenced semaphore write in memory once its fence ran, n
         split.Stop();
     };
     // A fence-flagged report lands once the fence after it ran (QueryCacheBase::CounterReport),
-    // which tells with the entry the back gave it.
+    // which retains a completion guard until the operation finishes.
     split.Defer([] {});
-    std::optional<u64> entry;
-    split.Defer([&split, &entry] { entry = split.BackEntry(); });
+    std::shared_ptr<void> completion;
+    split.Defer([&split, &completion] { completion = split.TrackFencedWrite(); });
     split.NoteSemaphoreWrite(0x1000, 21, true, Landing::Fenced);
     split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(entry.has_value());
-    REQUIRE(*entry > 0);
+    REQUIRE(completion != nullptr);
+    REQUIRE(split.Starts() > 0);
     REQUIRE_FALSE(split.BackEntry().has_value());
     auto queued = split.QueuedSemaphoreWriteAt(0x1000);
     REQUIRE(queued.has_value());
@@ -1004,10 +1005,11 @@ TEST_CASE("Split counts a fenced semaphore write in memory once its fence ran, n
     REQUIRE(queued.has_value());
     REQUIRE(queued->fenced);
     REQUIRE_FALSE(queued->known);
-    // A fence of an entry before it lands nothing of it; its own lands it.
-    split.NoteFencedWrite(*entry - 1);
+    // Only completion of the retained report retires the entry.
+    auto retained = completion;
+    completion.reset();
     REQUIRE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    split.NoteFencedWrite(*entry);
+    retained.reset();
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
     // Once it landed, a write after it holds the word once the back ran it.
     split.Defer([] {});
@@ -1018,16 +1020,124 @@ TEST_CASE("Split counts a fenced semaphore write in memory once its fence ran, n
     REQUIRE(queued->payload == 23);
     split.Drain(VideoCommon::DrainSite::Other);
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    // A later entry's fence lands the fenced writes of the entries before it.
-    split.Defer([] {});
+    // A later entry cannot retire an earlier operation that has not completed.
+    std::shared_ptr<void> first;
+    std::shared_ptr<void> later;
+    split.Defer([&] { first = split.TrackFencedWrite(); });
     split.NoteSemaphoreWrite(0x2000, 24, true, Landing::Fenced);
-    std::optional<u64> later;
-    split.Defer([&split, &later] { later = split.BackEntry(); });
+    split.Defer([&] { later = split.TrackFencedWrite(); });
+    split.NoteSemaphoreWrite(0x2004, 25, true, Landing::Fenced);
     split.Drain(VideoCommon::DrainSite::Other);
     REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    REQUIRE(later.has_value());
-    split.NoteFencedWrite(*later);
+    REQUIRE(later != nullptr);
+    later.reset();
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x2004).has_value());
+    first.reset();
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2004).has_value());
+}
+
+TEST_CASE("Split keeps a mirror pending until its own fenced report completes",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Landing = VideoCommon::GpuSplit::Landing;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    std::array<std::function<void()>, 2> fences;
+    split.Defer([&] {
+        for (auto& fence : fences) {
+            auto completion = split.TrackFencedWrite();
+            fence = [completion = std::move(completion)]() mutable { completion.reset(); };
+        }
+    });
+    split.NoteSemaphoreWrite(0x1000, 10, true, Landing::Fenced);
+    split.NoteSemaphoreWrite(0x2000, 10, true, Landing::Fenced);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+    fences[0]();
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+    fences[1]();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
+TEST_CASE("Split seals fenced reports and discards stale completions across starts",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Landing = VideoCommon::GpuSplit::Landing;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::shared_ptr<void> old_completion;
+    std::shared_ptr<void> completion;
+    std::atomic<bool> first_done{};
+    std::atomic<bool> send_second{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    SCOPE_EXIT {
+        send_second = true;
+    };
+    REQUIRE(split.TrackFencedWrite() == nullptr);
+    split.Defer([&] {
+        // Its first callback finishes before Execute sends its second report.
+        auto first = split.TrackFencedWrite();
+        first.reset();
+        first_done = true;
+        while (!send_second.load()) {
+            std::this_thread::yield();
+        }
+        completion = split.TrackFencedWrite();
+    });
+    split.NoteSemaphoreWrite(0x3000, 1, true, Landing::Fenced);
+    split.NoteSemaphoreWrite(0x3004, 2, true, Landing::Fenced);
+    split.Publish();
+    while (!first_done.load()) {
+        std::this_thread::yield();
+    }
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
+    send_second = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x3000).has_value());
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
+    // Discarding an operation releases its guard too: it cannot write later.
+    completion.reset();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3000).has_value());
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
+    // A query dropped before queuing an operation still seals when Execute returns.
+    split.Defer([&] { auto dropped = split.TrackFencedWrite(); });
+    split.NoteSemaphoreWrite(0x3010, 3, true, Landing::Fenced);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3010).has_value());
+    split.Defer([&] { old_completion = split.TrackFencedWrite(); });
+    split.NoteSemaphoreWrite(0x3020, 4, true, Landing::Fenced);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
+    split.Stop();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
+    const u32 old_start = split.Starts();
+    Access::Start(split, f.system);
+    REQUIRE(split.Starts() > old_start);
+    split.Defer([&] { completion = split.TrackFencedWrite(); });
+    split.NoteSemaphoreWrite(0x3020, 5, true, Landing::Fenced);
+    split.Drain(VideoCommon::DrainSite::Other);
+    old_completion.reset();
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
+    completion.reset();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
+    // Stop also forgets records whose entry was never published or executed.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x3030, 6, true, Landing::Fenced);
+    split.Stop();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3030).has_value());
 }
 
 TEST_CASE("Split waits for a semaphore write's position, not for the work sent after it",
@@ -1127,7 +1237,8 @@ TEST_CASE("Split's semaphore view decides acquires by the releases and writers q
     split.Defer([] {});
     split.NoteWriter();
     // A fenced release: memory decides once the back ran it, an equal acquire waits for that.
-    split.Defer([] {});
+    std::shared_ptr<void> completion;
+    split.Defer([&] { completion = split.TrackFencedWrite(); });
     split.NoteSemaphoreWrite(0x1008, 7, true, Landing::Fenced);
     split.Publish();
     const u64 writers = split.LastWriterPosition();

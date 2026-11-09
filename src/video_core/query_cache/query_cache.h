@@ -31,6 +31,7 @@
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
 
@@ -257,6 +258,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         streamer_id = static_cast<size_t>(counter_type);
         streamer = impl->streamers[streamer_id];
     }
+    // Even an unmapped query completes its entry's report registration. Retaining this guard
+    // until the operation finishes (or is discarded) keeps every report in the entry pending.
+    const bool immediate =
+        !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
+    auto split_completion =
+        immediate ? std::shared_ptr<void>{} : VideoCommon::GpuSplit::Get().TrackFencedWrite();
     auto cpu_addr_opt = gpu_memory->GpuToCpuAddress(addr);
     if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Request)) {
         LOG_INFO(HW_GPU,
@@ -285,27 +292,21 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     const u64 report_size = has_timestamp ? 16 : 4;
-    const bool immediate =
-        !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
-    // The GPU thread split's back entry this report came in: the front counts the report in
-    // memory once its operation ran with a fence (GpuSplit::NoteFencedWrite). Also when the
-    // operation writes nothing (an invalidated query), as a drain then reads memory as it is.
-    const std::optional<u64> split_entry =
-        immediate ? std::nullopt : VideoCommon::GpuSplit::Get().BackEntry();
     std::function<void()> operation([this, streamer, query_base = query, query_location, pointer,
                                      pointer_timestamp, cpu_addr, addr, asid = gpu_memory->GetID(),
-                                     counter_type, mirrored, report_size, report_noted, split_entry,
-                                     watched = watch != 0 && (addr & ~GPUVAddr{0xf}) == watch] {
+                                     counter_type, mirrored, report_size, report_noted,
+                                     split_completion = std::move(split_completion),
+                                     split_entry = VideoCommon::GpuSplit::Get().BackEntry(),
+                                     watched = watch != 0 &&
+                                               (addr & ~GPUVAddr{0xf}) == watch]() mutable {
         SCOPE_EXIT {
             if (report_noted) {
                 impl->rasterizer.FinishReport(cpu_addr, report_size);
             }
-            if (split_entry) {
-                VideoCommon::GpuSplit::Get().NoteFencedWrite(*split_entry);
-            }
+            split_completion.reset();
         };
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
