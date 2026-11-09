@@ -2079,9 +2079,19 @@ void PipelineCache::EvictUnusedPipelines() {
     // used go first, then the ones used longest ago, down to 7/8 of the budget so that a cache at
     // its budget doesn't evict at every check.
     constexpr u64 DriverBytesPerPipeline = 450'000;
-    static const size_t budget =
-        std::max<size_t>(2000, static_cast<size_t>(Common::GetMemInfo().TotalPhysicalMemory / 4 /
-                                                   DriverBytesPerPipeline));
+    static const size_t budget = [] {
+        // TEST: EDEN_NX2_PIPELINE_BUDGET=<pipelines> sets the budget, so a short run evicts.
+        if (const char* const value = std::getenv("EDEN_NX2_PIPELINE_BUDGET")) {
+            if (const unsigned long long forced = std::strtoull(value, nullptr, 10); forced != 0) {
+                LOG_INFO(Render_Vulkan, "Pipeline budget set by EDEN_NX2_PIPELINE_BUDGET: {}",
+                         forced);
+                return static_cast<size_t>(forced);
+            }
+        }
+        return std::max<size_t>(2000,
+                                static_cast<size_t>(Common::GetMemInfo().TotalPhysicalMemory / 4 /
+                                                    DriverBytesPerPipeline));
+    }();
     size_t built = 0;
     std::vector<std::pair<u64, GraphicsPipeline*>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
