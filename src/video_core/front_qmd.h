@@ -587,21 +587,26 @@ private:
             const bool is_signed = ((flags >> 24) & 1) != 0;
             const u32 value =
                 base ? Tegra::ReduceSemaphore((flags >> 20) & 7, is_signed, *base, payload) : 0;
-            split.NoteSemaphoreWrite(*device, value, base.has_value());
+            split.NoteSemaphoreWrite(*device, value, base.has_value(), GpuSplit::Landing::AtRun,
+                                     false, GpuSplit::SemaphoreWriter::QmdReduction);
             check(*device, value, base.has_value(), false);
         } else if (four_words) {
             // The payload as 64 bits, a timestamp after it.
-            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced);
-            split.NoteSemaphoreWrite(*device + 4, 0, true, GpuSplit::Landing::Fenced);
+            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
+            split.NoteSemaphoreWrite(*device + 4, 0, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
             check(*device, payload, true, false);
             check(*device + 4, 0, true, false);
         } else if (maximum) {
             // Whatever the word held, it holds the payload at least.
             const u32 value = base ? (std::max)(*base, payload) : payload;
-            split.NoteSemaphoreWrite(*device, value, true, !base.has_value());
+            split.NoteSemaphoreWrite(*device, value, true, !base.has_value(),
+                                     GpuSplit::SemaphoreWriter::QmdReduction);
             check(*device, value, true, !base.has_value());
         } else {
-            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced);
+            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
             check(*device, payload, true, false);
         }
         Nx2AcquireStats::NoteRelease(*device, Nx2AcquireStats::Releaser::Qmd);

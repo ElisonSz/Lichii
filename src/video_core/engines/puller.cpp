@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/control/channel_state.h"
@@ -23,6 +24,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -31,6 +33,8 @@
 namespace Tegra::Engines {
 
 namespace {
+
+namespace Details = VideoCommon::Nx2AcquireDetails;
 
 constexpr u32 Gf100BindClassMask = 0xffff;
 constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
@@ -130,12 +134,14 @@ void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
     const auto landing = True(properties & QueryPropertiesFlags::IsAFence)
                              ? VideoCommon::GpuSplit::Landing::Fenced
                              : VideoCommon::GpuSplit::Landing::AtRun;
-    split.NoteSemaphoreWrite(*device, payload, true, landing);
+    split.NoteSemaphoreWrite(*device, payload, true, landing, false,
+                             VideoCommon::GpuSplit::SemaphoreWriter::Puller);
     if (True(properties & QueryPropertiesFlags::HasTimeout)) {
         // The payload as 64 bits (a timestamp follows). A mirrored one into a word with direct
         // releases goes to the mirror's shadow instead, and leaves the high word as it is.
         const bool mirrored = True(properties & QueryPropertiesFlags::Nx2Mirror);
-        split.NoteSemaphoreWrite(*device + 4, 0, !mirrored, landing);
+        split.NoteSemaphoreWrite(*device + 4, 0, !mirrored, landing, false,
+                                 VideoCommon::GpuSplit::SemaphoreWriter::Puller);
     }
 }
 
@@ -186,6 +192,7 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
 
 // Has the back flush the word out of the buffer cache after the work sent before: memory holds
 // it once the back ran the flush (PendingAcquire::flush_position).
+template <bool Track>
 void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, DAddr device) {
     auto& split = VideoCommon::GpuSplit::Get();
     split.Defer(
@@ -202,6 +209,9 @@ void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, DAddr 
         },
         0, VideoCommon::GpuSplit::Writes::Caches);
     acquire.flush_position = split.Position();
+    if constexpr (Track) {
+        acquire.stats_flushed = true;
+    }
     VideoCommon::Count(VideoCommon::g_acquire_stats.flushes);
 }
 
@@ -328,13 +338,19 @@ bool Puller::PendingAcquire::WaitsToReach() const {
 }
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+    return Details::g_enabled ? CanResumeAcquireImpl<true>(dma_pusher)
+                              : CanResumeAcquireImpl<false>(dma_pusher);
+}
+
+template <bool Track>
+bool Puller::CanResumeAcquireImpl(DmaPusher& dma_pusher) {
     if (!pending_acquire || pending_acquire->met) {
         return true;
     }
     auto& stats = VideoCommon::g_acquire_stats;
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
     if (device && ViewApplies()) {
-        pending_acquire->met = PollWithoutDrain(dma_pusher, *device);
+        pending_acquire->met = PollWithoutDrain<Track>(dma_pusher, *device);
         return pending_acquire->met;
     }
     VideoCommon::Count(stats.drained);
@@ -350,9 +366,15 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                      dma_pusher.channel_state.bind_id, pending_acquire->address,
                      pending_acquire->value, current);
         }
+        if constexpr (Track) {
+            Details::NoteResume(this, *pending_acquire, Details::Resume::Drain);
+        }
         return true;
     }
     if (pending_acquire->Matches(current)) {
+        if constexpr (Track) {
+            Details::NoteResume(this, *pending_acquire, Details::Resume::Drain);
+        }
         return true;
     }
     // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
@@ -370,6 +392,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         ReleaseFences(dma_pusher);
         if (Nx2SemaphoreWaiters::Get().Latched(this) ||
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
+            if constexpr (Track) {
+                Details::NoteResume(this, *pending_acquire, Details::Resume::Drain);
+            }
             return true;
         }
     }
@@ -377,6 +402,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     return false;
 }
 
+template <bool Track>
 bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
     using Kind = ViewAnswer::Kind;
     using VideoCommon::DrainSite;
@@ -386,6 +412,9 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
     // A release the back ran latches the waiter, even if a later one changed the word again.
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         VideoCommon::Count(stats.latched);
+        if constexpr (Track) {
+            Details::NoteResume(this, acquire, Details::Resume::Latch);
+        }
         return true;
     }
     if (acquire.split_start != split.Starts()) {
@@ -416,9 +445,14 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
                 VideoCommon::Nx2AcquireStats::NoteQueuedPass(device);
             }
             VideoCommon::Count(stats.passed);
+            if constexpr (Track) {
+                Details::NoteResume(this, acquire,
+                                    answer.kind == Kind::MetByQueued ? Details::Resume::Queued
+                                                                     : Details::Resume::Memory);
+            }
             return true;
         case Kind::Flush:
-            RequestFlush(dma_pusher, acquire, device);
+            RequestFlush<Track>(dma_pusher, acquire, device);
             break;
         case Kind::NotMet:
         case Kind::Unknown:
@@ -436,10 +470,17 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         acquire.last_drain = now;
         VideoCommon::Count(stats.drained);
         VideoCommon::Count(stats.valve_drains);
+        if constexpr (Track) {
+            ++Details::Get().valves[Details::Operation(acquire.operation)];
+        }
         DrainBack(DrainSite::AcquirePoll);
         const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
         if (Nx2SemaphoreWaiters::Get().Latched(this) || acquire.Matches(current)) {
             VideoCommon::Count(stats.valve_passes);
+            if constexpr (Track) {
+                ++Details::Get().valve_passes[Details::Operation(acquire.operation)];
+                Details::NoteResume(this, acquire, Details::Resume::Valve);
+            }
             return true;
         }
         MaybeReleaseFences(dma_pusher, acquire);
@@ -448,6 +489,9 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
     }
     if (!verified &&
         !VerifyWait(dma_pusher, acquire, this, stats.late_polls, DrainSite::AcquirePoll)) {
+        if constexpr (Track) {
+            Details::NoteResume(this, acquire, Details::Resume::Verify);
+        }
         return true;
     }
     VideoCommon::Count(stats.polls);
@@ -547,6 +591,15 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+    if (Details::g_enabled) {
+        ProcessSemaphoreTriggerMethodImpl<true>(dma_pusher);
+    } else {
+        ProcessSemaphoreTriggerMethodImpl<false>(dma_pusher);
+    }
+}
+
+template <bool Track>
+void Puller::ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
@@ -606,7 +659,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        if (AcquireWithoutDrain(dma_pusher, acquire)) {
+        Details::AcquireScope<Track> capture{acquire};
+        SCOPE_EXIT {
+            capture.Finish(acquire, dma_pusher.memory_manager, pending_acquire.has_value());
+        };
+        if (AcquireWithoutDrain<Track>(dma_pusher, acquire, capture.Data())) {
             return;
         }
         auto& stats = VideoCommon::g_acquire_stats;
@@ -669,7 +726,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     }
 }
 
-bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire) {
+template <bool Track, typename Observation>
+bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
+                                 Observation* observed) {
     using Kind = ViewAnswer::Kind;
     using VideoCommon::DrainSite;
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
@@ -697,11 +756,24 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
     bool waited = false;
     for (u32 waits = 0; answer.kind == Kind::Unknown && waits < 2; ++waits) {
         VideoCommon::Count(stats.positioned);
-        if (split.WaitForPosition(answer.position, DrainSite::Acquire)) {
+        bool actually_waited;
+        if constexpr (Track) {
+            auto wait = observed->Begin(split, *device, answer.position, acquire.operation,
+                                        answer.write_dependency);
+            const auto begin = Details::Clock::now();
+            actually_waited = split.WaitForPosition(answer.position, DrainSite::Acquire);
+            observed->End(wait, begin, actually_waited);
+        } else {
+            actually_waited = split.WaitForPosition(answer.position, DrainSite::Acquire);
+        }
+        if (actually_waited) {
             VideoCommon::Count(stats.positioned_waited);
         }
         waited = true;
         answer = AskView(dma_pusher, acquire, *device);
+    }
+    if constexpr (Track) {
+        observed->decision = Details::Decision::Suspended;
     }
     bool pass = false;
     switch (answer.kind) {
@@ -716,6 +788,11 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
             VideoCommon::Nx2AcquireStats::NoteQueuedPass(*device);
         }
         if (pass) {
+            if constexpr (Track) {
+                observed->decision = waited                             ? Details::Decision::Waited
+                                     : answer.kind == Kind::MetByQueued ? Details::Decision::Queued
+                                                                        : Details::Decision::Memory;
+            }
             VideoCommon::Count(stats.passed);
             if (waited) {
                 VideoCommon::Count(stats.after_wait);
@@ -723,17 +800,23 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
         }
         break;
     case Kind::Flush:
-        RequestFlush(dma_pusher, acquire, *device);
+        RequestFlush<Track>(dma_pusher, acquire, *device);
         break;
     case Kind::NotMet:
     case Kind::Unknown:
         break;
     }
     if (!pass && waiters.Latched(this)) {
+        if constexpr (Track) {
+            observed->decision = Details::Decision::Latched;
+        }
         VideoCommon::Count(stats.latched);
         pass = true;
     }
     if (!pass && !VerifyWait(dma_pusher, acquire, this, stats.late, DrainSite::Acquire)) {
+        if constexpr (Track) {
+            observed->decision = Details::Decision::Drained;
+        }
         pass = true;
     }
     if (pass) {

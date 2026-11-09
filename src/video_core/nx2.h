@@ -488,6 +488,14 @@ public:
     static constexpr u32 AcquireEqual = 0x1;
     static constexpr u32 AcquireGequal = 0x4;
     static constexpr u32 AcquireMask = 0x8;
+    enum class Source : u8 {
+        Unknown,
+        PayloadRelease,
+        QueryResult,
+        QmdReduction,
+        QmdMax,
+        Count,
+    };
     /// One per channel suspended at once.
     static constexpr size_t MaxWaiters = 64;
 
@@ -516,7 +524,7 @@ public:
         free_slot->address = device_address;
         free_slot->value = value;
         free_slot->operation = operation;
-        free_slot->latched.store(false, std::memory_order_relaxed);
+        free_slot->latched.store(0, std::memory_order_relaxed);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
         return true;
@@ -542,14 +550,25 @@ public:
         for (const Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
-                return slot.latched.load(std::memory_order_acquire);
+                return slot.latched.load(std::memory_order_acquire) != 0;
             }
         }
         return false;
     }
 
+    /// The first writer that met this waiter, published in the latch itself.
+    [[nodiscard]] Source LatchSource(const void* owner) const {
+        for (const Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+                const u8 latch = slot.latched.load(std::memory_order_acquire);
+                return latch == 0 ? Source::Unknown : static_cast<Source>(latch - 1);
+            }
+        }
+        return Source::Unknown;
+    }
+
     /// A GPU write of value to the u32 at device_address.
-    void OnWrite(u64 device_address, u32 value) {
+    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown) {
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -557,7 +576,12 @@ public:
         for (Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
                 slot.address == device_address && Matches(slot, value)) {
-                slot.latched.store(true, std::memory_order_release);
+                const u8 previous = slot.latched.load(std::memory_order_relaxed);
+                // Keep the first source, and retain the release publication on every matching
+                // write: the acquire sees the engine's preceding writes as before.
+                slot.latched.store(previous != 0 ? previous
+                                                 : static_cast<u8>(static_cast<u8>(source) + 1),
+                                   std::memory_order_release);
             }
         }
     }
@@ -568,7 +592,7 @@ private:
         u64 address{};
         u32 value{};
         u32 operation{};
-        std::atomic<bool> latched{};
+        std::atomic<u8> latched{}; ///< Zero, or Source + 1 of the first matching write
     };
 
     static bool Matches(const Slot& slot, u32 current) {

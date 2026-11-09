@@ -29,6 +29,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -410,7 +411,7 @@ bool GpuSplit::WaitForSync() {
 }
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing,
-                                  bool at_least) {
+                                  bool at_least, SemaphoreWriter writer) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases in memory hold their values.
         std::erase_if(semaphore_writes,
@@ -426,6 +427,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         .known = known,
         .at_least = at_least,
         .fenced = landing == Landing::Fenced,
+        .writer = writer,
     };
     const u64 word = device_address & ~u64{3};
     if (const auto it = semaphore_writes.find(word);
@@ -438,7 +440,17 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.fenced = true;
     }
     semaphore_writes.insert_or_assign(word, write);
-    Nx2AcquireStats::NoteRelease(word, Nx2AcquireStats::Releaser::Puller);
+    Nx2AcquireDetails::NoteWriter(word, writer);
+    using Releaser = Nx2AcquireStats::Releaser;
+    const auto releaser =
+        writer == SemaphoreWriter::Report3D ? Releaser::Report3D
+        : writer == SemaphoreWriter::ReportCompute || writer == SemaphoreWriter::ReductionCompute
+            ? Releaser::ReportCompute
+        : writer == SemaphoreWriter::Copy ? Releaser::Copy
+        : writer == SemaphoreWriter::QmdRelease || writer == SemaphoreWriter::QmdReduction
+            ? Releaser::Qmd
+            : Releaser::Puller;
+    Nx2AcquireStats::NoteRelease(word, releaser);
 }
 
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
@@ -447,8 +459,19 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     if (it == semaphore_writes.end() || InMemory(it->second)) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.at_least,
-                                it->second.fenced, it->second.position};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known,  it->second.at_least,
+                                it->second.fenced,  it->second.writer, it->second.position};
+}
+
+std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::SemaphoreWriteForStats(
+    u64 device_address) const {
+    const auto it = semaphore_writes.find(device_address & ~u64{3});
+    if (it == semaphore_writes.end()) {
+        return std::nullopt;
+    }
+    const auto& write = it->second;
+    return QueuedSemaphoreWrite{write.payload, write.known,  write.at_least,
+                                write.fenced,  write.writer, write.position};
 }
 
 namespace {

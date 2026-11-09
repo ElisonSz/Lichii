@@ -351,7 +351,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (!mirrored && counter_type == QueryType::Payload) {
             shadow.NoteDirectRelease(cpu_addr, addr);
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+            cpu_addr, static_cast<u32>(query_base->value),
+            counter_type == QueryType::Payload ? Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease
+                                               : Tegra::Nx2SemaphoreWaiters::Source::QueryResult);
         if (watched) {
             u32 guest;
             std::memcpy(&guest, pointer, sizeof(guest));
@@ -395,7 +398,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             if (!mirrored) {
                 shadow.NoteDirectRelease(cpu_addr, addr);
             }
-            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+                cpu_addr, payload, Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease);
             if (watch != 0 && (addr & ~GPUVAddr{0xf}) == watch) {
                 u32 guest;
                 std::memcpy(&guest, pointer, sizeof(guest));

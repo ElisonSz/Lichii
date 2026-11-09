@@ -415,13 +415,27 @@ public:
         Fenced, ///< Once the fence signaled after it ran (QueryCacheBase::CounterReport):
                 ///< fence-flagged reports, counter reports
     };
+    /// Diagnostic identity of a noted write; it never participates in the semaphore view.
+    enum class SemaphoreWriter : u8 {
+        Other,
+        Puller,
+        Report3D,
+        ReportCompute,
+        ReductionCompute,
+        QmdRelease,
+        QmdReduction,
+        Copy,
+        Count,
+    };
     /// A semaphore release was just sent: once it landed (`landing`), the word at
     /// `device_address` holds `payload`, or a value the front can't tell (`known` false: a
     /// reduction, a counter report).
     void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known,
-                            Landing landing = Landing::AtRun, bool at_least = false);
-    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least) {
-        NoteSemaphoreWrite(device_address, payload, known, Landing::AtRun, at_least);
+                            Landing landing = Landing::AtRun, bool at_least = false,
+                            SemaphoreWriter writer = SemaphoreWriter::Other);
+    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least,
+                            SemaphoreWriter writer = SemaphoreWriter::Other) {
+        NoteSemaphoreWrite(device_address, payload, known, Landing::AtRun, at_least, writer);
     }
     struct QueuedSemaphoreWrite {
         u32 payload;
@@ -430,11 +444,17 @@ public:
         /// It lands once a fence ran, at no position the front can wait for; or an earlier write
         /// that does may still land after it.
         bool fenced;
+        SemaphoreWriter writer;
         u64 position; ///< Once the back ran this (Ran), the word holds the write, unless `fenced`
     };
     /// The last write sent to the semaphore word at `device_address`, if it may not be in memory
     /// yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
+        u64 device_address) const;
+
+    /// Diagnostic snapshot, including a write that reached memory since the view was asked.
+    /// Only statistics calls this: retiring a write must not erase the cause of a wait.
+    [[nodiscard]] std::optional<QueuedSemaphoreWrite> SemaphoreWriteForStats(
         u64 device_address) const;
 
     /// What the front can tell of a semaphore acquire without waiting for the back (the
@@ -447,8 +467,11 @@ public:
             Unknown,     ///< Memory tells once the back ran the work before `position`
             Flush,       ///< Shaders wrote the word: the buffer cache may hold it newer (Puller)
         };
+        constexpr SemaphoreView(Kind kind_, u64 position_ = 0, bool write_dependency_ = false)
+            : kind{kind_}, write_dependency{write_dependency_}, position{position_} {}
         Kind kind;
-        u64 position{};
+        bool write_dependency; ///< Unknown: position names the noted write to this word
+        u64 position;
     };
     /// The view of an acquire on the word at `device_address`, as far as the writes sent to it
     /// tell. `matches(value)`: whether the word holding `value` meets the acquire. `advances`: a
@@ -473,16 +496,16 @@ public:
             // Writes sent to the word before it are in memory once the back ran it. A
             // greater-or-equal acquire memory meets now meets it then too.
             if (!Ran(queued->position) && !(queued->known && advances)) {
-                return {ViewKind::Unknown, queued->position};
+                return {ViewKind::Unknown, queued->position, true};
             }
         } else if (queued) {
             if (!queued->known) {
-                return {ViewKind::Unknown, queued->position};
+                return {ViewKind::Unknown, queued->position, true};
             }
             if (queued->at_least) {
                 return advances && matches(queued->payload)
                            ? SemaphoreView{ViewKind::MetByQueued}
-                           : SemaphoreView{ViewKind::Unknown, queued->position};
+                           : SemaphoreView{ViewKind::Unknown, queued->position, true};
             }
             if (!matches(queued->payload)) {
                 return {ViewKind::NotMet};
@@ -752,6 +775,7 @@ private:
         bool known;
         bool at_least;
         bool fenced;
+        SemaphoreWriter writer;
     };
     /// The front's NoteSemaphoreWrite, by word address.
     std::unordered_map<u64, SemaphoreWrite> semaphore_writes;

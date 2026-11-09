@@ -418,8 +418,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
-                                *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
-                                             *device, address, guest, value, combine));
+                                *device,
+                                Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
+                                    *device, address, guest, value, combine),
+                                Tegra::Nx2SemaphoreWaiters::Source::QmdReduction);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -452,8 +454,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
-                                *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
-                                             *device, address, guest, value, combine));
+                                *device,
+                                Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
+                                    *device, address, guest, value, combine),
+                                Tegra::Nx2SemaphoreWaiters::Source::QmdMax);
                         }
                         static const GPUVAddr watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -1922,7 +1926,8 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
             }
         }
         split.NoteSemaphoreWrite(*device, base ? ReduceSemaphore(op, false, *base, payload) : 0,
-                                 base.has_value());
+                                 base.has_value(), VideoCommon::GpuSplit::Landing::AtRun, false,
+                                 VideoCommon::GpuSplit::SemaphoreWriter::ReductionCompute);
         return;
     }
     // One word: a fence-flagged report, which lands once its fence ran. Else a payload report
@@ -1930,10 +1935,12 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     const bool one_word = ((control >> 28) & 1) != 0;
     const auto landing =
         one_word ? VideoCommon::GpuSplit::Landing::Fenced : VideoCommon::GpuSplit::Landing::AtRun;
-    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], true, landing);
+    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], true, landing, false,
+                             VideoCommon::GpuSplit::SemaphoreWriter::ReportCompute);
     if (!one_word) {
         // 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, true, landing);
+        split.NoteSemaphoreWrite(*device + 4, 0, true, landing, false,
+                                 VideoCommon::GpuSplit::SemaphoreWriter::ReportCompute);
     }
 }
 

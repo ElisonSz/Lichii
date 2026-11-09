@@ -950,10 +950,12 @@ void DmaPusher::NoteEngineWrites(Engines::EngineTypes type, u32 method) {
         return;
     }
     split.NoteSemaphoreWrite(*device, dma_registers[MaxwellDMA::SemaphoreMethod + 2], true,
-                             VideoCommon::GpuSplit::Landing::Fenced);
+                             VideoCommon::GpuSplit::Landing::Fenced, false,
+                             VideoCommon::GpuSplit::SemaphoreWriter::Copy);
     if (writes.semaphore.size > sizeof(u32)) {
         // The payload as 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, true, VideoCommon::GpuSplit::Landing::Fenced);
+        split.NoteSemaphoreWrite(*device + 4, 0, true, VideoCommon::GpuSplit::Landing::Fenced,
+                                 false, VideoCommon::GpuSplit::SemaphoreWriter::Copy);
     }
 }
 

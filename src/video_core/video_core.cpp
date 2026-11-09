@@ -15,6 +15,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
@@ -64,6 +65,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::ReadQmdViewSwitch();
     VideoCommon::Nx2AcquireStats::ReadSwitch();
+    VideoCommon::Nx2AcquireDetails::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();

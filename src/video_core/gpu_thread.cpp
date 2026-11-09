@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
@@ -87,6 +88,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             VideoCommon::Nx2DrainCheck::MaybeReport();
             VideoCommon::Nx2AcquireStats::MaybeReport();
+            VideoCommon::Nx2AcquireDetails::Report();
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;

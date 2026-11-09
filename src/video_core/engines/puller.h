@@ -97,6 +97,8 @@ public:
         bool fences_released{};
         // The scheduler already polled this acquire before resuming the channel.
         bool met{};
+        bool stats_flushed{}; ///< EDEN_NX2_ACQUIRE_STATS: a cache flush was requested
+        bool stats_resumed{}; ///< The scheduler may ask again before clearing this acquire
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
@@ -165,11 +167,17 @@ private:
     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
+    template <bool Track>
+    void ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher);
+    template <bool Track>
+    bool CanResumeAcquireImpl(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
     /// Decides a Switch 2 acquire from the split's view of the semaphore words: passes it, or
     /// suspends the channel on it. False when the view doesn't apply (drain as before).
-    bool AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire);
+    template <bool Track, typename Observation>
+    bool AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire, Observation* observed);
     /// CanResumeAcquire for an acquire the view decides, at `device`.
+    template <bool Track>
     bool PollWithoutDrain(DmaPusher& dma_pusher, u64 device);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
