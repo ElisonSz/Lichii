@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -877,6 +878,192 @@ TEST_CASE("Split remembers the semaphore writes its back has not run yet",
     split.Drain(VideoCommon::DrainSite::Other);
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
+TEST_CASE("Split counts a fenced semaphore write in memory once its fence ran, not before",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Landing = VideoCommon::GpuSplit::Landing;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // A fence-flagged report lands once the fence after it ran (QueryCacheBase::CounterReport),
+    // which tells with the entry the back gave it.
+    split.Defer([] {});
+    std::optional<u64> entry;
+    split.Defer([&split, &entry] { entry = split.BackEntry(); });
+    split.NoteSemaphoreWrite(0x1000, 21, true, Landing::Fenced);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(entry.has_value());
+    REQUIRE(*entry > 0);
+    REQUIRE_FALSE(split.BackEntry().has_value());
+    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->fenced);
+    REQUIRE(queued->payload == 21);
+    // A write that lands as the back runs it, sent before that fence ran: the word holds either.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 22, true);
+    split.Drain(VideoCommon::DrainSite::Other);
+    queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->fenced);
+    REQUIRE_FALSE(queued->known);
+    // A fence of an entry before it lands nothing of it; its own lands it.
+    split.NoteFencedWrite(*entry - 1);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    split.NoteFencedWrite(*entry);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    // Once it landed, a write after it holds the word once the back ran it.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 23, true);
+    queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE_FALSE(queued->fenced);
+    REQUIRE(queued->payload == 23);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    // A later entry's fence lands the fenced writes of the entries before it.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x2000, 24, true, Landing::Fenced);
+    std::optional<u64> later;
+    split.Defer([&split, &later] { later = split.BackEntry(); });
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+    REQUIRE(later.has_value());
+    split.NoteFencedWrite(*later);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
+TEST_CASE("Split waits for a semaphore write's position, not for the work sent after it",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::array<std::atomic<bool>, 2> release{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in the entries below.
+    SCOPE_EXIT {
+        release[0] = true;
+        release[1] = true;
+    };
+    const auto blocking = [&split](std::atomic<bool>& flag) {
+        split.Defer([&flag] {
+            while (!flag.load()) {
+                std::this_thread::yield();
+            }
+        });
+    };
+    // A release the front can't value (a reduction, a counter) sent by compute work, behind an
+    // entry the back is still in, then more work behind another.
+    blocking(release[0]);
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 0, false);
+    split.NoteWriter();
+    const u64 release_position = split.Position();
+    REQUIRE(split.LastWriterPosition() == release_position);
+    blocking(release[1]);
+    split.Publish();
+    const auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->position == release_position);
+    REQUIRE_FALSE(split.Ran(release_position));
+    std::atomic<bool> done{};
+    bool waited{};
+    std::thread waiter([&] {
+        waited = split.WaitForPosition(release_position, VideoCommon::DrainSite::Acquire);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    REQUIRE_FALSE(done.load());
+    release[0] = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(done.load());
+    waiter.join();
+    REQUIRE(waited);
+    // The release ran; the work after it still runs.
+    REQUIRE(split.Ran(release_position));
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    REQUIRE_FALSE(split.Ran(split.Position()));
+    release[1] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(split.Ran(split.Position()));
+    REQUIRE_FALSE(split.WaitForPosition(release_position, VideoCommon::DrainSite::Acquire));
+}
+
+TEST_CASE("Split's semaphore view decides acquires by the releases and writers queued before them",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Landing = VideoCommon::GpuSplit::Landing;
+    using Kind = VideoCommon::GpuSplit::SemaphoreView::Kind;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::atomic<bool> release{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    SCOPE_EXIT {
+        release = true;
+    };
+    const auto equals = [](u32 value) { return [value](u32 word) { return word == value; }; };
+    const auto at_least = [](u32 value) { return [value](u32 word) { return word >= value; }; };
+    const auto memory = [](u32 value) { return [value] { return value; }; };
+    split.Defer([&release] {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+    });
+    // A known release queued for the word decides an equal acquire, whatever memory holds.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 5, true);
+    // One sent before compute work queued before the acquire doesn't: that work may release the
+    // word unseen (QMD releases). Nor does memory, until the back ran it.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1004, 6, true);
+    split.Defer([] {});
+    split.NoteWriter();
+    // A fenced release: memory decides once the back ran it, an equal acquire waits for that.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1008, 7, true, Landing::Fenced);
+    split.Publish();
+    const u64 writers = split.LastWriterPosition();
+    REQUIRE(split.WritersPending());
+    REQUIRE(split.ViewSemaphore(0x1000, false, 0, equals(5), memory(4)).kind == Kind::MetByQueued);
+    REQUIRE(split.ViewSemaphore(0x1000, false, 0, equals(4), memory(4)).kind == Kind::NotMet);
+    auto view = split.ViewSemaphore(0x1004, false, writers, equals(6), memory(0));
+    REQUIRE(view.kind == Kind::Unknown);
+    REQUIRE(view.position == writers);
+    view = split.ViewSemaphore(0x2000, false, writers, equals(3), memory(3));
+    REQUIRE(view.kind == Kind::Unknown);
+    REQUIRE(view.position == writers);
+    // Greater-or-equal acquires on words that only advance are decided at once.
+    REQUIRE(split.ViewSemaphore(0x2000, true, writers, at_least(3), memory(3)).kind == Kind::Met);
+    REQUIRE(split.ViewSemaphore(0x1008, true, writers, at_least(7), memory(7)).kind == Kind::Met);
+    REQUIRE(split.ViewSemaphore(0x1008, true, writers, at_least(7), memory(6)).kind ==
+            Kind::NotMet);
+    REQUIRE(split.ViewSemaphore(0x1008, false, writers, equals(6), memory(6)).kind ==
+            Kind::Unknown);
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    // Everything ran: memory decides, also on the word whose fenced release hasn't landed.
+    REQUIRE(split.ViewSemaphore(0x1004, false, writers, equals(6), memory(6)).kind == Kind::Met);
+    REQUIRE(split.ViewSemaphore(0x2000, false, writers, equals(3), memory(3)).kind == Kind::Met);
+    REQUIRE(split.QueuedSemaphoreWriteAt(0x1008).has_value());
+    REQUIRE(split.ViewSemaphore(0x1008, false, writers, equals(6), memory(6)).kind == Kind::Met);
+    REQUIRE(split.ViewSemaphore(0x1008, false, writers, equals(7), memory(6)).kind == Kind::NotMet);
 }
 
 TEST_CASE("Split publishes to a back that waits for work after a few words",

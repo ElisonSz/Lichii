@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -289,13 +290,21 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
-    std::function<void()> operation([this, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type, mirrored,
-                                     report_size, report_noted] {
+    // The GPU thread split's back entry this report came in: the front counts the report in
+    // memory once its operation ran with a fence (GpuSplit::NoteFencedWrite). Also when the
+    // operation writes nothing (an invalidated query), as a drain then reads memory as it is.
+    const std::optional<u64> split_entry =
+        immediate ? std::nullopt : VideoCommon::GpuSplit::Get().BackEntry();
+    std::function<void()> operation([this, streamer, query_base = query, query_location, pointer,
+                                     pointer_timestamp, cpu_addr, addr, asid = gpu_memory->GetID(),
+                                     counter_type, mirrored, report_size, report_noted,
+                                     split_entry] {
         SCOPE_EXIT {
             if (report_noted) {
                 impl->rasterizer.FinishReport(cpu_addr, report_size);
+            }
+            if (split_entry) {
+                VideoCommon::GpuSplit::Get().NoteFencedWrite(*split_entry);
             }
         };
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {

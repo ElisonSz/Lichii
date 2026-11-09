@@ -1337,14 +1337,14 @@ void ConcretizeListWords(VideoCommon::GpuSplit& split, VideoCore::RasterizerInte
         release);
 }
 
-// split.WaitUntil for a macro the back runs in the front's place (FrontRunOnBack), counted for the
-// async read-back line (EDEN_NX2_GPU_PROFILE).
+// split.WaitForPosition for a macro the back runs in the front's place (FrontRunOnBack), counted
+// for the async read-back line (EDEN_NX2_GPU_PROFILE).
 bool WaitForBackMacros(VideoCommon::GpuSplit& split, u64 position, VideoCommon::DrainSite site) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
-        return split.WaitUntil(position, site);
+        return split.WaitForPosition(position, site);
     }
     const u64 start = VideoCore::AsyncReadback::Now();
-    const bool waited = split.WaitUntil(position, site);
+    const bool waited = split.WaitForPosition(position, site);
     if (waited) {
         VideoCore::AsyncReadback::CountBackWait(VideoCore::AsyncReadback::Now() - start);
     }
@@ -1519,10 +1519,16 @@ void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& 
         return;
     }
     const bool payload = report.query.report == Regs::ReportSemaphore::Report::Payload;
-    split.NoteSemaphoreWrite(*device, report.payload, payload);
+    // As QueryCacheBase::CounterReport writes it: a payload report without a fence flag as the
+    // back runs it, a short release (fence-flagged) or a counter once a fence ran.
+    const bool fence_flagged =
+        operation == Regs::ReportSemaphore::Operation::Release && report.query.short_query != 0;
+    const auto landing = payload && !fence_flagged ? VideoCommon::GpuSplit::Landing::AtRun
+                                                   : VideoCommon::GpuSplit::Landing::Fenced;
+    split.NoteSemaphoreWrite(*device, report.payload, payload, landing);
     if (report.query.short_query == 0) {
         // 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, payload);
+        split.NoteSemaphoreWrite(*device + 4, 0, payload, landing);
     }
 }
 

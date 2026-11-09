@@ -121,9 +121,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     g_acquire_verify = verify != nullptr && verify[0] == '1';
     g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
     ring = std::make_unique<u64[]>(RingWords);
+    ++starts; // Before the back starts: it tags the entries of fenced writes with it (EntryTag)
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
-    ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
@@ -148,6 +148,8 @@ void GpuSplit::Stop() {
     last_writer_position = 0;
     last_sync_position = 0;
     synced_writer_position = 0;
+    last_entry_start = 0;
+    back_entry_start = 0;
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
     last_any_write = 0;
@@ -257,26 +259,43 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
-void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
+void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {
-        // The words of releases the back ran hold their values in memory.
-        const u64 done = consumed.load(std::memory_order_acquire);
+        // The words of releases in memory hold their values.
         std::erase_if(semaphore_writes,
-                      [done](const auto& entry) { return entry.second.position <= done; });
+                      [this](const auto& entry) { return InMemory(entry.second); });
         semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
     }
-    semaphore_writes.insert_or_assign(device_address & ~u64{3},
-                                      SemaphoreWrite{write_position, payload, known});
+    // The release is in the last entry sent (a copy engine launch in a long multi-method run is
+    // in an earlier piece: its fence then counts it in memory later, never too early).
+    SemaphoreWrite write{
+        .position = write_position,
+        .entry = EntryTag(last_entry_start),
+        .payload = payload,
+        .known = known,
+        .fenced = landing == Landing::Fenced,
+    };
+    const u64 word = device_address & ~u64{3};
+    if (const auto it = semaphore_writes.find(word);
+        !write.fenced && it != semaphore_writes.end() && it->second.fenced &&
+        fenced_landed.load(std::memory_order_acquire) <= it->second.entry) {
+        // A fenced write sent before may land after this one: until it did, the word holds
+        // either.
+        write.entry = it->second.entry;
+        write.known = false;
+        write.fenced = true;
+    }
+    semaphore_writes.insert_or_assign(word, write);
 }
 
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     u64 device_address) const {
     const auto it = semaphore_writes.find(device_address & ~u64{3});
-    if (it == semaphore_writes.end() ||
-        it->second.position <= consumed.load(std::memory_order_acquire)) {
+    if (it == semaphore_writes.end() || InMemory(it->second)) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.fenced,
+                                it->second.position};
 }
 
 namespace {
@@ -609,6 +628,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            back_entry_start = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
@@ -652,13 +672,17 @@ void GpuSplit::ReportAcquire() {
     };
     const u64 passed = take(stats.passed);
     const u64 by_queued = take(stats.by_queued);
+    const u64 after_wait = take(stats.after_wait);
     const u64 latched = take(stats.latched);
+    const u64 suspended = take(stats.suspended);
+    const u64 positioned = take(stats.positioned);
+    const u64 positioned_waited = take(stats.positioned_waited);
+    const u64 flushes = take(stats.flushes);
     const u64 drained = take(stats.drained);
-    const u64 drain_operation = take(stats.drain_operation);
     const u64 drain_settings = take(stats.drain_settings);
     const u64 drain_word = take(stats.drain_word);
-    const u64 drain_queued = take(stats.drain_queued);
     const u64 valve_drains = take(stats.valve_drains);
+    const u64 valve_passes = take(stats.valve_passes);
     const u64 polls = take(stats.polls);
     const u64 acquire_polls = take(stats.acquire_polls);
     const u64 list_polls = take(stats.list_polls);
@@ -668,24 +692,37 @@ void GpuSplit::ReportAcquire() {
     const u64 back_sleeps = take(stats.back_sleeps);
     const double spin_ms = static_cast<double>(take(stats.back_spin_ns)) / 1e6;
     LOG_INFO(HW_GPU,
-             "Acquires: {} passed without a drain ({} by a queued release), {} resumed by a "
-             "latch, {} drained ({} by the 1 ms valve; {} equal or mask, {} by the settings, {} "
-             "unmapped or GPU-written word, {} queued release unknown or short), {} polls waited "
-             "without a drain in 10 s; polls: {} of acquires, {} of GPU-written list copies; "
-             "back: {} waits for work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle "
-             "hooks asked by polls",
-             passed, by_queued, latched, drained, valve_drains, drain_operation, drain_settings,
-             drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
-             spin_ms, early_publishes, settles);
+             "Acquires: {} passed without a drain ({} by a queued release, {} after a positioned "
+             "wait), {} met by a latch, {} suspended, {} positioned waits ({} waited), {} word "
+             "flushes, {} drained ({} by the 1 ms valve, of those {} met; {} by the settings, {} "
+             "unmapped word), {} polls waited without a drain in 10 s; polls: {} of acquires, {} "
+             "of GPU-written list copies; back: {} waits for work, {} slept, {:.1f} ms spinning; "
+             "{} early publishes, {} idle hooks asked by polls",
+             passed, by_queued, after_wait, latched, suspended, positioned, positioned_waited,
+             flushes, drained, valve_drains, valve_passes, drain_settings, drain_word, polls,
+             acquire_polls, list_polls, back_waits, back_sleeps, spin_ms, early_publishes, settles);
     const u64 mismatches = take(stats.mismatches);
-    const u64 unlanded = take(stats.unlanded);
+    const u64 mismatches_waited = take(stats.mismatches_waited);
+    const u64 raced = take(stats.raced);
     const u64 late = take(stats.late);
-    if (mismatches != 0 || unlanded != 0 || late != 0) {
+    const u64 late_polls = take(stats.late_polls);
+    if (!g_acquire_verify) {
+        return;
+    }
+    // A pass of the view the drained word contradicts is an error of the view; the rest is
+    // expected: a fenced release may land during the drain, and waits end at a latch or a poll.
+    if (mismatches != 0) {
         LOG_WARNING(HW_GPU,
-                    "Acquire verify: {} passed but not met after a drain, {} met by a "
-                    "queued release not in memory after it, {} polls waited though a drain meets "
-                    "them, in 10 s",
-                    mismatches, unlanded, late);
+                    "Acquire verify: {} passed but not met after a drain ({} after a positioned "
+                    "wait), {} changed by a fenced release landing during the drain; {} "
+                    "suspended and {} polls kept waiting though a drain meets them, in 10 s",
+                    mismatches, mismatches_waited, raced, late, late_polls);
+    } else {
+        LOG_INFO(HW_GPU,
+                 "Acquire verify: {} passed but not met after a drain ({} after a positioned "
+                 "wait), {} changed by a fenced release landing during the drain; {} suspended "
+                 "and {} polls kept waiting though a drain meets them, in 10 s",
+                 mismatches, mismatches_waited, raced, late, late_polls);
     }
 }
 

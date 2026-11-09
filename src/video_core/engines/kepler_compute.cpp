@@ -1664,12 +1664,12 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
     if (method == 0x6c3) {
-        FrontNoteReport(split, fs, argument);
+        FrontNoteReport(split, fs, argument, false);
     }
 }
 
-void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs,
-                                    u32 control) {
+void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs, u32 control,
+                                    bool from_macro) {
     // SET_REPORT_SEMAPHORE_D was sent: what ProcessNativeReportSemaphore will write on the back.
     const u32 operation = control & 3;
     if (operation != 0 && operation != 2) {
@@ -1681,12 +1681,41 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     if (!device) {
         return;
     }
-    // A reduction combines the payload with the word's value then.
+    // A reduction combines the payload with the word's value then, as the back runs it (the
+    // fence it signals runs it at once while releases land at once). The front knows that value
+    // when no compute or copy work sent since may write the word (QMD releases): from the last
+    // release sent to the word if it is known and lands as the back runs it, or from memory if
+    // nothing queued may change it. A macro's own launches count as work only after it ran
+    // (DmaPusher::NoteWriter). The back reads and writes guest memory, not the mirror's shadow
+    // (Nx2MirrorShadow): a word it diverts may hold another value for acquires, so none is known.
     const bool reduction = ((control >> 3) & 1) != 0;
-    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], !reduction);
-    if (!reduction && ((control >> 28) & 1) == 0) {
+    if (reduction) {
+        const u32 payload = fs.registers[0x6c2];
+        const u32 op = (control >> 9) & 7;
+        std::optional<u32> base;
+        if (!from_macro && !Tegra::Nx2MirrorShadow::Get().Diverts(*device)) {
+            if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
+                if (queued->known && !queued->fenced &&
+                    queued->position >= split.LastWriterPosition()) {
+                    base = queued->payload;
+                }
+            } else if (!split.WritersPending() && !Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+                base = memory_manager.Read<u32>(address);
+            }
+        }
+        split.NoteSemaphoreWrite(*device, base ? ReduceSemaphore(op, false, *base, payload) : 0,
+                                 base.has_value());
+        return;
+    }
+    // One word: a fence-flagged report, which lands once its fence ran. Else a payload report
+    // with a timestamp, written as the back runs it.
+    const bool one_word = ((control >> 28) & 1) != 0;
+    const auto landing =
+        one_word ? VideoCommon::GpuSplit::Landing::Fenced : VideoCommon::GpuSplit::Landing::AtRun;
+    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], true, landing);
+    if (!one_word) {
         // 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, true);
+        split.NoteSemaphoreWrite(*device + 4, 0, true, landing);
     }
 }
 
@@ -1708,7 +1737,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
     if (method == 0x6c3) {
         for (u32 i = 0; i < amount; ++i) {
-            FrontNoteReport(split, fs, base_start[i]);
+            FrontNoteReport(split, fs, base_start[i], false);
         }
     }
 }
@@ -1770,7 +1799,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
         if (address == 0x6c3) {
-            FrontNoteReport(split, fs, value);
+            FrontNoteReport(split, fs, value, true);
         }
         return true;
     };

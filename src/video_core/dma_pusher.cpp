@@ -738,10 +738,12 @@ void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
         return;
     }
     auto& split = VideoCommon::GpuSplit::Get();
-    split.NoteSemaphoreWrite(*device, dma_semaphore[2], true);
+    // Fence-flagged reports (MaxwellDMA::ReleaseSemaphore): they land once their fence ran.
+    constexpr auto landing = VideoCommon::GpuSplit::Landing::Fenced;
+    split.NoteSemaphoreWrite(*device, dma_semaphore[2], true, landing);
     if (type == SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
         // The payload as 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, true);
+        split.NoteSemaphoreWrite(*device + 4, 0, true, landing);
     }
 }
 

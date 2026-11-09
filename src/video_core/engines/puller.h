@@ -79,9 +79,22 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
-        /// When an unmet poll last drained (CanResumeAcquire)
+        /// When a poll last drained (the 1 ms valve, PollWithoutDrain)
         std::chrono::steady_clock::time_point last_drain;
         bool reported; ///< The 2 s warning was logged
+        /// GpuSplit::Starts when the acquire was sent: the positions below are of that start.
+        u32 split_start{};
+        /// GpuSplit::LastWriterPosition when the acquire was sent: compute and copy work before
+        /// it may release the word without the front's knowing (QMD releases).
+        u64 writers_before{};
+        /// A flush of the word out of the buffer cache, sent to the split's back: until the back
+        /// ran it, memory may hold an older value than the cache.
+        std::optional<u64> flush_position{};
+        /// GpuSplit::Position when the acquire was sent, and whether the fence work was sent
+        /// since: once the back ran everything before the acquire and it still waits, as after
+        /// the drain this replaces.
+        u64 sent_at{};
+        bool fences_released{};
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
@@ -151,6 +164,11 @@ private:
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    /// Decides a Switch 2 acquire from the split's view of the semaphore words: passes it, or
+    /// suspends the channel on it. False when the view doesn't apply (drain as before).
+    bool AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire);
+    /// CanResumeAcquire for an acquire the view decides, at `device`.
+    bool PollWithoutDrain(DmaPusher& dma_pusher, u64 device);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
