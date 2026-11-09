@@ -297,8 +297,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         immediate ? std::nullopt : VideoCommon::GpuSplit::Get().BackEntry();
     std::function<void()> operation([this, streamer, query_base = query, query_location, pointer,
                                      pointer_timestamp, cpu_addr, addr, asid = gpu_memory->GetID(),
-                                     counter_type, mirrored, report_size, report_noted,
-                                     split_entry] {
+                                     counter_type, mirrored, report_size, report_noted, split_entry,
+                                     watched = watch != 0 && (addr & ~GPUVAddr{0xf}) == watch] {
         SCOPE_EXIT {
             if (report_noted) {
                 impl->rasterizer.FinishReport(cpu_addr, report_size);
@@ -351,6 +351,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             shadow.NoteDirectRelease(cpu_addr, addr);
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        if (watched) {
+            u32 guest;
+            std::memcpy(&guest, pointer, sizeof(guest));
+            LOG_INFO(HW_GPU,
+                     "Semaphore watch: report landed {:#x} value {:#x} guest {:#x} mirror {} "
+                     "fenced {} entry {:#x}",
+                     addr, static_cast<u32>(query_base->value), guest, mirrored,
+                     True(query_base->flags & QueryFlagBits::IsFence), split_entry.value_or(0));
+        }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -386,6 +395,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 shadow.NoteDirectRelease(cpu_addr, addr);
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            if (watch != 0 && (addr & ~GPUVAddr{0xf}) == watch) {
+                u32 guest;
+                std::memcpy(&guest, pointer, sizeof(guest));
+                LOG_INFO(
+                    HW_GPU,
+                    "Semaphore watch: report immediate {:#x} value {:#x} guest {:#x} mirror {}",
+                    addr, payload, guest, mirrored);
+            }
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY write n={} path=immediate as={} gpu={:#x} device={:#x} type={} "

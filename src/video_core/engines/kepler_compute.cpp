@@ -122,8 +122,19 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 before = memory_manager.Read<u32>(address);
+            const u32 result = ReduceSemaphore(reduction, false, before, payload);
+            memory_manager.Write<u32>(address, result);
+            static const GPUVAddr watch = [] {
+                const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+                return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
+            }();
+            if (watch != 0 && (address & ~GPUVAddr{0xf}) == watch) {
+                LOG_INFO(HW_GPU,
+                         "Semaphore watch: compute report reduction {:#x} op {} payload {:#x} "
+                         "guest {:#x} -> {:#x}",
+                         address, reduction, payload, before, result);
+            }
         });
         return;
     }
@@ -414,7 +425,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                             return text ? u64{std::strtoull(text, nullptr, 16)} : u64{};
                         }();
                         if (watch != 0 && (address & ~u64{0xf}) == watch) {
-                            LOG_INFO(HW_GPU, "Semaphore watch: QMD release reduction {:#x} -> {:#x}", address, value);
+                            LOG_INFO(HW_GPU,
+                                     "Semaphore watch: QMD release reduction {:#x} flags {:#x} "
+                                     "payload {:#x} guest {:#x} -> {:#x}",
+                                     address, flags, payload, guest, value);
                         }
                         VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
                             memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
@@ -439,6 +453,16 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                                 *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
                                              *device, address, guest, value, combine));
+                        }
+                        static const GPUVAddr watch = [] {
+                            const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
+                            return text ? GPUVAddr{std::strtoull(text, nullptr, 16)} : GPUVAddr{};
+                        }();
+                        if (watch != 0 && (address & ~GPUVAddr{0xf}) == watch) {
+                            LOG_INFO(HW_GPU,
+                                     "Semaphore watch: QMD release max {:#x} payload {:#x} "
+                                     "guest {:#x} -> {:#x}",
+                                     address, payload, guest, value);
                         }
                     });
                 } else {

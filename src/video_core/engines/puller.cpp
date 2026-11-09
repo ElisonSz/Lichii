@@ -35,6 +35,14 @@ namespace {
 constexpr u32 Gf100BindClassMask = 0xffff;
 constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
 
+bool WatchSemaphore(GPUVAddr address) {
+    static const GPUVAddr watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+        return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
+    }();
+    return watch != 0 && (address & ~GPUVAddr{0xf}) == watch;
+}
+
 // Reads a semaphore word as a GPU acquire sees it in memory: a mirrored release the guest memory
 // does not hold counts (Nx2MirrorShadow). Without a flush: the buffer cache may hold the word
 // newer where the GPU wrote its page (ReadSemaphoreWord, AskView).
@@ -43,7 +51,12 @@ u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<D
     if (!device) {
         return guest;
     }
-    return Nx2MirrorShadow::Get().Read(*device, guest).value_or(guest);
+    const auto mirrored = Nx2MirrorShadow::Get().Read(*device, guest);
+    if (WatchSemaphore(address)) {
+        LOG_INFO(HW_GPU, "Semaphore watch: memory {:#x} guest {:#x} shadow {} seen {:#x}", address,
+                 guest, mirrored.has_value(), mirrored.value_or(guest));
+    }
+    return mirrored.value_or(guest);
 }
 
 // Reads a semaphore word as a GPU acquire sees it, flushing a GPU-written copy out of the buffer
@@ -52,13 +65,24 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (device && dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
                                                          VideoCommon::CacheType::BufferCache)) {
+        const bool watched = WatchSemaphore(address);
+        const u32 before = watched ? dma_pusher.memory_manager.Read<u32>(address) : 0;
         VideoCommon::GpuSplit::Get().Run(
             [rasterizer = dma_pusher.rasterizer, device = *device] {
                 rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::SemaphoreFlush);
+        if (watched) {
+            LOG_INFO(HW_GPU, "Semaphore watch: drain flush {:#x} guest {:#x} -> {:#x}", address,
+                     before, dma_pusher.memory_manager.Read<u32>(address));
+        }
     }
-    return ReadSemaphoreMemory(dma_pusher, address, device);
+    const u32 value = ReadSemaphoreMemory(dma_pusher, address, device);
+    if (WatchSemaphore(address)) {
+        LOG_INFO(HW_GPU, "Semaphore watch: drained {:#x} guest {:#x} seen {:#x}", address,
+                 dma_pusher.memory_manager.Read<u32>(address), value);
+    }
+    return value;
 }
 
 // With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
@@ -165,8 +189,16 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
 void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, DAddr device) {
     auto& split = VideoCommon::GpuSplit::Get();
     split.Defer(
-        [rasterizer = dma_pusher.rasterizer, device] {
+        [rasterizer = dma_pusher.rasterizer, memory_manager = &dma_pusher.memory_manager, device,
+         address = acquire.address, target = acquire.value,
+         watched = WatchSemaphore(acquire.address)] {
+            const u32 before = watched ? memory_manager->Read<u32>(address) : 0;
             rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+            if (watched) {
+                LOG_INFO(HW_GPU,
+                         "Semaphore watch: view flush {:#x} target {:#x} guest {:#x} -> {:#x}",
+                         address, target, before, memory_manager->Read<u32>(address));
+            }
         },
         0, VideoCommon::GpuSplit::Writes::Caches);
     acquire.flush_position = split.Position();
@@ -233,6 +265,17 @@ bool VerifyPass(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, co
     }
     auto& stats = VideoCommon::g_acquire_stats;
     const bool fenced = FencedWritePending(device);
+    if (WatchSemaphore(acquire.address)) {
+        const u32 guest = dma_pusher.memory_manager.Read<u32>(acquire.address);
+        const auto queued = VideoCommon::GpuSplit::Get().QueuedSemaphoreWriteAt(device);
+        LOG_INFO(HW_GPU,
+                 "Semaphore watch: view pass {:#x} target {:#x} guest {:#x} "
+                 "diverts {} dirty {} queued {} known {} fenced {} after_wait {}",
+                 acquire.address, acquire.value, guest, Nx2MirrorShadow::Get().Diverts(device),
+                 dma_pusher.rasterizer->MustFlushRegion(device, sizeof(u32),
+                                                        VideoCommon::CacheType::BufferCache),
+                 queued.has_value(), queued && queued->known, fenced, after_wait);
+    }
     if (MetAfterDrain(dma_pusher, acquire, waiter, site)) {
         return true;
     }
@@ -507,11 +550,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
-    static const GPUVAddr watch = [] {
-        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-        return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
-    }();
-    if (watch != 0 && (regs.semaphore_address.SemaphoreAddress() & ~GPUVAddr{0xf}) == watch) {
+    if (WatchSemaphore(regs.semaphore_address.SemaphoreAddress())) {
         LOG_INFO(HW_GPU, "Semaphore watch: channel {} as {} device {:#x} op {} {:#x} value {:#x} (now {:#x})",
                  dma_pusher.channel_state.bind_id, dma_pusher.memory_manager.GetID(),
                  dma_pusher.memory_manager.GpuToCpuAddress(regs.semaphore_address.SemaphoreAddress()).value_or(0),
