@@ -219,8 +219,9 @@ public:
     /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
     /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
     void NoteDmaSemaphore(u32 method, u32 argument);
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already).
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
 

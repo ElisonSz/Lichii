@@ -288,8 +288,11 @@ public:
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 argument, bool from_macro);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control,
                          bool from_macro);
+    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

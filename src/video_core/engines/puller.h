@@ -95,6 +95,8 @@ public:
         /// the drain this replaces.
         u64 sent_at{};
         bool fences_released{};
+        // The scheduler already polled this acquire before resuming the channel.
+        bool met{};
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).

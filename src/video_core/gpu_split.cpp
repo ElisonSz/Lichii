@@ -153,6 +153,7 @@ void GpuSplit::Stop() {
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
     last_any_write = 0;
+    last_unplaced_write = 0;
     last_noted_write = 0;
     write_positions.fill(0);
     published_local = 0;
@@ -231,7 +232,7 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             if (BackQuiet()) {
-                publish_every = 8;
+                publish_every = PublishAfterWait;
                 Nx2Profile::AddDrain(site, start);
                 return;
             }
@@ -259,7 +260,8 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
-void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing) {
+void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing,
+                                  bool at_least) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases in memory hold their values.
         std::erase_if(semaphore_writes,
@@ -273,6 +275,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         .entry = EntryTag(last_entry_start),
         .payload = payload,
         .known = known,
+        .at_least = at_least,
         .fenced = landing == Landing::Fenced,
     };
     const u64 word = device_address & ~u64{3};
@@ -294,8 +297,8 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     if (it == semaphore_writes.end() || InMemory(it->second)) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.fenced,
-                                it->second.position};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.at_least,
+                                it->second.fenced, it->second.position};
 }
 
 namespace {
@@ -346,6 +349,19 @@ u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
     return target;
 }
 
+u64 GpuSplit::MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                 u64 size) const {
+    u64 target = last_unplaced_write;
+    if (size > MaxNotedBytes || address + size < address) {
+        target = std::max(target, last_noted_write);
+    } else {
+        ForEachDeviceRange(memory, address, size, [this, &target](DAddr device, u64 bytes) {
+            target = std::max(target, DeviceWritesTarget(device, bytes));
+        });
+    }
+    return std::min(target, write_position);
+}
+
 u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
     u64 target = 0;
     const u64 last = (address + size - 1) >> WriteGranuleBits;
@@ -377,6 +393,8 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            // The back may run out of what was sent before long.
+            publish_every = PublishAfterWait;
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -435,9 +453,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
-    if (writes == Writes::Anywhere) {
-        NoteAnyWrite();
-    }
+    NoteWrites(writes);
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {

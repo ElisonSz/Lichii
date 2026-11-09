@@ -149,3 +149,45 @@ TEST_CASE("Semaphore reductions follow the documented ops", "[video_core][native
     REQUIRE(ReduceSemaphore(6, false, 0b1100, 0b1010) == 0b1110);
     REQUIRE(ReduceSemaphore(7, false, 0b1100, 0b1010) == 0b0110);
 }
+
+TEST_CASE("A QMD scheduler with a table of its own schedules apart from the shared one",
+          "[video_core][native_qmd]") {
+    constexpr Address address = 0x40000;
+    auto qmd = MakeQmd();
+    qmd[4] = 1U << 14; // One dependency
+    SetRelease(qmd, 24, 0x5000, Enable | OneWord, 1);
+    const std::map<Address, Descriptor> memory{{address, qmd}};
+    const auto signal = [&](NativeQmdScheduler& scheduler, Word action) {
+        std::vector<Released> released;
+        const auto error = scheduler.Signal(
+            address, action,
+            [&](Address qmd_address, Descriptor& descriptor) {
+                const auto it = memory.find(qmd_address);
+                if (it == memory.end()) {
+                    return false;
+                }
+                descriptor = it->second;
+                return true;
+            },
+            [&](Address destination, Word payload, Word flags) {
+                released.push_back({destination, payload, flags});
+                return true;
+            });
+        REQUIRE(error.empty());
+        return released;
+    };
+    const std::vector<Released> run{{0x5000, 1, Enable | OneWord}};
+    // Loaded on the shared table, it waits for its dependency.
+    NativeQmdScheduler shared;
+    REQUIRE(signal(shared, 3).empty());
+    // A copy of the table runs it at the decrement as the shared one does, and apart from it.
+    NativeQmdScheduler own{NativeQmdScheduler::OwnTable{}};
+    own.CopyStates(shared);
+    REQUIRE(signal(own, 7) == run);
+    REQUIRE(signal(own, 7).empty()); // Completed: a decrement is kept for its next load
+    REQUIRE(signal(shared, 7) == run);
+    // A table that never saw the load keeps the decrement for it.
+    NativeQmdScheduler other{NativeQmdScheduler::OwnTable{}};
+    REQUIRE(signal(other, 7).empty());
+    REQUIRE(signal(other, 3) == run);
+}

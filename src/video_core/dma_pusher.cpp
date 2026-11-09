@@ -93,10 +93,13 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer([gpu = &system.GPU()] {
-            gpu->FlushCommands();
-            gpu->OnCommandListEnd();
-        });
+        // Submits, and releases the fences done (downloads where the GPU wrote).
+        split.Defer(
+            [gpu = &system.GPU()] {
+                gpu->FlushCommands();
+                gpu->OnCommandListEnd();
+            },
+            0, VideoCommon::GpuSplit::Writes::Caches);
         split.Publish();
         return;
     }
@@ -181,12 +184,16 @@ bool DmaPusher::Step() {
     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
     // waiting forever on a release it never got). The acquire is released now, so the commands
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
+    // The current list's entries before this one ran already, and an entry the acquire suspended
+    // inside reads its remaining words from memory anyway (CanUseSubmittedCommands).
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
+        size_t first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
         for (CommandList& list : dma_pushbuffer) {
             if (!list.submitted_offsets.empty()) {
-                RefreshSnapshot(list, now);
+                RefreshSnapshot(list, now, first_entry);
             }
+            first_entry = 0;
         }
     }
 
@@ -245,12 +252,16 @@ bool DmaPusher::Step() {
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
-                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
-                                 bytes = words * sizeof(u32)] {
-                        engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                    }, VideoCommon::GpuSplit::FastDrawNeutral);
+                    split.Defer(
+                        [engine_state, memory = &memory_manager,
+                         address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
+                            engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
+                        },
+                        VideoCommon::GpuSplit::FastDrawNeutral,
+                        VideoCommon::GpuSplit::Writes::Noted);
                 } else {
-                    engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+                    engine_state->current_dirty =
+                        memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
             }
         }
@@ -636,8 +647,12 @@ void DmaPusher::CallMethod(u32 argument) {
                     }
                 }
             }
+            // A method the engine only keeps for later (its method sink) writes nothing yet.
+            using Writes = VideoCommon::GpuSplit::Writes;
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
-                         WantsSegment() ? &segment : nullptr);
+                         WantsSegment() ? &segment : nullptr,
+                         subchannel->execution_mask[dma_state.method] ? Writes::Anywhere
+                                                                      : Writes::Noted);
             if (engine_type == Engines::EngineTypes::MaxwellDMA) {
                 NoteDmaSemaphore(dma_state.method, argument);
             }
@@ -747,9 +762,10 @@ void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
     }
 }
 
-void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
-    for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+    for (size_t i = first_entry; i < list.command_lists.size() && i < list.submitted_offsets.size();
+         ++i) {
         const CommandListHeader& entry = list.command_lists[i];
         const u32 offset = list.submitted_offsets[i];
         if (offset + entry.size > list.submitted_words.size()) {
@@ -868,10 +884,13 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
                     diag.reads_synced.fetch_add(1, std::memory_order_relaxed);
                     if (split.Active() && Nx2CmdPageDiag::IsDrawPage(page)) {
                         // The back, at this list's place: did work sent before it write the page?
-                        split.Defer([page, begin = static_cast<u32>(*device - page),
-                                     end = static_cast<u32>(*device - page + part.size())] {
-                            Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
-                        }, VideoCommon::GpuSplit::FastDrawNeutral);
+                        split.Defer(
+                            [page, begin = static_cast<u32>(*device - page),
+                             end = static_cast<u32>(*device - page + part.size())] {
+                                Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
+                            },
+                            VideoCommon::GpuSplit::FastDrawNeutral,
+                            VideoCommon::GpuSplit::Writes::Noted);
                     }
                 } else {
                     diag.reads_unknown.fetch_add(1, std::memory_order_relaxed);

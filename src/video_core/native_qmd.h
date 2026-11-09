@@ -36,7 +36,25 @@ public:
     using Word = std::uint32_t;
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
-    struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
+    struct RejectShaderDispatch {
+        bool operator()(const Descriptor&) const {
+            return false;
+        }
+    };
+    /// A scheduler with a table of its own, not the one the channels share: the split GPU thread's
+    /// front runs the scheduling ahead of its back to know what the launches release
+    /// (KeplerCompute).
+    struct OwnTable {};
+    NativeQmdScheduler() = default;
+    explicit NativeQmdScheduler(OwnTable) : table{&own_states} {}
+    NativeQmdScheduler(const NativeQmdScheduler&) = delete;
+    NativeQmdScheduler& operator=(const NativeQmdScheduler&) = delete;
+    /// Takes the QMD states of `other` over, while nothing runs on either.
+    void CopyStates(const NativeQmdScheduler& other) {
+        if (table != other.table) {
+            *table = *other.table;
+        }
+    }
     // Optional diagnostics: called with "load"/"count"/"defer"/"run" events.
     std::function<void(std::string_view, Address, std::int32_t)> trace;
     // Optional diagnostics: called with the QMD, slot and raw words of a release it skips.
@@ -55,8 +73,16 @@ public:
         return Signal(address, argument, read, release, RejectShaderDispatch{});
     }
     template <typename Read, typename Release, typename Dispatch>
-    std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
-        struct Pending { Address address; Word action; Word count; };
+    std::string_view Signal(Address address, Word argument, Read read, Release release,
+                            Dispatch dispatch) {
+        struct Pending {
+            Address address;
+            Word action;
+            Word count;
+        };
+        auto& states = *table;
+        // What `read` returns is used before the next read only: a table entry holds no copy.
+        Descriptor descriptor{};
         std::string_view error;
         std::array<Pending, 256> pending{};
         std::size_t count = 1;
@@ -73,9 +99,11 @@ public:
             auto& state = states[request.address];
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
-                    if (!read(request.address, state.descriptor)) return "unmapped QMD";
-                    const auto& qmd = state.descriptor;
-                    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
+                    if (!read(request.address, descriptor))
+                        return "unmapped QMD";
+                    const auto& qmd = descriptor;
+                    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100))
+                        return "unsupported QMD version or queue";
                     if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>) {
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
                             return "native shader dispatch required";
@@ -102,18 +130,25 @@ public:
             } else {
                 return "unsupported PCAS action";
             }
-            if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0) continue;
-            if (state.dependencies < 0) return "QMD dependency underflow";
+            if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0)
+                continue;
+            if (state.dependencies < 0)
+                return "QMD dependency underflow";
             // The SDK patches release payloads while a scheduled QMD is
             // waiting for its remaining dependencies. Fetch them at execution.
-            if (!read(request.address, state.descriptor)) return "unmapped QMD";
-            const auto qmd = state.descriptor;
-            if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
+            if (!read(request.address, descriptor))
+                return "unmapped QMD";
+            const auto qmd = descriptor;
+            if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100))
+                return "unsupported QMD version or queue";
             // A program Eden can't run is skipped, but the QMD still completes: its releases
             // are what other queues and the CPU wait on (the console never fails a launch).
-            const bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
-            if (!dispatched) error = "native shader dispatch required";
-            if (trace) trace("run", request.address, dispatched ? 1 : 0);
+            const bool dispatched =
+                !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
+            if (!dispatched)
+                error = "native shader dispatch required";
+            if (trace)
+                trace("run", request.address, dispatched ? 1 : 0);
             state.completed = true;
             for (std::size_t slot = 0; slot < ReleaseSlots.size(); ++slot) {
                 const Word base = ReleaseSlots[slot];
@@ -138,13 +173,13 @@ public:
         }
         return error;
     }
+
 private:
     // Release slots (address low, flags | address high, payload). NVN2 patches a third one at
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).
     static constexpr std::array<Word, 3> ReleaseSlots{24, 28, 52};
 
     struct State {
-        Descriptor descriptor{};
         std::int32_t dependencies{};
         std::int32_t deferred{};
         bool loaded{};
@@ -154,6 +189,8 @@ private:
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    static inline std::unordered_map<Address, State> shared_states;
+    std::unordered_map<Address, State> own_states;
+    std::unordered_map<Address, State>* table{&shared_states};
 };
 } // namespace Tegra

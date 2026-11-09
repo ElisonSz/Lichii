@@ -1703,7 +1703,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::FastDrawNeutral);
+                    VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Caches);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -1826,7 +1826,7 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
                 AsyncReadback::MaybeReport();
             }
         },
-        fs.parameters);
+        fs.parameters, VideoCommon::GpuSplit::Writes::Caches);
     const u64 position = split.Position();
     fs.back_last = position;
     const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
@@ -1930,9 +1930,9 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
     };
     if (fs.draw_pending) {
         // A draw, or one an instance loop deferred to this entry (ProcessDirtyRegisters): where
-        // its shaders store, and what the caches download for it, only the back knows.
-        split.NoteAnyWrite();
-        return;
+        // its shaders store, and what the caches download for it, only the back knows. Guest
+        // memory it writes through the caches only.
+        split.NoteCacheWrite();
     }
     if (method >= cb_data && method < cb_data + 16) {
         // FrontWrite and FrontCallMultiMethod advanced the offset past these words already.
@@ -1975,13 +1975,14 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
             (mode == Regs::RenderEnable::Mode::Conditional ||
              mode == Regs::RenderEnable::Mode::IfEqual ||
              mode == Regs::RenderEnable::Mode::IfNotEqual)) {
-            split.NoteAnyWrite();
+            split.NoteCacheWrite();
         }
         break;
     }
     case MAXWELL3D_REG_INDEX(sync_info):
-        // A syncpoint increment: macros read syncpoints through memory too (MemoryManager::Read).
-        split.NoteAnyWrite();
+        // A syncpoint increment: macros read syncpoints through memory too (MemoryManager::Read
+        // of the syncpoint shim), guest memory holds nothing new.
+        split.NoteCacheWrite();
         break;
     default:
         break;

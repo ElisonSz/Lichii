@@ -189,10 +189,14 @@ public:
     void Stop();
 
     /// What the sender of an entry tells about the guest memory the back writes running it, for
-    /// the front's reads of guest memory (WaitForWrites).
+    /// the front's reads of guest memory (WaitForWrites, MemoryWritesTarget).
     enum class Writes : u8 {
         Anywhere, ///< Unknown: a read anywhere waits for the entry
-        Noted,    ///< Nothing, or what the sender notes right after sending it (NoteWrite)
+        /// The GPU caches anywhere (shader stores, copies into buffers), guest memory only through
+        /// them, where GPU work wrote (Nx2MayBeGpuWritten): a read of the caches waits for it, a
+        /// read of other guest memory not (MemoryWritesTarget)
+        Caches,
+        Noted, ///< Nothing, or what the sender notes right after sending it (NoteWrite)
     };
 
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
@@ -209,9 +213,7 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
@@ -224,9 +226,7 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
@@ -243,9 +243,7 @@ public:
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
     /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
     template <typename Func>
@@ -264,9 +262,7 @@ public:
             std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
         }
         Commit(2 + payload);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -289,6 +285,9 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    void PublishSoon() {
+        publish_every = PublishAfterWait;
+    }
     /// The front has nothing to send while it polls suspended channels. A back that ran everything
     /// runs its idle hook (the deferred submit) and sleeps now instead of spinning for more, as it
     /// did when every poll drained (Drain asks for the hook), but without the wait.
@@ -355,10 +354,14 @@ public:
     /// `device_address` holds `payload`, or a value the front can't tell (`known` false: a
     /// reduction, a counter report).
     void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known,
-                            Landing landing = Landing::AtRun);
+                            Landing landing = Landing::AtRun, bool at_least = false);
+    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least) {
+        NoteSemaphoreWrite(device_address, payload, known, Landing::AtRun, at_least);
+    }
     struct QueuedSemaphoreWrite {
         u32 payload;
         bool known;
+        bool at_least;
         /// It lands once a fence ran, at no position the front can wait for; or an earlier write
         /// that does may still land after it.
         bool fenced;
@@ -411,6 +414,11 @@ public:
             if (!queued->known) {
                 return {ViewKind::Unknown, queued->position};
             }
+            if (queued->at_least) {
+                return advances && matches(queued->payload)
+                           ? SemaphoreView{ViewKind::MetByQueued}
+                           : SemaphoreView{ViewKind::Unknown, queued->position};
+            }
             if (!matches(queued->payload)) {
                 return {ViewKind::NotMet};
             }
@@ -435,7 +443,30 @@ public:
     /// The entry just sent may write guest memory anywhere.
     void NoteAnyWrite() {
         last_any_write = write_position;
+        last_unplaced_write = write_position;
     }
+    /// The entry just sent may write the GPU caches anywhere (Writes::Caches).
+    void NoteCacheWrite() {
+        last_any_write = write_position;
+    }
+    void NoteWrites(Writes writes) {
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        } else if (writes == Writes::Caches) {
+            NoteCacheWrite();
+        }
+    }
+    /// The position after the last entry sent that may write guest memory where the front does
+    /// not know (NoteAnyWrite), outside what the caches hold.
+    [[nodiscard]] u64 LastUnplacedWrite() const {
+        return (std::min)(last_unplaced_write, write_position);
+    }
+    /// Once the back ran everything before the position returned, no entry sent so far writes
+    /// guest memory in [address, address + size) of `memory` but through the GPU caches
+    /// (Writes::Caches): what the back reads there without them, as the QMD scheduler does, is in
+    /// memory then. Placed as WaitForWrites places writes.
+    [[nodiscard]] u64 MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                         u64 size) const;
     /// Waits until the back executed every entry sent so far that can write guest memory in
     /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
     /// Writes are placed by the device memory the GPU addresses map to when noted and read: GPU
@@ -468,7 +499,7 @@ private:
     /// share a slot share its position, so a read may wait for a write elsewhere, never miss one.
     static constexpr u32 WriteGranuleBits = 8;
     static constexpr u64 MaxNotedBytes = 0x4000;
-    static constexpr u32 WriteSlotBits = 10;
+    static constexpr u32 WriteSlotBits = 14;
 
     static size_t WriteSlot(u64 granule) {
         return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - WriteSlotBits));
@@ -558,6 +589,7 @@ private:
         u64 entry;
         u32 payload;
         bool known;
+        bool at_least;
         bool fenced;
     };
     /// The front's NoteSemaphoreWrite, by word address.
@@ -566,6 +598,7 @@ private:
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
     /// NoteWrite placed, and the last placed write in each slot's granules.
     u64 last_any_write{};
+    u64 last_unplaced_write{};
     u64 last_noted_write{};
     std::array<u64, size_t{1} << WriteSlotBits> write_positions{};
     u64 published_local{};

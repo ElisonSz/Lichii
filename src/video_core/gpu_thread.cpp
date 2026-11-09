@@ -134,6 +134,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 break;
             }
             if (split.Active()) {
+                split.PublishSoon();
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
@@ -153,19 +154,23 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.DeferFunction(std::move(run->func));
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
-                        rasterizer_ptr->FlushRegion(addr, size);
-                    });
-                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                        rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    split.Defer([rasterizer_ptr, addr = flush->addr,
+                                 size = flush->size] { rasterizer_ptr->FlushRegion(addr, size); },
+                                0, VideoCommon::GpuSplit::Writes::Caches);
+                } else if (const auto* invalidate =
+                               std::get_if<InvalidateRegionCommand>(&next.data)) {
+                    split.Defer(
+                        [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                            rasterizer_ptr->OnCacheInvalidation(addr, size);
+                        },
+                        0, VideoCommon::GpuSplit::Writes::Noted);
                 } else {
                     ASSERT(false);
                 }
-                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
-                    SignalCommand(*state_ptr, fence, block);
-                }, VideoCommon::GpuSplit::FastDrawNeutral);
+                split.Defer([state_ptr = &state, fence = next.fence,
+                             block = next.block] { SignalCommand(*state_ptr, fence, block); },
+                            VideoCommon::GpuSplit::FastDrawNeutral,
+                            VideoCommon::GpuSplit::Writes::Noted);
                 split.Publish();
                 last_progress = std::chrono::steady_clock::now();
                 continue;
