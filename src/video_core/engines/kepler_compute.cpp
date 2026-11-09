@@ -34,6 +34,7 @@
 #include "video_core/native_query_trace.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
@@ -619,6 +620,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                     const u32 slot = Nx2ListIndirect::PlaceholderSlot(resolved[word]);
                     std::array<u32, Nx2ListIndirect::SlotWords> words{};
                     rasterizer->Nx2ReadListSlots(std::span<const u32>{&slot, 1}, words);
+                    Nx2ListIndirect::Stats::Count(Nx2ListIndirect::Stats::Get().grids_read);
                     resolved[word] = words[Nx2ListIndirect::PlaceholderWord(resolved[word])];
                 }
             }
@@ -1565,7 +1567,13 @@ struct ListCallContext {
         Nx2ListIndirect::ReleaseSlot(split, rasterizer, slot);
     }
     void ReadSlots(std::span<const u32> slots, std::span<u32> words) const {
+        const u64 read_start =
+            Nx2ListIndirect::Stats::Enabled() ? Nx2ListIndirect::Stats::NowNs() : 0; // TEST
         Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
+        if (Nx2ListIndirect::Stats::Enabled()) {
+            Nx2ListIndirect::Stats::NoteRead(slots.size(),
+                                             Nx2ListIndirect::Stats::NowNs() - read_start);
+        }
     }
     void SetRegister(u32 method, u32 value) const {
         front_registers[method] = value;
@@ -1713,7 +1721,11 @@ void KeplerCompute::ReleaseFront() {
                                                    front->registers,
                                                    native_registers,
                                                    no_emit};
-        list_front->ConcretizeAll(context, Nx2ListIndirect::GetChannel(native_data_ram));
+        auto& channel = Nx2ListIndirect::GetChannel(native_data_ram);
+        if (!channel.words.empty() || !list_front->Registers().empty()) {
+            Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop); // TEST
+        }
+        list_front->ConcretizeAll(context, channel);
     }
     native_executing_macro = front->executing_macro;
     native_parameters = std::move(front->parameters);
@@ -2072,6 +2084,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                             reason)) {
             fs.parameters.clear();
             return;
+        }
+        if (concretized) {
+            Nx2ListIndirect::Stats::NoteConcretized(reason); // TEST
         }
     }
 #ifdef ARCHITECTURE_x86_64

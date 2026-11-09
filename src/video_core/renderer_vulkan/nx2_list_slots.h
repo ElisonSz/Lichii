@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -87,12 +88,15 @@ class Nx2ListSlots {
             return;
         }
         copies.clear();
+        patch_words.clear(); // TEST
         const DAddr end = device_addr + size;
         for (auto it = owed.lower_bound(device_addr >= 3 ? device_addr - 3 : 0);
              it != owed.end() && it->first < end;) {
             const DAddr word = it->first;
             const u32 value = it->second;
             if (read(word) != value) {
+                Tegra::Nx2ListIndirect::Stats::Count(
+                    Tegra::Nx2ListIndirect::Stats::Get().owed_dropped); // TEST
                 Release(Tegra::Nx2ListIndirect::PlaceholderSlot(value));
                 it = owed.erase(it);
                 continue;
@@ -106,12 +110,18 @@ class Nx2ListSlots {
                     (first - word);
                 copies.push_back(
                     VkBufferCopy{source, offset + (first - device_addr), last - first});
+                patch_words.push_back({value, static_cast<u32>(first - word)}); // TEST
             }
             ++it;
         }
         if (!copies.empty()) {
             ++patched_binds;
+            Tegra::Nx2ListIndirect::Stats::Count(
+                Tegra::Nx2ListIndirect::Stats::Get().patched_binds); // TEST
             RecordCopies(*buffer, dst, copies);
+            if (Tegra::Nx2ListIndirect::Stats::g_check) {
+                CheckPatch(dst);
+            }
         }
     }
 
@@ -129,6 +139,11 @@ class Nx2ListSlots {
         return patched_binds;
     }
 
+    /// TEST: compare the slot snapshot and subsequent GPU uses against the old reader's words.
+    void CheckSnapshot(u32 slot, std::span<const u32> words);
+    /// TEST: compare the indirect arguments of the dispatch just recorded.
+    void CheckDispatch(u32 slot);
+
   private:
     static constexpr u32 NoEntry = ~0U;
     static constexpr u32 SlotWordBytes = Tegra::Nx2ListIndirect::SlotWords * sizeof(u32);
@@ -142,6 +157,31 @@ class Nx2ListSlots {
     /// writes may be read by an earlier dispatch or copy), before every read and write after.
     void RecordCopies(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> regions);
 
+    /// Records a barrier that makes transfer writes visible to the host, after a fence wait.
+    void RecordHostBarrier();
+
+    // TEST (EDEN_NX2_LIST_INDIRECT_CHECK): copies of what the host GPU used, compared with what
+    // the old path would have used once it ran them.
+    struct CheckEntry {
+        Tegra::Nx2ListIndirect::Stats::Check check;
+        u32 slot;
+        u32 bytes;
+        std::array<u8, 12> expected;
+    };
+    struct PatchWord {
+        u32 value; ///< The owed placeholder
+        u32 skip;  ///< Bytes of it before the binding
+    };
+    static constexpr u32 CheckEntries = 1024;
+    static constexpr u32 CheckEntryBytes = 16;
+    /// Records a copy of the `expected.size()` bytes at `src_offset` of `src`, for CheckFlush.
+    void CheckRecord(Tegra::Nx2ListIndirect::Stats::Check check, u32 slot, VkBuffer src,
+                     VkDeviceSize src_offset, std::span<const u8> expected);
+    /// The patch just recorded into `dst` (copies, patch_words).
+    void CheckPatch(VkBuffer dst);
+    /// Waits for the host GPU and compares what CheckRecord copied.
+    void CheckFlush();
+
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
     vk::Buffer buffer;
@@ -152,6 +192,12 @@ class Nx2ListSlots {
     std::unordered_map<DAddr, std::array<u32, 3>> qmd_slots; ///< By QMD device address
     std::vector<VkBufferCopy> copies;
     u64 patched_binds{};
+    // TEST (EDEN_NX2_LIST_INDIRECT_CHECK).
+    std::vector<PatchWord> patch_words;
+    vk::Buffer check_buffer;
+    std::vector<CheckEntry> check_entries;
+    std::array<std::array<u32, 3>, SlotCount> check_words{};
+    std::array<u8, SlotCount> check_counts{}; ///< Words of check_words known (0: none)
 };
 
 } // namespace Vulkan

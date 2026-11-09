@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <utility>
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nx2_list_slots.h"
@@ -9,6 +10,16 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
 namespace Vulkan {
+
+namespace Stats = Tegra::Nx2ListIndirect::Stats; // TEST
+
+namespace {
+/// TEST: the bytes of `words`.
+template <typename T, size_t Extent>
+[[nodiscard]] std::span<const u8> Bytes(std::span<T, Extent> words) {
+    return {reinterpret_cast<const u8*>(words.data()), words.size_bytes()};
+}
+} // Anonymous namespace
 
 void Nx2ListSlots::Release(u32 slot) {
     if (slot >= SlotCount) {
@@ -26,6 +37,7 @@ void Nx2ListSlots::Snapshot(VkBuffer src, u64 src_offset, u32 count, u32 slot) {
         return;
     }
     Prepare();
+    Stats::Count(Stats::Get().snapshots); // TEST
     const VkDeviceSize base = VkDeviceSize{slot} * SlotBytes;
     copies.clear();
     copies.push_back(VkBufferCopy{src_offset, base, VkDeviceSize{count} * 4});
@@ -46,9 +58,15 @@ void Nx2ListSlots::NoteOwed(DAddr device_addr, u32 value, u32 guest_word) {
         Release(Tegra::Nx2ListIndirect::PlaceholderSlot(it->second));
         it = owed.erase(it);
     }
+    if (Stats::g_check && Tegra::Nx2ListIndirect::IsPlaceholder(value)) {
+        // TEST: the upload wrote the placeholder at once (a word it did not write is not owed).
+        Stats::NoteCompared(Stats::Check::Owed, Tegra::Nx2ListIndirect::PlaceholderSlot(value),
+                            Bytes(std::span{&guest_word, 1}), Bytes(std::span{&value, 1}));
+    }
     if (guest_word != value || !Tegra::Nx2ListIndirect::IsPlaceholder(value)) {
         return; // It wrote nothing there
     }
+    Stats::Count(Stats::Get().owed); // TEST
     holds[Tegra::Nx2ListIndirect::PlaceholderSlot(value)].fetch_add(1, std::memory_order_acq_rel);
     owed.emplace(device_addr, value);
 }
@@ -118,23 +136,27 @@ void Nx2ListSlots::Read(std::span<const u32> slots, std::span<u32> words) {
                                           VkDeviceSize{i} * SlotWordBytes, SlotWordBytes});
         }
         RecordCopies(*buffer, *readback, copies);
-        scheduler.Record([](vk::CommandBuffer cmdbuf) {
-            // A fence makes device writes available, not visible to the host.
-            static constexpr VkMemoryBarrier HOST_BARRIER{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                                   HOST_BARRIER);
-        });
+        RecordHostBarrier();
         scheduler.Finish();
         readback.Invalidate();
         const size_t bytes =
             (std::min)(count * SlotWordBytes, words.size_bytes() - first * SlotWordBytes);
         std::memcpy(words.data() + first * Tegra::Nx2ListIndirect::SlotWords,
                     readback.Mapped().data(), bytes);
+    }
+    if (Stats::g_check) {
+        // TEST: the words read back against the list's, and what the checks copied.
+        for (size_t i = 0; i < slots.size() && (i + 1) * SlotWordBytes <= words.size_bytes(); ++i) {
+            const u32 slot = slots[i];
+            if (slot < SlotCount && check_counts[slot] != 0) {
+                const size_t known = check_counts[slot];
+                Stats::NoteCompared(
+                    Stats::Check::Read, slot,
+                    Bytes(words.subspan(i * Tegra::Nx2ListIndirect::SlotWords, known)),
+                    Bytes(std::span{check_words[slot]}.first(known)));
+            }
+        }
+        CheckFlush();
     }
 }
 
@@ -191,6 +213,109 @@ void Nx2ListSlots::RecordCopies(VkBuffer src, VkBuffer dst, std::span<const VkBu
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
     });
+}
+
+void Nx2ListSlots::RecordHostBarrier() {
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        // A fence makes device writes available, not visible to the host.
+        static constexpr VkMemoryBarrier HOST_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_BARRIER);
+    });
+}
+
+void Nx2ListSlots::CheckSnapshot(u32 slot, std::span<const u32> words) {
+    if (slot >= SlotCount || words.empty() || words.size() > Tegra::Nx2ListIndirect::SlotWords ||
+        !buffer) {
+        return;
+    }
+    check_words[slot] = {};
+    std::ranges::copy(words, check_words[slot].begin());
+    check_counts[slot] = static_cast<u8>(words.size());
+    CheckRecord(Stats::Check::Snapshot, slot, *buffer, VkDeviceSize{slot} * SlotBytes,
+                Bytes(words));
+    if (check_entries.size() >= CheckEntries / 2) {
+        CheckFlush(); // At the list's place on the back: between methods
+    }
+}
+
+void Nx2ListSlots::CheckDispatch(u32 slot) {
+    if (slot >= SlotCount || check_counts[slot] != Tegra::Nx2ListIndirect::SlotWords) {
+        return;
+    }
+    const auto& words = check_words[slot];
+    // The grid DispatchNativeCompute dispatches from the words (the width as the slot has it).
+    const std::array<u32, 3> grid{words[0], words[1] & 0xffff, words[2] & 0xffff};
+    if (!(grid[0] && grid[1] && grid[2])) {
+        Stats::Count(Stats::Get().empty_grids);
+    }
+    if (grid[0] >> 31) {
+        Stats::Count(Stats::Get().wide_grids);
+    }
+    CheckRecord(Stats::Check::Dispatch, slot, *buffer,
+                VkDeviceSize{slot} * SlotBytes + DispatchOffset, Bytes(std::span{grid}));
+}
+
+void Nx2ListSlots::CheckPatch(VkBuffer dst) {
+    for (size_t i = 0; i < copies.size() && i < patch_words.size(); ++i) {
+        const u32 slot = Tegra::Nx2ListIndirect::PlaceholderSlot(patch_words[i].value);
+        const u32 word = Tegra::Nx2ListIndirect::PlaceholderWord(patch_words[i].value);
+        if (slot >= SlotCount || word >= check_counts[slot]) {
+            continue;
+        }
+        const auto bytes = Bytes(std::span{&check_words[slot][word], 1})
+                               .subspan(patch_words[i].skip, copies[i].size);
+        CheckRecord(Stats::Check::Patch, slot, dst, copies[i].dstOffset, bytes);
+    }
+}
+
+void Nx2ListSlots::CheckRecord(Stats::Check check, u32 slot, VkBuffer src, VkDeviceSize src_offset,
+                               std::span<const u8> expected) {
+    if (check_entries.size() >= CheckEntries || expected.size() > CheckEntryBytes) {
+        Stats::Count(Stats::Get().unchecked);
+        return;
+    }
+    if (!check_buffer) {
+        check_buffer = memory_allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = VkDeviceSize{CheckEntries} * CheckEntryBytes,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            },
+            MemoryUsage::Download);
+    }
+    CheckEntry entry{check, slot, static_cast<u32>(expected.size()), {}};
+    std::memcpy(entry.expected.data(), expected.data(), expected.size());
+    const VkBufferCopy copy{src_offset, VkDeviceSize{check_entries.size()} * CheckEntryBytes,
+                            expected.size()};
+    check_entries.push_back(entry);
+    RecordCopies(src, *check_buffer, std::span{&copy, 1});
+}
+
+void Nx2ListSlots::CheckFlush() {
+    if (check_entries.empty()) {
+        return;
+    }
+    RecordHostBarrier();
+    scheduler.Finish();
+    check_buffer.Invalidate();
+    const std::span<const u8> data = std::as_const(check_buffer).Mapped();
+    for (size_t i = 0; i < check_entries.size(); ++i) {
+        const CheckEntry& entry = check_entries[i];
+        Stats::NoteCompared(entry.check, entry.slot, data.subspan(i * CheckEntryBytes, entry.bytes),
+                            std::span{entry.expected}.first(entry.bytes));
+    }
+    check_entries.clear();
 }
 
 } // namespace Vulkan

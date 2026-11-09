@@ -31,6 +31,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1329,10 +1330,14 @@ void ConcretizeListWords(VideoCommon::GpuSplit& split, VideoCore::RasterizerInte
     if (!Nx2ListIndirect::MayRead(reads.data_ram_known, reads.data_ram, channel.words)) {
         return;
     }
+    Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Macro3d); // TEST
     Nx2ListIndirect::ConcretizeDataRam(
         channel.words, data_ram,
         [&](std::span<const u32> slots, std::span<u32> words) {
+            const u64 read_start = Nx2ListIndirect::Stats::NowNs(); // TEST
             Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
+            Nx2ListIndirect::Stats::NoteRead(slots.size(),
+                                             Nx2ListIndirect::Stats::NowNs() - read_start);
         },
         release);
 }
@@ -1389,6 +1394,7 @@ void Maxwell3D::ReleaseFront() {
     if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
         channel != nullptr && !channel->words.empty()) {
         auto& split = VideoCommon::GpuSplit::Get();
+        Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop); // TEST
         Nx2ListIndirect::ConcretizeDataRam(
             channel->words, std::span<u32>{native_data_ram},
             [&](std::span<const u32> slots, std::span<u32> words) {

@@ -189,6 +189,11 @@ public:
     /// The back: the words of `slots`, three each, read back from the host GPU (waits for it).
     virtual void Nx2ReadListSlots([[maybe_unused]] std::span<const u32> slots,
                                   [[maybe_unused]] std::span<u32> words) {}
+    /// TEST (EDEN_NX2_LIST_INDIRECT_CHECK), the back, right after Nx2SnapshotListWords: the
+    /// words the front read as before for that list, for what the host GPU uses of the slot to
+    /// be compared with.
+    virtual void Nx2CheckListSlot([[maybe_unused]] u32 slot,
+                                  [[maybe_unused]] std::span<const u32> words) {}
 
     virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
         for (const DAddr page : pages) {
