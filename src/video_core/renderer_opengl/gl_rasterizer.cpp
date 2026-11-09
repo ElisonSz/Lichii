@@ -22,6 +22,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_opengl/gl_device.h"
 #include "video_core/renderer_opengl/gl_query_cache.h"
@@ -396,6 +397,12 @@ void RasterizerOpenGL::DrawTexture() {
 }
 
 void RasterizerOpenGL::DispatchCompute() {
+    // As after a draw, serve sync requests once dispatch resources and cache locks are released.
+    SCOPE_EXIT {
+        if (VideoCommon::GpuSplit::TickEnabled()) {
+            gpu.TickWork();
+        }
+    };
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};
     if (!pipeline) {

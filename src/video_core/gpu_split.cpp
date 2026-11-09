@@ -74,6 +74,13 @@ void Pause() {
     return "an engine";
 }
 
+bool BackTickEnabled() {
+    const char* const value = std::getenv("EDEN_NX2_BACK_TICK");
+    return value == nullptr || value[0] != '0';
+}
+
+std::atomic<bool> g_back_tick_enabled{BackTickEnabled()};
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -114,6 +121,34 @@ void GpuSplit::CheckOwner(const char* where) {
 }
 
 GpuSplit GpuSplit::instance;
+
+void GpuSplit::ReadTickSwitch() {
+    g_back_tick_enabled.store(BackTickEnabled(), std::memory_order_relaxed);
+}
+
+bool GpuSplit::TickEnabled() {
+    return g_back_tick_enabled.load(std::memory_order_relaxed);
+}
+
+void GpuSplit::RequestTick() {
+    if (!TickEnabled()) {
+        return;
+    }
+    u64 state = tick_state.load(std::memory_order_relaxed);
+    const u64 generation = state & ~(TickAccepting | TickRequested);
+    do {
+        if ((state & TickAccepting) == 0 ||
+            (state & ~(TickAccepting | TickRequested)) != generation) {
+            return;
+        }
+    } while (!tick_state.compare_exchange_weak(
+        state, state | TickRequested, std::memory_order_seq_cst, std::memory_order_relaxed));
+    // Paired with the back's check after setting back_waiting: one side sees the other.
+    if (back_waiting.load(std::memory_order_seq_cst)) {
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
+    }
+}
 
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
@@ -734,6 +769,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    tick_state.store(tick_state.load(std::memory_order_relaxed) + TickGeneration + TickAccepting,
+                     std::memory_order_release);
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -747,6 +784,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
+        MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
@@ -759,7 +797,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                                        : std::chrono::steady_clock::time_point{};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
-                                !hook_requested.load(std::memory_order_relaxed);
+                                !hook_requested.load(std::memory_order_relaxed) &&
+                                (tick_state.load(std::memory_order_relaxed) & TickRequested) == 0;
                  ++spins) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
@@ -789,9 +828,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 back_waiting.store(true, std::memory_order_seq_cst);
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 available = published.load(std::memory_order_seq_cst);
-                // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
+                // Idle-hook and tick requests made since the hooks ran must prevent sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
-                    !hook_requested.load(std::memory_order_seq_cst)) {
+                    !hook_requested.load(std::memory_order_seq_cst) &&
+                    (tick_state.load(std::memory_order_seq_cst) & TickRequested) == 0) {
                     Count(g_acquire_stats.back_sleeps);
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
@@ -816,6 +856,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook(idle_argument);
             }
+            // Serve a guest read before the next entry, even with more work queued on the front.
+            MaybeTick();
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
             if ((read_position - last_store >= 4096 ||
@@ -829,6 +871,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }
+    // Stop accepting ticks before leaving. A reader still has its normal queued GPU tick:
+    // it runs on the front after a settings stop, or #1058 releases it at final shutdown.
+    tick_state.fetch_and(~(TickAccepting | TickRequested), std::memory_order_seq_cst);
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();

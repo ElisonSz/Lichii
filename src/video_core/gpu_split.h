@@ -202,6 +202,18 @@ public:
         wake.notify_one();
     }
 
+    /// Set before the GPU threads start, cleared after they have joined.
+    void SetTickHook(void (*hook)(void*), void* argument) {
+        tick_hook = hook;
+        tick_argument = argument;
+    }
+    /// Any thread: ask the back to tick after its current entry, or wake it if idle. Callers
+    /// also queue a normal GPU tick, which serves requests when the split stops or is disabled.
+    void RequestTick();
+    /// Reload EDEN_NX2_BACK_TICK after the frontend loads nx2_switches.txt.
+    static void ReadTickSwitch();
+    [[nodiscard]] static bool TickEnabled();
+
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
     /// commands read without cache flushes). Called by the front between commands.
     void MaybeStart(Core::System& system);
@@ -709,7 +721,19 @@ private:
     }
 
     void BackLoop(std::stop_token stop_token);
-    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
+    /// The back, between entries. Ticking may record deferred work even when the ring is empty.
+    void MaybeTick() {
+        if ((tick_state.load(std::memory_order_relaxed) & TickRequested) == 0) {
+            return;
+        }
+        const u64 state = tick_state.fetch_and(~TickRequested, std::memory_order_acquire);
+        if ((state & TickRequested) != 0 && tick_hook != nullptr) {
+            back_quiet.store(false, std::memory_order_seq_cst);
+            tick_hook(tick_argument);
+        }
+    }
+    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its
+    /// size.
     size_t Execute(const u64* entry, size_t words);
 
     Core::System* system{};
@@ -786,6 +810,14 @@ private:
     static inline thread_local bool on_gpu_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    void (*tick_hook)(void*){};
+    void* tick_argument{};
+    // One state arbitrates requests with back exit. Each start advances the generation, so a
+    // caller delayed across Stop/Start cannot leave a request for the next back thread.
+    static constexpr u64 TickAccepting = 1;
+    static constexpr u64 TickRequested = 2;
+    static constexpr u64 TickGeneration = 4;
+    std::atomic<u64> tick_state{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
     std::atomic<bool> back_quiet{true};
