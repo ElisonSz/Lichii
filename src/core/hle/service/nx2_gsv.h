@@ -1792,12 +1792,50 @@ private:
         TipcHandshake(ctx, "nx2:vi2");
     }
 
+    // EDEN_NX2_FPS_LOG, or EDEN_NX2_GPU_PROFILE next to the GPU threads' numbers: the game's frame
+    // rate every 10 s from its presents, with the mean and the worst time between two of them and
+    // how many took longer than 1/30 s (frames the player sees as stutter at 60 fps).
+    void ReportFrameRate() {
+        static const bool enabled = std::getenv("EDEN_NX2_FPS_LOG") != nullptr ||
+                                    std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+        if (!enabled) {
+            return;
+        }
+        using Clock = std::chrono::steady_clock;
+        const Clock::time_point now = Clock::now();
+        FrameRateWindow& window = m_frame_rate;
+        if (window.start == Clock::time_point{}) {
+            window = {.start = now, .last = now};
+            return;
+        }
+        const Clock::duration interval = now - window.last;
+        window.last = now;
+        ++window.frames;
+        window.worst = (std::max)(window.worst, interval);
+        if (interval > std::chrono::microseconds{33'333}) {
+            ++window.slow;
+        }
+        const Clock::duration length = now - window.start;
+        if (length < std::chrono::seconds{10}) {
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(length).count();
+        const double frames = static_cast<double>(window.frames);
+        LOG_INFO(Service,
+                 "Frame rate: {:.1f} fps over {:.1f} s ({} frames), frame time mean {:.2f} ms, "
+                 "worst {:.1f} ms, {} longer than 33.3 ms",
+                 frames / seconds, seconds, window.frames, seconds * 1000.0 / frames,
+                 std::chrono::duration<double, std::milli>(window.worst).count(), window.slow);
+        window = {.start = now, .last = now};
+    }
+
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
     // at once (changes.patch's default mask is 0x7fff).
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        ReportFrameRate();
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
@@ -2587,6 +2625,14 @@ private:
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
+    struct FrameRateWindow {
+        std::chrono::steady_clock::time_point start{};
+        std::chrono::steady_clock::time_point last{};
+        u64 frames{};
+        u64 slow{};
+        std::chrono::steady_clock::duration worst{};
+    };
+    FrameRateWindow m_frame_rate{}; // ReportFrameRate
     u64 m_shown_layout{}; // image and crop size last logged
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
