@@ -402,11 +402,12 @@ void OnPresent() {
         // Ticks and count are separate atomics: a run can land in one frame's ticks and the next
         // frame's count, so each adds up on its own.
         const u64 count = site_counts[index] - (std::min)(site_counts[index], last_site_counts[index]);
-        const u64 ticks = site_ticks[index] - (std::min)(site_ticks[index], last_site_ticks[index]);
-        if (count == 0 && ticks == 0) {
+        const u64 run_ticks =
+            site_ticks[index] - (std::min)(site_ticks[index], last_site_ticks[index]);
+        if (count == 0 && run_ticks == 0) {
             continue;
         }
-        const double ms = static_cast<double>(ticks) * ms_per_tick;
+        const double ms = static_cast<double>(run_ticks) * ms_per_tick;
         state.window_site_counts[index] += count;
         state.window_site_ms[index] += ms;
         sites += fmt::format("{}{}:{}x{:.1f}", sites.empty() ? "" : ",", site_names[index], count, ms);
