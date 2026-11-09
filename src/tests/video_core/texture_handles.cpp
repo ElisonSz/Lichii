@@ -486,6 +486,35 @@ TEST_CASE("Handle tables are read for every element at once", "[video_core][text
     }
 }
 
+TEST_CASE("Handle tables read storage buffers past binding 31 from their own base",
+          "[video_core][texture_handles]") {
+    // Native programs bind up to Info::MAX_SSBOS storage buffers (Ocarina of Time binds 37).
+    // Each buffer's base is read once for all the elements, tracked by a mask of the bindings
+    // read so far. With 32 bits, binding 33 took binding 1's bit and read no base.
+    constexpr GPUVAddr cbuf = 0x1000;
+    HandleTestMemory memory;
+    Shader::Info info;
+    for (u32 binding = 0; binding < 34; ++binding) {
+        info.storage_buffers_descriptors.push_back(
+            {.cbuf_index = 0, .cbuf_offset = 0x10 * binding, .count = 1, .is_written = false});
+        memory.words[cbuf + 0x10 * binding] = 0x10000 + 0x100 * binding; // the buffer address
+        memory.words[cbuf + 0x10 * binding + 4] = 0;
+        memory.words[0x10000 + 0x100 * binding] = binding; // the word each buffer holds
+    }
+    using Op = Shader::HandleOp;
+    // Binding 1's first word plus binding 33's.
+    info.handle_programs.push_back({static_cast<u32>(Op::Immediate), 0U,
+                                    static_cast<u32>(Op::Storage), 1U,
+                                    static_cast<u32>(Op::Immediate), 0U,
+                                    static_cast<u32>(Op::Storage), 33U, static_cast<u32>(Op::Add)});
+    const auto cbuf_address = [](u32 index) -> GPUVAddr { return index == 0 ? cbuf : 0; };
+    std::vector<u32> handles;
+    VideoCommon::EvaluateTextureHandles(info, 0, memory, cbuf_address, 0, 2,
+                                        [&handles](u32, u32 handle) { handles.push_back(handle); });
+    CHECK(handles == std::vector<u32>{34, 34});
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 0) == 34U);
+}
+
 namespace {
 // A light loop's shadow map handle: each invocation reads a light index from its own list, at an
 // address only it knows, then the handle of that light from a table of 96-byte entries.
