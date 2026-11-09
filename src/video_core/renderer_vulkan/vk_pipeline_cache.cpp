@@ -26,6 +26,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -2003,7 +2004,14 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
-    while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
+    // Destroying a pipeline costs the driver time, and an eviction can free thousands at once:
+    // 3,086 in Ocarina of Time after standing in one place in Hyrule Field, and those 10 s had a
+    // 375 ms frame against 20 to 26 ms before (AMD, Windows). A few go each frame instead, 4,800
+    // until the next eviction check 600 frames later.
+    constexpr size_t MaxDestroyedPerFrame = 8;
+    for (size_t destroyed = 0; destroyed < MaxDestroyedPerFrame && !evicted_pipelines.empty() &&
+                               scheduler.IsFree(evicted_pipelines.front().first);
+         ++destroyed) {
         evicted_pipelines.pop_front();
     }
     while (!retired_compute_pipelines.empty() &&
@@ -2030,33 +2038,46 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
-    // (~8.5 ms each) plus a driver pipeline cache hit.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // with every place a session went (title 1: 1,500 on its title screen alone). Rebuilding an
+    // evicted one costs a full shader translation on the GPU thread (~8.5 ms each) plus a driver
+    // pipeline cache hit, while draws wait for it: going back to a place built its shaders again,
+    // and evicting every pipeline unused for 9000 frames threw away what shader cache v2 prebuilt
+    // at boot (Ocarina, standing in Hyrule Field: 3,086 at once). Pipelines go only once the built
+    // ones would hold more than a quarter of the system's memory: about 9,500 with 16 GiB and
+    // 19,000 with 32 GiB, where Ocarina's whole cache is about 24,000. The prebuilt ones no draw
+    // used go first, then the ones used longest ago, down to 7/8 of the budget so that a cache at
+    // its budget doesn't evict at every check.
+    constexpr u64 DriverBytesPerPipeline = 450'000;
+    static const size_t budget =
+        std::max<size_t>(2000, static_cast<size_t>(Common::GetMemInfo().TotalPhysicalMemory / 4 /
+                                                   DriverBytesPerPipeline));
+    size_t built = 0;
+    std::vector<std::pair<u64, GraphicsPipeline*>> candidates;
+    for (const auto& [key, pipeline] : graphics_cache) {
+        if (pipeline == nullptr || !pipeline->IsBuilt()) {
+            continue;
+        }
+        ++built;
+        if (pipeline.get() != current_pipeline) {
+            candidates.emplace_back(pipeline->WasUsed() ? pipeline->LastUse() + 1 : 0,
+                                    pipeline.get());
+        }
+    }
+    if (built <= budget) {
         return;
     }
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    const size_t to_evict = std::min(candidates.size(), built - budget * 7 / 8);
+    std::ranges::sort(candidates, {}, &std::pair<u64, GraphicsPipeline*>::first);
+    std::unordered_set<const GraphicsPipeline*> evict;
+    evict.reserve(to_evict);
+    for (size_t index = 0; index < to_evict; ++index) {
+        evict.insert(candidates[index].second);
+    }
     const u64 tick = scheduler.CurrentTick();
-    // ~0.9 GB of driver memory at ~0.45 MB each.
-    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
-    size_t kept_prebuilt = 0;
     size_t evicted = 0;
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
-            ++it;
-            continue;
-        }
-        // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
-        // budget: evicting it throws the prebuild away, and the game translates it again on the
-        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
-        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
-        // large cache can't hold their driver memory for the whole session.
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
+        if (!evict.contains(pipeline)) {
             ++it;
             continue;
         }
@@ -2075,8 +2096,10 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} graphics pipelines, least recently used first: {} were built, over the "
+             "budget of {} ({} MiB of driver memory at ~0.45 MB each); {} left",
+             evicted, built, budget, budget * DriverBytesPerPipeline >> 20, graphics_cache.size());
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the
