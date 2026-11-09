@@ -2180,10 +2180,11 @@ void RasterizerVulkan::DispatchCompute() {
         }
         const auto [args_buffer, args_offset] = slots.DispatchArguments(*list_slot);
         scheduler.RequestOutsideRenderPassOperationContext();
-        record_read_barrier();
+        scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, byte_addressed_shadow, indirect_buffer = args_buffer,
                           indirect_offset = args_offset](vk::CommandBuffer cmdbuf) {
+            RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
                 return;
             }
