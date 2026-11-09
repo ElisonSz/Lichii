@@ -184,6 +184,8 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/nx2_list_slots.cpp
     renderer_vulkan/nx2_list_slots.h
+    renderer_vulkan/pipeline_recipe.cpp
+    renderer_vulkan/pipeline_recipe.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h

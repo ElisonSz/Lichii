@@ -29,6 +29,7 @@
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
+#include "video_core/renderer_vulkan/pipeline_recipe.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/video_core.h"
 
@@ -59,6 +60,7 @@ namespace VideoCore {
 /// @brief Creates an emulated GPU instance using the given system context.
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
+    Vulkan::PipelineKeep::ReadSwitch();
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::ReadQmdViewSwitch();
     VideoCommon::Nx2AcquireStats::ReadSwitch();

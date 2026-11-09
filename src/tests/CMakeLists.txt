@@ -76,6 +76,7 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/pipeline_recipe.cpp
     video_core/async_shader_emission.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
@@ -218,7 +219,8 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 target_compile_definitions(tests PRIVATE
-    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures"
+    SHADER_SWEEP_FIXTURES="${PROJECT_SOURCE_DIR}/tools/shader-sweep/fixtures")
 
 add_test(NAME tests COMMAND tests)
 

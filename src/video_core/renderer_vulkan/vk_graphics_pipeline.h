@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_recipe.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -76,29 +77,6 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
-/// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
-/// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
-/// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
-struct MeshEmulationSetup {
-    std::vector<u32> vertex_spirv;
-    u32 output_binding{};
-    u32 block_words{};    ///< output words per mesh workgroup
-    u32 max_primitives{}; ///< triangles per mesh workgroup
-    // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
-    // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
-    bool has_task{};
-    u32 mesh_stage{};
-    u32 payload_stride{};
-    u32 payload_binding{};
-    u32 offsets_binding{};
-    u32 args_binding{};
-    std::vector<u32> distribution_spirv;
-    // Output layout, for the readback diagnostics.
-    u32 max_vertices{};
-    u32 vertex_lines{};
-    std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
-};
-
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -106,15 +84,17 @@ public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
-        VideoCore::ShaderNotify* shader_notify,
-        const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue,
+        VideoCore::ShaderNotify* shader_notify, const Device& device,
+        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
         DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
-        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
+        std::function<void()> on_built = {});
+
+    std::shared_ptr<GraphicsPipelineRecipe> recipe;
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
