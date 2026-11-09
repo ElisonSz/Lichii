@@ -1711,12 +1711,12 @@ TEST_CASE("Split tells guest memory writes from what only the GPU caches hold",
                                          MappedPages::device_address + 0x140));
     VideoCommon::GpuSplit split;
     Access::Initialize(split, f.system);
-    split.Defer([] {}, Writes::Noted);
+    split.Defer([] {}, 0, Writes::Noted);
     split.NoteWrite(f.memory, word, 4);
     const u64 noted = Access::End(split);
     // Shader stores: a read of the caches waits for them, a read of guest memory only for the
     // writes noted there.
-    split.Defer([] {}, Writes::Caches);
+    split.Defer([] {}, 0, Writes::Caches);
     CHECK(Access::WritesTarget(split, f.memory, other, 4) == Access::End(split));
     CHECK(split.MemoryWritesTarget(f.memory, word, 4) == noted);
     CHECK(split.MemoryWritesTarget(f.memory, other, 4) == 0);
@@ -1815,7 +1815,7 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     CHECK(word(0x10) == 9);
 
     // Over a value the front can't tell, a maximum holds its payload at least.
-    split.Defer([] {}, Writes::Noted);
+    split.Defer([] {}, 0, Writes::Noted);
     split.NoteSemaphoreWrite(word_devices + 0x10, 0, false);
     inline_qmd(qmds + 0x200, make_qmd(0, 0x10, Enable | OneWord | Maximum, 12), false);
     release = queued(0x10);
@@ -1837,23 +1837,24 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     Access::RunBack(split);
     CHECK(word(0x20) == 7);
 
-    // Work that may write guest memory anywhere, still queued: the front can't tell what the
-    // back reads, its table is no longer the back's.
+    // Work that may write guest memory anywhere and change the mappings, still queued: the front
+    // can't tell what the back reads yet, the launch waits for it.
     split.Defer([] {});
     inline_qmd(qmds + 0x500, make_qmd(0, 0x30, Enable | OneWord, 1), false);
     CHECK_FALSE(queued(0x30).has_value());
     Access::RunBack(split);
-    // Taken over again once the back ran everything.
+    // The back ran everything: the front takes its table over, the waiting launch with it.
     inline_qmd(qmds + 0x600, make_qmd(0, 0x30, Enable | OneWord, 2), true);
     release = queued(0x30);
     REQUIRE(release.has_value());
     CHECK(release->payload == 2);
     Access::RunBack(split);
 
-    // A write to a waiting QMD still queued when its decrement is sent: not valued.
+    // A write to a waiting QMD still queued when its decrement is sent: the launch waits, not
+    // valued then.
     inline_qmd(qmds + 0x700, make_qmd(1, 0x40, Enable | OneWord | Maximum, 3), false);
     Access::RunBack(split);
-    split.Defer([] {}, Writes::Noted);
+    split.Defer([] {}, 0, Writes::Noted);
     split.NoteWrite(f.memory, qmds + 0x700 + 26 * sizeof(u32), sizeof(u32));
     send(0xad, static_cast<u32>((qmds + 0x700) >> 8));
     send(0xb0, 7);

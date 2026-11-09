@@ -289,6 +289,27 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    class PublishHold {
+    public:
+        PublishHold(GpuSplit& split_, bool hold) : split{split_}, was_held{split_.publish_held} {
+            if (hold) {
+                split.publish_held = true;
+            }
+        }
+        ~PublishHold() {
+            if (split.publish_held != was_held) {
+                split.publish_held = was_held;
+                split.PublishIfDue();
+            }
+        }
+        PublishHold(const PublishHold&) = delete;
+        PublishHold& operator=(const PublishHold&) = delete;
+
+    private:
+        GpuSplit& split;
+        bool was_held;
+    };
+
     void PublishSoon() {
         publish_every = PublishAfterWait;
     }
@@ -444,6 +465,7 @@ public:
 
     /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`.
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+    void NoteWriteAt(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size, u64 position);
     /// The entry just sent may write guest memory anywhere.
     void NoteAnyWrite() {
         NoteUnplacedWrite();
@@ -544,8 +566,14 @@ private:
     static void NoteSetWrite(WriteSet& set, u64 granule, u64 position);
     /// The latest position of the writes to `granule` in its set, at most.
     [[nodiscard]] static u64 SetTarget(const WriteSet& set, u64 granule);
-    void NoteDeviceWrite(DAddr address, u64 size);
-    void NoteCoarseDeviceWrite(DAddr address, u64 size);
+    void NoteDeviceWrite(DAddr address, u64 size) {
+        NoteDeviceWriteAt(address, size, write_position);
+    }
+    void NoteDeviceWriteAt(DAddr address, u64 size, u64 position);
+    void NoteCoarseDeviceWrite(DAddr address, u64 size) {
+        NoteCoarseDeviceWriteAt(address, size, write_position);
+    }
+    void NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position);
     /// The position WaitForWrites waits for.
     [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                    u64 size) const;
@@ -576,6 +604,12 @@ private:
     void Commit(size_t words) {
         last_entry_start = write_position;
         write_position += words;
+        PublishIfDue();
+    }
+    void PublishIfDue() {
+        if (publish_held) {
+            return;
+        }
         const u64 unpublished = write_position - published_local;
         if (unpublished >= publish_every) {
             Publish();
@@ -644,6 +678,7 @@ private:
     u64 last_noted_write{};
     alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
     alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
+    bool publish_held{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

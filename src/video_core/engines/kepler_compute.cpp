@@ -1488,7 +1488,9 @@ struct ListCallContext {
     const EmitFunc& emit;
 
     [[nodiscard]] std::optional<u64> DeviceWord(u64 gpu_address) const {
-        // GPU maps drain the split before later command reads, including this macro call.
+        if (!split.Ran(split.LastMappingChange())) {
+            return std::nullopt; // An unmap queued before this call may change the device word.
+        }
         const auto first = memory.GpuToCpuAddress(gpu_address);
         const auto last = memory.GpuToCpuAddress(gpu_address + 3);
         if (!first || !last || *last != *first + 3) {
@@ -1563,11 +1565,24 @@ struct FrontQmdMemory {
     void NoteWrite(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size) const {
         split.NoteWrite(memory, address, size);
     }
+    void NoteWriteAt(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size, u64 position) const {
+        split.NoteWriteAt(memory, address, size, position);
+    }
+    [[nodiscard]] const void* Id() const {
+        return &memory;
+    }
 };
 
 // The QMD methods: PCAS (0xae-0xb0) and the inline QMD's last word (0x107).
 [[nodiscard]] bool IsQmdMethod(u32 method) {
     return method == 0xae || method == 0xaf || method == 0xb0 || method == 0x107;
+}
+
+// Methods whose notes the front takes from guest memory as the back finds it running them: the
+// QMD methods (descriptors, and the words maxima and reductions combine with) and the compute
+// report (reductions). The front holds them unpublished until it noted them.
+[[nodiscard]] bool ValuedFromMemory(u32 method) {
+    return IsQmdMethod(method) || method == 0x6c3;
 }
 
 // Whether a PCAS method signals the QMD scheduler, as ProcessNativeMethod filters them.
@@ -1732,6 +1747,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd);
     }
+    const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
     split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
     FrontNoteWrites(split, fs, method, argument, false);
 }
@@ -1874,6 +1890,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd);
     }
+    const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontWrites(method));
     // The back runs them one by one; what they write is the back's once it ran them all.
@@ -1940,6 +1957,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd);
         }
+        const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(address)};
         split.MacroWrite(this, address, value, FrontWrites(address));
         FrontNoteWrites(split, fs, address, value, true);
         return true;

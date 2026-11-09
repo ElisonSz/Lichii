@@ -5,10 +5,13 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace Tegra {
 
@@ -55,6 +58,36 @@ public:
             *table = *other.table;
         }
     }
+    [[nodiscard]] bool SameStates(const NativeQmdScheduler& other) const {
+        return *table == *other.table;
+    }
+    [[nodiscard]] std::size_t StateCount() const {
+        return table->size();
+    }
+    /// The split GPU thread's front runs signals it may have to take back, where it can't read a
+    /// QMD as the back will yet (FrontQmdView): from BeginAttempt on, Signal records what it
+    /// changes in the table, until CommitAttempt keeps it or RollbackAttempt restores the table.
+    void BeginAttempt() {
+        undo.clear();
+        attempting = true;
+    }
+    void CommitAttempt() {
+        undo.clear();
+        attempting = false;
+    }
+    void RollbackAttempt() {
+        auto& states = *table;
+        // Newest first: each QMD ends with the state it had before the attempt.
+        for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+            if (it->second) {
+                states.insert_or_assign(it->first, *it->second);
+            } else {
+                states.erase(it->first);
+            }
+        }
+        undo.clear();
+        attempting = false;
+    }
     // Optional diagnostics: called with "load"/"count"/"defer"/"run" events.
     std::function<void(std::string_view, Address, std::int32_t)> trace;
     // Optional diagnostics: called with the QMD, slot and raw words of a release it skips.
@@ -90,11 +123,26 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
             if (states.size() >= 4096 && !states.contains(request.address)) {
-                // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
+                // Finished QMDs with nothing deferred are only history, drop them instead of
+                // stalling.
+                if (attempting) {
+                    for (const auto& [kept_address, kept] : states) {
+                        if (kept.completed && kept.deferred == 0) {
+                            undo.emplace_back(kept_address, kept);
+                        }
+                    }
+                }
                 std::erase_if(states, [](const auto& entry) {
                     return entry.second.completed && entry.second.deferred == 0;
                 });
-                if (states.size() >= 4096) return "QMD cache limit";
+                if (states.size() >= 4096)
+                    return "QMD cache limit";
+            }
+            if (attempting) {
+                const auto found = states.find(request.address);
+                undo.emplace_back(request.address, found != states.end()
+                                                       ? std::optional<State>{found->second}
+                                                       : std::nullopt);
             }
             auto& state = states[request.address];
             if (request.action == 3 || request.action == 2) {
@@ -185,6 +233,7 @@ private:
         bool loaded{};
         bool scheduled{};
         bool completed{};
+        bool operator==(const State&) const = default;
     };
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
@@ -192,5 +241,8 @@ private:
     static inline std::unordered_map<Address, State> shared_states;
     std::unordered_map<Address, State> own_states;
     std::unordered_map<Address, State>* table{&shared_states};
+    /// BeginAttempt: the states the attempt changed, as they were (none: the QMD had no state).
+    bool attempting{};
+    std::vector<std::pair<Address, std::optional<State>>> undo;
 };
 } // namespace Tegra

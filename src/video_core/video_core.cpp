@@ -11,6 +11,7 @@
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "video_core/front_qmd.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_async_readback.h"
@@ -53,9 +54,11 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
 namespace VideoCore {
 
 /// @brief Creates an emulated GPU instance using the given system context.
-void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
+void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window,
+               Core::System& system) {
     Settings::UpdateRescalingInfo();
     VideoCommon::Nx2Profile::ReadSwitch();
+    VideoCommon::ReadQmdViewSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
