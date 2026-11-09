@@ -191,7 +191,11 @@ public:
     /// What the sender of an entry tells about the guest memory the back writes running it, for
     /// the front's reads of guest memory (WaitForWrites, MemoryWritesTarget).
     enum class Writes : u8 {
-        Anywhere, ///< Unknown: a read anywhere waits for the entry
+        /// Unknown: a read anywhere waits for the entry, and it may change the GPU's mappings
+        /// (unmaps; GPU maps drain the split)
+        Anywhere,
+        /// Guest memory anywhere, the mappings not: engine work whose writes nobody placed
+        Unplaced,
         /// The GPU caches anywhere (shader stores, copies into buffers), guest memory only through
         /// them, where GPU work wrote (Nx2MayBeGpuWritten): a read of the caches waits for it, a
         /// read of other guest memory not (MemoryWritesTarget)
@@ -442,6 +446,10 @@ public:
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
     /// The entry just sent may write guest memory anywhere.
     void NoteAnyWrite() {
+        NoteUnplacedWrite();
+        last_mapping_change = write_position;
+    }
+    void NoteUnplacedWrite() {
         last_any_write = write_position;
         last_unplaced_write = write_position;
     }
@@ -452,6 +460,8 @@ public:
     void NoteWrites(Writes writes) {
         if (writes == Writes::Anywhere) {
             NoteAnyWrite();
+        } else if (writes == Writes::Unplaced) {
+            NoteUnplacedWrite();
         } else if (writes == Writes::Caches) {
             NoteCacheWrite();
         }
@@ -460,6 +470,9 @@ public:
     /// not know (NoteAnyWrite), outside what the caches hold.
     [[nodiscard]] u64 LastUnplacedWrite() const {
         return (std::min)(last_unplaced_write, write_position);
+    }
+    [[nodiscard]] u64 LastMappingChange() const {
+        return (std::min)(last_mapping_change, write_position);
     }
     /// Once the back ran everything before the position returned, no entry sent so far writes
     /// guest memory in [address, address + size) of `memory` but through the GPU caches
@@ -494,17 +507,45 @@ private:
     /// Words a back waiting for work gets without a publish_every (Commit).
     static constexpr size_t PublishAfterWait = 8;
 
-    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long
-    /// (longer ones count as anywhere), in write_positions slots hashed by granule: granules that
-    /// share a slot share its position, so a read may wait for a write elsewhere, never miss one.
+    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long,
+    /// in sets of WriteWays slots hashed by granule. Writes up to MaxCoarseNotedBytes (copies,
+    /// uploads) go by 64 KiB granule into coarse sets, longer ones count as unplaced. A slot holds
+    /// a granule and the position of its last write; a write to a granule its set lacks takes the
+    /// slot written longest ago, and the set keeps the latest position of the writes it so
+    /// dropped (`evicted`). A read waits for its granule's own last write while the set holds
+    /// it, else for the evicted ones: it may wait for a write elsewhere, never miss one, and the
+    /// writes to other granules hashed there (the constant buffer words of queued draws) hold up
+    /// a read of a QMD only once they pushed it out of its set.
     static constexpr u32 WriteGranuleBits = 8;
     static constexpr u64 MaxNotedBytes = 0x4000;
-    static constexpr u32 WriteSlotBits = 14;
+    static constexpr u32 WriteSlotBits = 12; ///< Sets
+    static constexpr u32 CoarseGranuleBits = 16;
+    static constexpr u64 MaxCoarseNotedBytes = u64{16} << 20;
+    static constexpr u32 CoarseSlotBits = 10;
+    static constexpr size_t WriteWays = 4;
 
+    /// One cache line.
+    struct WriteSet {
+        std::array<u64, WriteWays> positions;
+        /// The granules' low 32 bits: granules that agree in them share a slot.
+        std::array<u32, WriteWays> granules;
+        u64 evicted;
+        u64 unused;
+    };
+    static_assert(sizeof(WriteSet) == 64);
+    /// The set a granule is hashed to.
     static size_t WriteSlot(u64 granule) {
         return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - WriteSlotBits));
     }
+    static size_t CoarseSlot(u64 granule) {
+        return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - CoarseSlotBits));
+    }
+    /// A write to `granule` at `position` (the newest, or an earlier one placed late).
+    static void NoteSetWrite(WriteSet& set, u64 granule, u64 position);
+    /// The latest position of the writes to `granule` in its set, at most.
+    [[nodiscard]] static u64 SetTarget(const WriteSet& set, u64 granule);
     void NoteDeviceWrite(DAddr address, u64 size);
+    void NoteCoarseDeviceWrite(DAddr address, u64 size);
     /// The position WaitForWrites waits for.
     [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                    u64 size) const;
@@ -599,8 +640,10 @@ private:
     /// NoteWrite placed, and the last placed write in each slot's granules.
     u64 last_any_write{};
     u64 last_unplaced_write{};
+    u64 last_mapping_change{};
     u64 last_noted_write{};
-    std::array<u64, size_t{1} << WriteSlotBits> write_positions{};
+    alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
+    alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

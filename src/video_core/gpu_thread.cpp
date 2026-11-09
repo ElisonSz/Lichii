@@ -22,11 +22,12 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
+#include "video_core/front_qmd.h"
 #include "video_core/gpu.h"
-#include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
-#include "video_core/nx2_profile.h"
+#include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCommon::GPUThread {
@@ -93,6 +94,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 if (resumed) {
                     last_progress = std::chrono::steady_clock::now();
                 }
+                if (split.Active()) {
+                    VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
+                }
                 if (!state.queue.TryPop(next)) {
                     if (!scheduler.HasPendingChannels()) {
                         continue;
@@ -135,6 +139,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (split.Active()) {
                 split.PublishSoon();
+                VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
@@ -144,7 +149,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     // TickWork ends fast draw reuse itself when it runs a request.
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
-                                VideoCommon::GpuSplit::FastDrawNeutral);
+                                VideoCommon::GpuSplit::FastDrawNeutral,
+                                VideoCommon::GpuSplit::Writes::Caches);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.

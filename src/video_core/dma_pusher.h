@@ -218,7 +218,8 @@ public:
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
     /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
-    void NoteDmaSemaphore(u32 method, u32 argument);
+    void ShadowEngineMethod(Engines::EngineTypes type, u32 method, u32 argument);
+    void NoteEngineWrites(Engines::EngineTypes type, u32 method);
     /// Copies the list's words from memory again, as of suspension count `now`, from entry
     /// `first_entry` on (the entries before it ran already).
     void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
@@ -307,8 +308,13 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
-    /// The copy engine's semaphore address (high, low) and payload as sent (NoteDmaSemaphore).
-    std::array<u32, 3> dma_semaphore{};
+    /// The registers of the channel's copy engine (MaxwellDMA::RegisterCount) and its
+    /// inline-to-memory engine (KeplerMemory::Regs::NUM_REGS), as the methods sent left them
+    /// (ShadowEngineMethod): where the back's copies and uploads write.
+    static constexpr size_t DmaRegisterCount = 0x800;
+    static constexpr size_t InlineToMemoryRegisterCount = 0x7f;
+    std::array<u32, DmaRegisterCount> dma_registers{};
+    std::array<u32, InlineToMemoryRegisterCount> inline_to_memory_registers{};
 
     Engines::Puller puller;
     std::mutex sync_mutex;
