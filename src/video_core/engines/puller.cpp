@@ -11,7 +11,6 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
-#include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -24,7 +23,9 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -367,6 +368,7 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
                 // release.
                 split.NoteSync();
                 VideoCommon::Count(stats.by_queued);
+                VideoCommon::Nx2AcquireStats::NoteQueuedPass(device);
             }
             VideoCommon::Count(stats.passed);
             return true;
@@ -525,8 +527,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
         const GPUVAddr mirror = g_nx2_ampere ? Nx2SemaphoreMirror(sequence_address) : 0;
         if (mirror != 0) {
-            LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address,
-                      payload, mirror);
+            LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
         }
         OnBack(
             [rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
@@ -671,6 +672,7 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
             // (GpuSplit::NoteSync).
             split.NoteSync();
             VideoCommon::Count(stats.by_queued);
+            VideoCommon::Nx2AcquireStats::NoteQueuedPass(*device);
         }
         if (pass) {
             VideoCommon::Count(stats.passed);

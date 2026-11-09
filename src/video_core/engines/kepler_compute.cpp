@@ -361,6 +361,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                if (VideoCommon::Nx2DrainCheck::g_enabled) {
+                    // TEST: what the front's QMD view compares the descriptors it read with.
+                    VideoCommon::Nx2DrainCheck::NoteQmdRead(address, descriptor,
+                                                            VideoCommon::GpuSplit::OnBackThread());
+                }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -381,14 +386,24 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                // TEST (EDEN_NX2_DRAIN_CHECK): what the front's QMD view compares its notes with.
+                const auto checked = [this, address](u32 offset, u32 value) {
+                    if (VideoCommon::Nx2DrainCheck::g_enabled) {
+                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                            VideoCommon::Nx2DrainCheck::NoteQmdRelease(
+                                *device + offset, value, VideoCommon::GpuSplit::OnBackThread());
+                        }
+                    }
+                };
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags] {
+                    rasterizer->SignalFence([this, address, payload, flags, checked] {
                         const auto combine = [&](u32 current) {
                             return ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1, current, payload);
                         };
                         const u32 guest = memory_manager.Read<u32>(address);
                         const u32 value = combine(guest);
                         memory_manager.Write<u32>(address, value);
+                        checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                                 *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
@@ -408,15 +423,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::HasTimeout,
                         payload, 0);
+                    checked(0, payload);
+                    checked(4, 0);
                 } else if (flags & (1U << 19)) {
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
+                    rasterizer->SignalFence([this, address, payload, checked] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
                         const u32 guest = memory_manager.Read<u32>(address);
                         const u32 value = combine(guest);
                         memory_manager.Write<u32>(address, value);
+                        checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                                 *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
@@ -433,9 +451,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     }
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+                    checked(0, payload);
                 }
                 return true;
             }, [&](const auto& descriptor) { return DispatchNativeCompute(descriptor); });
+        if (VideoCommon::Nx2DrainCheck::g_enabled) {
+            // TEST: where this signal's reads end, for the front's QMD view check.
+            VideoCommon::Nx2DrainCheck::NoteQmdSignalEnd(VideoCommon::GpuSplit::OnBackThread());
+        }
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
             return true;
@@ -1469,6 +1492,12 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
 
 namespace {
 
+[[nodiscard]] bool QmdReleasesLandAtOnce() {
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? !Settings::IsGPULevelHigh()
+               : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate();
+}
+
 // A compute macro call as Nx2ListIndirect::ComputeFront sees it (its Context).
 template <typename EmitFunc>
 struct ListCallContext {
@@ -1634,7 +1663,7 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front_macros = true;
         // A new session's or a restarted split's: the QMDs the back scheduled meanwhile, in the
         // table the engines share. The back is idle, its table the current one.
-        GetFrontQmd().TakeOver(native_qmd);
+        GetFrontQmd().TakeOver(native_qmd, VideoCommon::Nx2AcquireStats::QmdTakeOver::FrontStart);
     }
     return *front;
 }
@@ -1722,11 +1751,13 @@ std::span<u32> KeplerCompute::FrontMacroPositions(FrontState& fs) {
     return native_macro_positions;
 }
 
-void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                                    u32 argument, bool is_last_call, const GPUVAddr* segment) {
+void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split,
+                                    u32 method, u32 argument, bool is_last_call,
+                                    const GPUVAddr* segment) {
     auto& fs = Front(split);
     if (method >= fs.registers.size()) {
         split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
+        split.TagUnplaced(VideoCommon::UnplacedKind::Engine); // TEST
         return;
     }
     if (method >= 0xe00) {
@@ -1745,11 +1776,38 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     if (IsQmdMethod(method)) {
-        GetFrontQmd().MaybeTakeOver(split, native_qmd);
+        GetFrontQmd().MaybeTakeOver(split, native_qmd,
+                                    VideoCommon::Nx2AcquireStats::QmdTakeOver::QmdMethod);
     }
     const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
     split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
     FrontNoteWrites(split, fs, method, argument, false);
+    FrontQmdCheck(split);
+}
+
+void KeplerCompute::FrontQmdCheck(VideoCommon::GpuSplit& split) {
+    if (!VideoCommon::Nx2DrainCheck::g_enabled) {
+        return;
+    }
+    auto checks = GetFrontQmd().TakeChecks();
+    if (!checks) {
+        return;
+    }
+    split.DeferFunction(
+        [predicted = std::move(checks->releases), reads = std::move(checks->reads),
+         table = std::move(checks->table), valued = checks->valued && QmdReleasesLandAtOnce(),
+         after_late = checks->table_after_late, wait_position = checks->wait_position,
+         first_waiting = checks->first_waiting, late = std::move(checks->late)] {
+            VideoCommon::Nx2DrainCheck::CheckQmdReleases(predicted, reads, valued, wait_position,
+                                                         first_waiting);
+            VideoCommon::Nx2DrainCheck::CheckLateQmdReads(late);
+            if (table && valued) {
+                const NativeQmdScheduler shared; // The table the engines share
+                VideoCommon::Nx2DrainCheck::NoteQmdTables(table->SameStates(shared),
+                                                          table->StateCount(), after_late);
+            }
+        },
+        VideoCommon::GpuSplit::Writes::Noted);
 }
 
 // What the back writes to guest memory running `method` with `argument`, just sent as
@@ -1854,6 +1912,7 @@ void KeplerCompute::FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontStat
         if (!split.Ran(split.LastMappingChange())) {
             GetFrontQmd().Lose();
             split.NoteUnplacedWrite();
+            split.TagUnplaced(VideoCommon::UnplacedKind::InlineQmd); // TEST
         }
         return;
     }
@@ -1888,7 +1947,8 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         FrontApply(fs, method, base_start[i]);
     }
     if (IsQmdMethod(method)) {
-        GetFrontQmd().MaybeTakeOver(split, native_qmd);
+        GetFrontQmd().MaybeTakeOver(split, native_qmd,
+                                    VideoCommon::Nx2AcquireStats::QmdTakeOver::QmdMethod);
     }
     const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
@@ -1897,6 +1957,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     for (u32 i = 0; i < amount; ++i) {
         FrontNoteWrites(split, fs, method, base_start[i], false);
     }
+    FrontQmdCheck(split);
 }
 
 bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count,
@@ -1955,11 +2016,13 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         if (IsQmdMethod(address)) {
-            GetFrontQmd().MaybeTakeOver(split, native_qmd);
+            GetFrontQmd().MaybeTakeOver(split, native_qmd,
+                                        VideoCommon::Nx2AcquireStats::QmdTakeOver::QmdMethod);
         }
         const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(address)};
         split.MacroWrite(this, address, value, FrontWrites(address));
         FrontNoteWrites(split, fs, address, value, true);
+        FrontQmdCheck(split);
         return true;
     };
     if (list_front && native_data_ram != nullptr) {

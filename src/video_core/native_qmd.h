@@ -39,11 +39,7 @@ public:
     using Word = std::uint32_t;
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
-    struct RejectShaderDispatch {
-        bool operator()(const Descriptor&) const {
-            return false;
-        }
-    };
+    struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
     /// A scheduler with a table of its own, not the one the channels share: the split GPU thread's
     /// front runs the scheduling ahead of its back to know what the launches release
     /// (KeplerCompute).
@@ -106,13 +102,8 @@ public:
         return Signal(address, argument, read, release, RejectShaderDispatch{});
     }
     template <typename Read, typename Release, typename Dispatch>
-    std::string_view Signal(Address address, Word argument, Read read, Release release,
-                            Dispatch dispatch) {
-        struct Pending {
-            Address address;
-            Word action;
-            Word count;
-        };
+    std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
+        struct Pending { Address address; Word action; Word count; };
         auto& states = *table;
         // What `read` returns is used before the next read only: a table entry holds no copy.
         Descriptor descriptor{};
@@ -123,8 +114,7 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
             if (states.size() >= 4096 && !states.contains(request.address)) {
-                // Finished QMDs with nothing deferred are only history, drop them instead of
-                // stalling.
+                // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
                 if (attempting) {
                     for (const auto& [kept_address, kept] : states) {
                         if (kept.completed && kept.deferred == 0) {
@@ -135,8 +125,7 @@ public:
                 std::erase_if(states, [](const auto& entry) {
                     return entry.second.completed && entry.second.deferred == 0;
                 });
-                if (states.size() >= 4096)
-                    return "QMD cache limit";
+                if (states.size() >= 4096) return "QMD cache limit";
             }
             if (attempting) {
                 const auto found = states.find(request.address);
@@ -150,8 +139,7 @@ public:
                     if (!read(request.address, descriptor))
                         return "unmapped QMD";
                     const auto& qmd = descriptor;
-                    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100))
-                        return "unsupported QMD version or queue";
+                    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
                     if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>) {
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
                             return "native shader dispatch required";
@@ -178,25 +166,19 @@ public:
             } else {
                 return "unsupported PCAS action";
             }
-            if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0)
-                continue;
-            if (state.dependencies < 0)
-                return "QMD dependency underflow";
+            if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0) continue;
+            if (state.dependencies < 0) return "QMD dependency underflow";
             // The SDK patches release payloads while a scheduled QMD is
             // waiting for its remaining dependencies. Fetch them at execution.
             if (!read(request.address, descriptor))
                 return "unmapped QMD";
             const auto qmd = descriptor;
-            if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100))
-                return "unsupported QMD version or queue";
+            if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
             // A program Eden can't run is skipped, but the QMD still completes: its releases
             // are what other queues and the CPU wait on (the console never fails a launch).
-            const bool dispatched =
-                !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
-            if (!dispatched)
-                error = "native shader dispatch required";
-            if (trace)
-                trace("run", request.address, dispatched ? 1 : 0);
+            const bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);
+            if (!dispatched) error = "native shader dispatch required";
+            if (trace) trace("run", request.address, dispatched ? 1 : 0);
             state.completed = true;
             for (std::size_t slot = 0; slot < ReleaseSlots.size(); ++slot) {
                 const Word base = ReleaseSlots[slot];
@@ -221,7 +203,6 @@ public:
         }
         return error;
     }
-
 private:
     // Release slots (address low, flags | address high, payload). NVN2 patches a third one at
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).

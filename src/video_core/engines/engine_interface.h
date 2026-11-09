@@ -8,6 +8,7 @@
 
 #include <bitset>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "common/common_types.h"
@@ -50,6 +51,7 @@ public:
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};
+    std::optional<EngineTypes> bound_type;
     /// Fast draw (nx2_fast_draw.h): the engine reports its own changes (Maxwell3D); a method of any other
     /// engine ends draw reuse.
     bool reports_fast_draw_breaks{};

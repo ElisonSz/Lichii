@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 
@@ -84,6 +85,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (VideoCommon::g_acquire_counting) {
                 split.ReportAcquire();
             }
+            VideoCommon::Nx2DrainCheck::MaybeReport();
+            VideoCommon::Nx2AcquireStats::MaybeReport();
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;
@@ -95,7 +98,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     last_progress = std::chrono::steady_clock::now();
                 }
                 if (split.Active()) {
-                    VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
+                    VideoCommon::FrontQmdView::Get().MaybeTakeOver(
+                        split, VideoCommon::Nx2AcquireStats::QmdTakeOver::BetweenCommands);
                 }
                 if (!state.queue.TryPop(next)) {
                     if (!scheduler.HasPendingChannels()) {
@@ -139,7 +143,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (split.Active()) {
                 split.PublishSoon();
-                VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
+                VideoCommon::FrontQmdView::Get().MaybeTakeOver(
+                    split, VideoCommon::Nx2AcquireStats::QmdTakeOver::BetweenCommands);
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
@@ -158,13 +163,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.Drain(VideoCommon::DrainSite::Map);
                     } else {
                         split.DeferFunction(std::move(run->func));
+                        split.TagUnplaced(VideoCommon::UnplacedKind::RunCommand);
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = flush->addr,
                                  size = flush->size] { rasterizer_ptr->FlushRegion(addr, size); },
                                 0, VideoCommon::GpuSplit::Writes::Caches);
-                } else if (const auto* invalidate =
-                               std::get_if<InvalidateRegionCommand>(&next.data)) {
+                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
                     split.Defer(
                         [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                             rasterizer_ptr->OnCacheInvalidation(addr, size);

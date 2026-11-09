@@ -17,6 +17,7 @@
 #endif
 #include <cstring>
 #include <string>
+#include <string_view>
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
@@ -28,6 +29,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -48,6 +50,29 @@ void Pause() {
 }
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
+
+/// TEST: an engine's name, by the class it was bound as (MethodEndingAt).
+[[nodiscard]] std::string_view EngineName(std::optional<Tegra::Engines::EngineTypes> type) {
+    using Tegra::Engines::EngineTypes;
+    if (!type) {
+        return "an unbound engine";
+    }
+    switch (*type) {
+    case EngineTypes::Nv01Timer:
+        return "Nv01Timer";
+    case EngineTypes::KeplerCompute:
+        return "KeplerCompute";
+    case EngineTypes::Maxwell3D:
+        return "Maxwell3D";
+    case EngineTypes::Fermi2D:
+        return "Fermi2D";
+    case EngineTypes::MaxwellDMA:
+        return "MaxwellDMA";
+    case EngineTypes::KeplerMemory:
+        return "KeplerMemory";
+    }
+    return "an engine";
+}
 
 } // Anonymous namespace
 
@@ -120,6 +145,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     const char* const verify = std::getenv("EDEN_NX2_ACQUIRE_VERIFY");
     g_acquire_verify = verify != nullptr && verify[0] == '1';
     g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
+    profile_publishes = Nx2Profile::Enabled();
+    log_methods = g_acquire_counting;
     ring = std::make_unique<u64[]>(RingWords);
     ++starts; // Before the back starts: it tags the entries of fenced writes with it (EntryTag)
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
@@ -155,11 +182,16 @@ void GpuSplit::Stop() {
     last_any_write = 0;
     last_unplaced_write = 0;
     last_mapping_change = 0;
+    last_unplaced_kind = UnplacedKind::Other;
+    last_mapping_kind = UnplacedKind::Other;
+    first_unpublished_ticks = 0;
+    back_idle_since.store(0, std::memory_order_relaxed);
     last_noted_write = 0;
     write_sets.fill({});
     coarse_sets.fill({});
     published_local = 0;
     publish_held = false;
+    logged_method_count = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
@@ -207,9 +239,34 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
 }
 
+void GpuSplit::NoteFirstUnpublished() {
+    first_unpublished_ticks = Nx2Profile::Ticks();
+}
+
+void GpuSplit::NoteEarlyPublish() {
+    Nx2Profile::Add(Nx2Profile::Counter::EarlyPublishes, 1);
+}
+
+void GpuSplit::NoteLatePublish() {
+    const u64 idle_since = back_idle_since.load(std::memory_order_relaxed);
+    if (idle_since == 0 || first_unpublished_ticks == 0) {
+        return;
+    }
+    // The back could have run the words since it ran out of work or since the first was sent.
+    const u64 since = std::max(idle_since, first_unpublished_ticks);
+    const u64 now = Nx2Profile::Ticks();
+    if (now > since) {
+        Nx2Profile::Add(Nx2Profile::Counter::LatePublishTicks, now - since);
+        Nx2Profile::Add(Nx2Profile::Counter::LatePublishes, 1);
+    }
+}
+
 void GpuSplit::Publish() {
     if (published_local == write_position) {
         return;
+    }
+    if (profile_publishes) {
+        NoteLatePublish(); // TEST
     }
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
@@ -292,6 +349,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.fenced = true;
     }
     semaphore_writes.insert_or_assign(word, write);
+    Nx2AcquireStats::NoteRelease(word, Nx2AcquireStats::Releaser::Puller);
 }
 
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
@@ -335,6 +393,7 @@ void GpuSplit::NoteWriteAt(const Tegra::MemoryManager& memory, GPUVAddr address,
     }
     if (size > MaxCoarseNotedBytes || address + size < address) {
         NoteUnplacedWrite();
+        TagUnplaced(UnplacedKind::Oversized); // TEST
         return;
     }
     if (size > MaxNotedBytes) {
@@ -512,15 +571,54 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+    if (log_methods) {
+        LogMethod(engine, method); // TEST
+    }
     NoteWrites(writes);
 }
 
-void GpuSplit::DeferFunction(std::function<void()>&& func) {
+void GpuSplit::LogMethod(const Tegra::Engines::EngineInterface* engine, u32 method) {
+    if (!logged_methods) {
+        logged_methods = std::make_unique<SentMethod[]>(LoggedMethods);
+    }
+    logged_methods[logged_method_count++ & (LoggedMethods - 1)] = {write_position,
+                                                                   engine->bound_type, method};
+}
+
+std::string GpuSplit::MethodEndingAt(u64 end) const {
+    if (!logged_methods || logged_method_count == 0) {
+        return {};
+    }
+    // Ends grow with the count: a binary search over the ones kept.
+    u64 low = logged_method_count > LoggedMethods ? logged_method_count - LoggedMethods : 0;
+    u64 high = logged_method_count;
+    while (low < high) {
+        const u64 middle = low + (high - low) / 2;
+        if (logged_methods[middle & (LoggedMethods - 1)].end < end) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low == logged_method_count) {
+        return {};
+    }
+    const SentMethod& sent = logged_methods[low & (LoggedMethods - 1)];
+    if (sent.end != end) {
+        return {};
+    }
+    // Not typeid: without RTTI (MSVC's /GR-) it reads type data the engines don't have.
+    return fmt::format("{} {:#x}", EngineName(sent.engine), sent.method);
+}
+
+void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
     auto* const heap = new std::function<void()>(std::move(func));
-    Defer([heap] {
-        (*heap)();
-        delete heap;
-    });
+    Defer(
+        [heap] {
+            (*heap)();
+            delete heap;
+        },
+        0, writes);
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
@@ -654,6 +752,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front publishes what it holds after a few more words from now on.
             back_idle_at.store(read_position, std::memory_order_relaxed);
+            if (profile_publishes) {
+                back_idle_since.store(Nx2Profile::Ticks(), std::memory_order_relaxed);
+            }
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
             // The front usually sends more within microseconds: spin briefly before sleeping.
@@ -697,6 +798,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
             }
+        }
+        if (profile_publishes) {
+            back_idle_since.store(0, std::memory_order_relaxed);
         }
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.

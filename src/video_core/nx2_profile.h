@@ -74,21 +74,58 @@ enum class Zone : u32 {
     WorkerIdle,           ///< VulkanWorker waiting for work
     PresentWait,          ///< Present waits for the Vulkan worker or a free presentation frame
     QueueSubmit,          ///< vkQueueSubmit
+    Resnapshot,           ///< TEST: copying unconsumed command entries again after a resume
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_names{
-    "other",         "idle",          "pending sleep",  "resume pending", "push",
-    "tick",          "run",           "flush/inval",    "macro",          "draw",
-    "clear",         "compute",       "flush work",     "pipeline lookup", "configure",
-    "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
-    "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
-    "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait", "graphics pipeline miss",
-    "compute pipeline miss", "pipeline wait", "shader capture", "texture cache", "GPU wait",
-    "present", "worker idle",
-    "present wait", "queue submit",
+    "other",
+    "idle",
+    "pending sleep",
+    "resume pending",
+    "push",
+    "tick",
+    "run",
+    "flush/inval",
+    "macro",
+    "draw",
+    "clear",
+    "compute",
+    "flush work",
+    "pipeline lookup",
+    "configure",
+    "sync descriptors",
+    "read handles",
+    "fill image views",
+    "texture buffers",
+    "update buffers",
+    "descriptor acquire",
+    "bind stage buffers",
+    "push descriptors",
+    "render targets",
+    "configure draw",
+    "dynamic state",
+    "draw record",
+    "texture upload",
+    "fence",
+    "fence skipped",
+    "method",
+    "split drain",
+    "split wait",
+    "writer wait",
+    "list submit wait",
+    "list GPU wait",
+    "graphics pipeline miss",
+    "compute pipeline miss",
+    "pipeline wait",
+    "shader capture",
+    "texture cache",
+    "GPU wait",
+    "present",
+    "worker idle",
+    "present wait",
+    "queue submit",
+    "resnapshot",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
@@ -166,7 +203,7 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 12> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     /// GPU waits by the zone they happened in (Other: outside every zone)
@@ -239,14 +276,20 @@ private:
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
 enum class Counter : u32 {
-    DownloadBytes,  ///< Buffer data copied back from the host GPU at fences
-    DownloadCopies, ///< Buffer ranges copied back
-    DmaReadBytes,   ///< Guest memory the native MME read with DMA
+    DownloadBytes,           ///< Buffer data copied back from the host GPU at fences
+    DownloadCopies,          ///< Buffer ranges copied back
+    DmaReadBytes,            ///< Guest memory the native MME read with DMA
     DownloadBytesOnDmaPages, ///< Of DownloadBytes: on pages the MME has DMA-read
-    MethodWrites,   ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
-    SameValueWrites, ///< Of MethodWrites: the register already held the value
-    AcquireChecks,  ///< Semaphore acquires evaluated
-    AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    MethodWrites,            ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
+    SameValueWrites,         ///< Of MethodWrites: the register already held the value
+    AcquireChecks,           ///< Semaphore acquires evaluated
+    AcquireWaits,            ///< Of AcquireChecks: not met yet (the channel waits)
+    /// TEST: the split's front publishes words while its back waits for work (GpuSplit::Publish):
+    /// the back's wait since it ran out or since the first of them was sent (Ticks), and count
+    LatePublishTicks,
+    LatePublishes,
+    ResnapshotWords, ///< TEST: command list words copied again at resumes
+    EarlyPublishes,  ///< TEST: publishes to a back waiting for work, before publish_every
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -367,6 +410,15 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    if (data.counters[9] != 0 || data.counters[10] != 0 || data.counters[11] != 0) {
+        // TEST: the back idle while words it could run waited on the front.
+        line += fmt::format(" | publishes to an idle back late by {:.1f} ms ({:.0f}/s), early "
+                            "{:.0f}/s | resnapshot words {:.0f}/s",
+                            static_cast<double>(data.counters[8]) * 1000.0 / window_ticks,
+                            static_cast<double>(data.counters[9]) * 1e9 / window,
+                            static_cast<double>(data.counters[11]) * 1e9 / window,
+                            static_cast<double>(data.counters[10]) * 1e9 / window);
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {

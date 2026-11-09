@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -27,9 +29,26 @@ class MemoryManager;
 
 namespace Tegra::Engines {
 class EngineInterface;
+enum class EngineTypes : u32;
 }
 
 namespace VideoCommon {
+
+/// TEST (EDEN_NX2_GPU_PROFILE / EDEN_NX2_ACQUIRE_VERIFY): what sent the last write the front could
+/// not place (GpuSplit::TagUnplaced), for why the QMD view could not value a signal.
+enum class UnplacedKind : u8 {
+    Other,      ///< A deferred call nobody tagged
+    RunCommand, ///< A function the CPU queued in order (unmaps, events)
+    Engine,     ///< An engine method the front sends as it is (blits)
+    Oversized,  ///< A placed write longer than the coarse slots take
+    QmdLaunch,  ///< A QMD launch the view could not value
+    InlineQmd,  ///< An inline QMD behind a change of the mappings
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(UnplacedKind::Count)>
+    unplaced_kind_names{"other",        "CPU functions", "engines", "oversized writes",
+                        "QMD launches", "inline QMDs"};
 
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
 enum class DrainSite : u32 {
@@ -217,6 +236,9 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (log_methods) {
+            LogMethod(engine, method); // TEST
+        }
         NoteWrites(writes);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
@@ -230,6 +252,9 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+        if (log_methods) {
+            LogMethod(engine, method); // TEST
+        }
         NoteWrites(writes);
     }
 
@@ -268,7 +293,7 @@ public:
         Commit(2 + payload);
         NoteWrites(writes);
     }
-    void DeferFunction(std::function<void()>&& func);
+    void DeferFunction(std::function<void()>&& func, Writes writes = Writes::Anywhere);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
@@ -326,6 +351,13 @@ public:
     }
     /// Logs g_acquire_stats every 10 s (front, while they count).
     void ReportAcquire();
+    [[nodiscard]] std::string MethodEndingAt(u64 end) const;
+    [[nodiscard]] u64 Backlog() const {
+        return write_position - consumed.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] u64 Unpublished() const {
+        return write_position - published_local;
+    }
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
     /// The ring position after the entries sent so far, for Ran and WaitForPosition.
@@ -496,6 +528,20 @@ public:
     [[nodiscard]] u64 LastMappingChange() const {
         return (std::min)(last_mapping_change, write_position);
     }
+    void TagUnplaced(UnplacedKind kind) {
+        if (last_unplaced_write == write_position) {
+            last_unplaced_kind = kind;
+        }
+        if (last_mapping_change == write_position) {
+            last_mapping_kind = kind;
+        }
+    }
+    [[nodiscard]] UnplacedKind LastUnplacedKind() const {
+        return last_unplaced_kind;
+    }
+    [[nodiscard]] UnplacedKind LastMappingKind() const {
+        return last_mapping_kind;
+    }
     /// Once the back ran everything before the position returned, no entry sent so far writes
     /// guest memory in [address, address + size) of `memory` but through the GPU caches
     /// (Writes::Caches): what the back reads there without them, as the QMD scheduler does, is in
@@ -602,6 +648,9 @@ private:
     }
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
+        if (profile_publishes && write_position == published_local) {
+            NoteFirstUnpublished();
+        }
         last_entry_start = write_position;
         write_position += words;
         PublishIfDue();
@@ -620,10 +669,27 @@ private:
         if (unpublished >= PublishAfterWait &&
             back_idle_at.load(std::memory_order_relaxed) == published_local) {
             Count(g_acquire_stats.early_publishes);
+            if (profile_publishes) {
+                NoteEarlyPublish();
+            }
             Publish();
         }
     }
+    void NoteFirstUnpublished();
+    void NoteEarlyPublish();
+    void NoteLatePublish();
     void WaitForSpace(size_t words);
+    /// TEST (EDEN_NX2_GPU_PROFILE / EDEN_NX2_ACQUIRE_VERIFY): the engine method entries sent, by
+    /// the position after them.
+    struct SentMethod {
+        u64 end;
+        std::optional<Tegra::Engines::EngineTypes> engine; ///< The class it was bound as
+        u32 method;
+    };
+    static constexpr size_t LoggedMethods = size_t{1} << 16;
+    /// EDEN_NX2_GPU_PROFILE / EDEN_NX2_ACQUIRE_VERIFY as the split started (MaybeStart).
+    bool log_methods{};
+    void LogMethod(const Tegra::Engines::EngineInterface* engine, u32 method);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -675,9 +741,15 @@ private:
     u64 last_any_write{};
     u64 last_unplaced_write{};
     u64 last_mapping_change{};
+    UnplacedKind last_unplaced_kind{};
+    UnplacedKind last_mapping_kind{};
     u64 last_noted_write{};
     alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
     alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
+    bool profile_publishes{};
+    u64 first_unpublished_ticks{};
+    std::unique_ptr<SentMethod[]> logged_methods;
+    u64 logged_method_count{};
     bool publish_held{};
     u64 published_local{};
     u64 consumed_cache{};
@@ -736,6 +808,7 @@ private:
     /// it equals published_local, the back waits for the words the front holds (Commit). Port of
     /// the publish part of 62db242b34 (jpkto, PR #805).
     alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
+    alignas(128) std::atomic<u64> back_idle_since{};
     std::jthread back_thread;
 };
 

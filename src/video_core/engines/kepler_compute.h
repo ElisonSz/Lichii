@@ -293,6 +293,7 @@ public:
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control,
                          bool from_macro);
     void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
+    void FrontQmdCheck(VideoCommon::GpuSplit& split); ///< TEST
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

@@ -182,6 +182,7 @@ public:
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
         subchannel_type[subchannel_id] = engine_type;
+        engine->bound_type = engine_type;
     }
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
@@ -216,8 +217,9 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
-    /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
+    /// TEST: compares parsed command words with memory at their place on the back.
+    void CheckParsedEntry(GPUVAddr address, std::span<const CommandHeader> commands,
+                          bool skipped_writers, u32 path);
     void ShadowEngineMethod(Engines::EngineTypes type, u32 method, u32 argument);
     void NoteEngineWrites(Engines::EngineTypes type, u32 method);
     /// Copies the list's words from memory again, as of suspension count `now`, from entry

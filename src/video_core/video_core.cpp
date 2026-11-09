@@ -17,6 +17,7 @@
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -54,17 +55,18 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
 namespace VideoCore {
 
 /// @brief Creates an emulated GPU instance using the given system context.
-void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window,
-               Core::System& system) {
+void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::ReadQmdViewSwitch();
+    VideoCommon::Nx2AcquireStats::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
     Tegra::Nx2ListIndirect::ReadSwitch();
+    VideoCommon::Nx2DrainCheck::ReadSwitch();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
