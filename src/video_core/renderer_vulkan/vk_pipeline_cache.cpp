@@ -849,21 +849,40 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // TEST: where shutdown spends its time (the frontend stops waiting after 10 s).
+    auto step_begin = std::chrono::steady_clock::now();
+    const auto step = [&step_begin](const char* name) {
+        const auto now = std::chrono::steady_clock::now();
+        LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} took {:.1f} ms", name,
+                 std::chrono::duration<double, std::milli>(now - step_begin).count());
+        step_begin = now;
+    };
     serialization_stop.request_stop();
     StopBackgroundJobs();
+    step("stopping background jobs");
     // The pipelines' builds end before the driver pipeline cache they build into goes.
     shader_jobs->Shutdown();
+    step("shader jobs");
     serialization_thread.WaitForRequests();
     SaveUsedPipelines();
+    step("serialization and used pipelines");
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    step("saving the driver pipeline cache");
     // After the records the serialization thread queued: its writer drains on destruction
     shader_cache_v2 = nullptr;
     cache_v2.reset();
+    step("shader cache v2");
+    const size_t graphics_count = graphics_cache.size();
     graphics_cache.clear();
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} graphics pipelines", graphics_count);
+    step("destroying graphics pipelines");
+    const size_t evicted_count = evicted_pipelines.size();
     evicted_pipelines.clear();
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} evicted pipelines", evicted_count);
+    step("destroying evicted pipelines");
     if (pipeline_binaries) {
         pipeline_binaries->LogCounts("at the end of the session");
         pipeline_binaries.reset();
