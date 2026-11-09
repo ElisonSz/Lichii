@@ -261,6 +261,12 @@ public:
         std::vector<Word> methods; ///< Ascending, each once
         bool methods_known{true};
         bool data_ram{};
+        /// The data RAM words DREAD can read and the registers MME_READ can read, ascending, each
+        /// once; not all of them where `..._known` is false (an address the code computes).
+        std::vector<Word> data_ram_reads;
+        bool data_ram_reads_known{true};
+        std::vector<Word> register_reads;
+        bool register_reads_known{true};
     };
 
     static Effects AnalyzeEffects(std::span<const Word> code, Word start) {
@@ -420,7 +426,13 @@ public:
                     case 17: case 18: case 19: case 20: case 21:
                         value = both ? known(taken(d.op[lane]) ? ~0U : 0) : unknown;
                         break;
-                    case 22: value = unknown; break; // A register
+                    case 22: // A register
+                        value = unknown;
+                        if (both)
+                            effects.register_reads.push_back((a + b) & 0xffff);
+                        else
+                            effects.register_reads_known = false;
+                        break;
                     case 23:
                         if (imm < 2) break;
                         // Entered, or skipped with a count of 0. Its last instruction may start
@@ -453,7 +465,14 @@ public:
                         if (!both || !jumps) flow[flow_count++] = {Flow::Next, 0, false};
                         break;
                     }
-                    case 30: effects.data_ram = true; value = unknown; break;
+                    case 30:
+                        effects.data_ram = true;
+                        value = unknown;
+                        if (x.known)
+                            effects.data_ram_reads.push_back(a);
+                        else
+                            effects.data_ram_reads_known = false;
+                        break;
                     case 31: effects.data_ram = true; break;
                     default: break; // 7: the load barrier
                     }
@@ -513,9 +532,11 @@ public:
                 }
             }
         }
-        std::ranges::sort(effects.methods);
-        effects.methods.erase(std::unique(effects.methods.begin(), effects.methods.end()),
-                              effects.methods.end());
+        for (std::vector<Word>* list :
+             {&effects.methods, &effects.data_ram_reads, &effects.register_reads}) {
+            std::ranges::sort(*list);
+            list->erase(std::unique(list->begin(), list->end()), list->end());
+        }
         return effects;
     }
 

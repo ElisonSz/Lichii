@@ -14,6 +14,7 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/nx2_list_slots.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -228,6 +229,22 @@ public:
         return last_stream_uniform;
     }
 
+    /// GPU-written list words the host GPU took over (Nx2ListIndirect), owed in a compute
+    /// dispatch's constant buffer [device_addr, +size) that `buffer` holds at `offset`, filled
+    /// already: the slot words go over the placeholders. `read(device)`: guest memory's word.
+    template <typename Read>
+    void Nx2PatchComputeUniform(DAddr device_addr, u32 size, VkBuffer buffer, u64 offset,
+                                Read&& read) {
+        if (nx2_list_slots.HasOwed()) {
+            nx2_list_slots.PatchUniform(device_addr, size, buffer, offset, read);
+        }
+    }
+
+    /// The slots of GPU-written list words (Nx2ListIndirect).
+    [[nodiscard]] Nx2ListSlots& Nx2Slots() noexcept {
+        return nx2_list_slots;
+    }
+
     /// Adds `ref` to the descriptor payload exactly as BindMappedUniformBuffer did when it made
     /// the allocation (it is the very same call). The caller guarantees the allocation is still
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
@@ -351,6 +368,8 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+
+    Nx2ListSlots nx2_list_slots{memory_allocator, scheduler};
 };
 
 struct BufferCacheParams {

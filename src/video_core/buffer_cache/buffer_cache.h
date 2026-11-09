@@ -2847,11 +2847,18 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
             needs_alignment_stream ||
             (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
              !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+        // GPU-written list words owed there go over their placeholders (Nx2ListIndirect).
+        const auto guest_word = [this](DAddr word) {
+            return device_memory.Read<u32>(word);
+        };
         if constexpr (!IS_OPENGL) {
             if (use_fast_buffer) {
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+                const auto stream = runtime.LastStreamUniformRef();
+                runtime.Nx2PatchComputeUniform(binding.device_addr, size, stream.buffer,
+                                               stream.offset, guest_word);
                 return;
             }
         }
@@ -2859,6 +2866,12 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         buffer.MarkUsage(offset, size);
+        if constexpr (!IS_OPENGL) {
+            runtime.Nx2PatchComputeUniform(binding.device_addr, size, buffer.Handle(), offset,
+                                           guest_word);
+        } else {
+            (void)guest_word;
+        }
         if constexpr (NEEDS_BIND_UNIFORM_INDEX) {
             runtime.BindComputeUniformBuffer(binding_index, buffer, offset, size);
             ++binding_index;

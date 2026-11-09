@@ -238,6 +238,9 @@ public:
     /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
     /// `*pending` and pending_list_tick instead of waiting (the result is false then).
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
+    /// Takes a complete compute macro call's GPU-written parameters as slot placeholders when
+    /// a tagged dry run proves the front can leave their values to the host GPU.
+    bool TakeGpuWrittenListWords(const CommandListHeader& header);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 

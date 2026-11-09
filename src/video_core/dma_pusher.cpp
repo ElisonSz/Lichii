@@ -17,10 +17,9 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
-#include "video_core/nx2_profile.h"
-#include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/dma_pusher.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -30,6 +29,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -355,6 +356,11 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (gpu_written && TakeGpuWrittenListWords(header)) {
+            // The words stay on the host GPU; the front parses their slot placeholders.
+            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (bool pending = false;
@@ -880,6 +886,58 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
             memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
         }
         chunk = chunk_end;
+    }
+    return true;
+}
+
+bool DmaPusher::TakeGpuWrittenListWords(const CommandListHeader& header) {
+    // Ocarina of Time's compute culling writes the group counts of a later dispatch as the
+    // parameters of compute macro 0xe74, which only stores them in the data RAM for 0xe7a and
+    // 0xe76 to upload and launch with. The front need not wait for the culling to run and its
+    // copy to come back: the macros run on placeholders the host GPU's copy of the words takes
+    // the place of (Nx2ListIndirect, KeplerCompute::FrontTakeListWords).
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!Nx2ListIndirect::g_enabled || rasterizer == nullptr || command_resume_offset != 0 ||
+        !split.Active() || !split.FrontMacros()) {
+        return false;
+    }
+    const u32 count = static_cast<u32>(header.size);
+    // All of a macro call's parameters, from its first: its header ended the entry before.
+    if (count == 0 || count > Nx2ListIndirect::SlotWords || dma_state.method_count != count ||
+        dma_state.method < MacroRegistersStart || (dma_state.method & 1) != 0 ||
+        subchannels[dma_state.subchannel] == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::KeplerCompute) {
+        return false;
+    }
+    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
+    if (!compute->FrontRunsMacros() || !rasterizer->Nx2ListSlotsSupported()) {
+        return false;
+    }
+    // GPU maps drain the split before later command reads (GPUThread::RunCommand), so the
+    // back finds the same mappings here. The words must occupy contiguous device memory.
+    const u64 bytes = u64{count} * sizeof(u32);
+    const auto device = memory_manager.GpuToCpuAddress(dma_state.dma_get);
+    const auto last = memory_manager.GpuToCpuAddress(dma_state.dma_get + bytes - 1);
+    if (!device || !last || *last != *device + bytes - 1) {
+        return false;
+    }
+    const std::optional<u32> slot = rasterizer->Nx2AcquireListSlot();
+    if (!slot) {
+        return false;
+    }
+    if (!compute->FrontTakeListWords(split, dma_state.method, count, *slot)) {
+        rasterizer->Nx2ReleaseListSlot(*slot); // Nothing sent with it
+        return false;
+    }
+    // At the list's place: after the work sent before it, the GPU fetched the list there.
+    split.Defer(
+        [rasterizer_ = rasterizer, device_ = *device, count, slot_ = *slot] {
+            rasterizer_->Nx2SnapshotListWords(device_, count, slot_);
+        },
+        0, VideoCommon::GpuSplit::Writes::Noted);
+    command_headers.resize_destructive(count);
+    for (u32 k = 0; k < count; ++k) {
+        command_headers[k].argument = Nx2ListIndirect::Placeholder(*slot, k);
     }
     return true;
 }

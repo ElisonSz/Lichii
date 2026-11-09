@@ -115,6 +115,13 @@ public:
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    bool Nx2ListSlotsSupported() const override;
+    std::optional<u32> Nx2AcquireListSlot() override;
+    void Nx2ReleaseListSlot(u32 slot) override;
+    void Nx2SnapshotListWords(DAddr device_addr, u32 count, u32 slot) override;
+    void Nx2NoteOwedListWord(DAddr device_addr, u32 value) override;
+    void Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) override;
+    void Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
