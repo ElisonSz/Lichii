@@ -144,14 +144,16 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
     using Kind = ViewAnswer::Kind;
     const auto memory = [&] { return ReadSemaphoreMemory(dma_pusher, acquire.address, device); };
     // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
-    // KeplerCompute::ProcessNativeMethod), also where the buffer cache holds them newer. Not on
-    // a word the mirror diverts (Nx2MirrorShadow): acquires there see the mirrored counter until
-    // a direct release of the other one, which may be behind it.
+    // KeplerCompute::ProcessNativeMethod). A word the mirror diverts (Nx2MirrorShadow) can
+    // instead fall behind when a direct release replaces the mirrored counter.
     const bool advances = acquire.WaitsToReach() && !Nx2MirrorShadow::Get().Diverts(device);
     if (Nx2MayBeGpuWritten(device, sizeof(u32)) &&
         dma_pusher.rasterizer->MustFlushRegion(device, sizeof(u32),
                                                VideoCommon::CacheType::BufferCache)) {
-        return {advances && acquire.Matches(memory()) ? Kind::Met : Kind::Flush};
+        // Guest memory is not authoritative while the cache owns these bytes. A direct
+        // semaphore release may have advanced RAM without updating that copy; the download
+        // used by the drain path can therefore lower the word, even for a >= acquire.
+        return {Kind::Flush};
     }
     return VideoCommon::GpuSplit::Get().ViewSemaphore(
         device, advances, acquire.writers_before,
