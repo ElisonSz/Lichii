@@ -69,7 +69,8 @@ void TrackSemaphoreView(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
 // Reads a semaphore word as a GPU acquire sees it in memory: a mirrored release the guest memory
 // does not hold counts (Nx2MirrorShadow). Without a flush: the buffer cache may hold the word
 // newer where the GPU wrote its page (ReadSemaphoreWord, AskView).
-u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<DAddr> device) {
+u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<DAddr> device,
+                        bool* shadow_used = nullptr) {
     if (device) {
         TrackSemaphoreView(dma_pusher, address, *device);
     }
@@ -78,6 +79,9 @@ u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<D
         return guest;
     }
     const auto mirrored = Nx2MirrorShadow::Get().Read(*device, guest);
+    if (shadow_used != nullptr) {
+        *shadow_used = mirrored.has_value();
+    }
     if (VideoCommon::SemRecorder::Enabled()) {
         VideoCommon::SemRecorder::Add({.kind = "memory",
                                        .address = *device,
@@ -211,7 +215,16 @@ using ViewAnswer = VideoCommon::GpuSplit::SemaphoreView;
 ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, DAddr device) {
     using Kind = ViewAnswer::Kind;
     TrackSemaphoreView(dma_pusher, acquire.address, device);
-    const auto memory = [&] { return ReadSemaphoreMemory(dma_pusher, acquire.address, device); };
+    const auto memory = [&](bool fenced) -> std::optional<u32> {
+        bool shadow_used = false;
+        const u32 value = ReadSemaphoreMemory(dma_pusher, acquire.address, device, &shadow_used);
+        // A positioned wait consumes reports, not their fence callbacks. An older direct
+        // callback can still remove this shadow before the latest fenced release lands.
+        if (fenced && shadow_used) {
+            return std::nullopt;
+        }
+        return value;
+    };
     // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
     // KeplerCompute::ProcessNativeMethod). A word the mirror diverts (Nx2MirrorShadow) can
     // instead fall behind when a direct release replaces the mirrored counter.

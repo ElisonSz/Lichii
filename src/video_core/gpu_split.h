@@ -490,8 +490,8 @@ public:
     /// The view of an acquire on the word at `device_address`, as far as the writes sent to it
     /// tell. `matches(value)`: whether the word holding `value` meets the acquire. `advances`: a
     /// greater-or-equal acquire on a word that only advances. `writers_before`: the
-    /// LastWriterPosition when the acquire was sent. `memory()`: the word in memory, as GPU
-    /// acquires read it.
+    /// LastWriterPosition when the acquire was sent. `memory(fenced)`: the word in memory, as GPU
+    /// acquires read it, or none if that source is unreliable while a fenced write is pending.
     template <typename Matches, typename Memory>
     [[nodiscard]] SemaphoreView ViewSemaphore(u64 device_address, bool advances, u64 writers_before,
                                               Matches&& matches, Memory&& memory) const {
@@ -507,8 +507,8 @@ public:
         if (queued && queued->fenced) {
             // It lands once a fence ran, at no position the front can wait for: memory decides,
             // as after a drain, and the landing latches the waiter or a poll finds the word.
-            // Writes sent to the word before it are in memory once the back ran it. A
-            // greater-or-equal acquire memory meets now meets it then too.
+            // Earlier fenced writes can still land after the back ran this entry. The memory
+            // reader must reject a source those callbacks can invalidate (a mirror shadow).
             if (!Ran(queued->position) && !(queued->known && advances)) {
                 return {ViewKind::Unknown, queued->position, true};
             }
@@ -529,7 +529,8 @@ public:
             }
             return {ViewKind::Unknown, writers_before};
         }
-        if (!matches(memory())) {
+        const std::optional<u32> current = memory(queued && queued->fenced);
+        if (!current || !matches(*current)) {
             return {ViewKind::NotMet};
         }
         return settled ? SemaphoreView{ViewKind::Met}

@@ -1221,7 +1221,7 @@ TEST_CASE("Split's semaphore view decides acquires by the releases and writers q
     };
     const auto equals = [](u32 value) { return [value](u32 word) { return word == value; }; };
     const auto at_least = [](u32 value) { return [value](u32 word) { return word >= value; }; };
-    const auto memory = [](u32 value) { return [value] { return value; }; };
+    const auto memory = [](u32 value) { return [value](bool) { return value; }; };
     split.Defer([&release] {
         while (!release.load()) {
             std::this_thread::yield();
@@ -1266,6 +1266,14 @@ TEST_CASE("Split's semaphore view decides acquires by the releases and writers q
     REQUIRE(split.QueuedSemaphoreWriteAt(0x1008).has_value());
     REQUIRE(split.ViewSemaphore(0x1008, false, writers, equals(6), memory(6)).kind == Kind::Met);
     REQUIRE(split.ViewSemaphore(0x1008, false, writers, equals(7), memory(6)).kind == Kind::NotMet);
+    // An older fenced callback can discard a satisfying mirror shadow even after this entry
+    // ran. A raw-memory sample above remains usable; an unreliable shadow sample does not.
+    const auto shadow = [](bool fenced) -> std::optional<u32> {
+        return fenced ? std::nullopt : std::optional<u32>{100};
+    };
+    REQUIRE(split.ViewSemaphore(0x1008, false, writers, at_least(7), shadow).kind == Kind::NotMet);
+    completion.reset();
+    REQUIRE(split.ViewSemaphore(0x1008, false, writers, at_least(7), shadow).kind == Kind::Met);
 }
 
 TEST_CASE("Split publishes to a back that waits for work after a few words",
