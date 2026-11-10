@@ -583,6 +583,12 @@ private:
                 checks.push_back({word, value, known, at_least});
             }
         };
+        SemRecorder::Add({.kind = "front-qmd",
+                          .address = *device,
+                          .gpu = address,
+                          .value = payload,
+                          .position = split.Position(),
+                          .flags = flags});
         if (reduction) {
             const bool is_signed = ((flags >> 24) & 1) != 0;
             const u32 value =

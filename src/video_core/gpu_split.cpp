@@ -285,6 +285,7 @@ void GpuSplit::CompleteFencedEntry(u64 tag) {
         return;
     }
     it->complete = true;
+    SemRecorder::Add({.kind = "fence-entry-complete", .entry = tag});
     PublishFencedEntries();
 }
 
@@ -440,6 +441,20 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.fenced = true;
     }
     semaphore_writes.insert_or_assign(word, write);
+    if (SemRecorder::Enabled()) {
+        SemRecorder::Track(word);
+        SemRecorder::Add({.kind = "note",
+                          .address = word,
+                          .value = payload,
+                          .after = write.payload,
+                          .position = write.position,
+                          .entry = write.entry,
+                          .consumed = consumed.load(std::memory_order_acquire),
+                          .fence = fenced_landed.load(std::memory_order_acquire),
+                          .flags = u64{known} | (u64{at_least} << 1) |
+                                   (u64{landing == Landing::Fenced} << 2) |
+                                   (u64{write.known} << 3) | (u64{write.fenced} << 4)});
+    }
     Nx2AcquireDetails::NoteWriter(word, writer);
     using Releaser = Nx2AcquireStats::Releaser;
     const auto releaser =
@@ -453,10 +468,33 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
     Nx2AcquireStats::NoteRelease(word, releaser);
 }
 
+SemRecorder::Event GpuSplit::SemaphoreRecordState(u64 device_address, const char* kind) const {
+    const auto it = semaphore_writes.find(device_address & ~u64{3});
+    const bool found = it != semaphore_writes.end();
+    const SemaphoreWrite write = found ? it->second : SemaphoreWrite{};
+    // The lookup's actual return is logged separately: progress can advance between these
+    // diagnostic loads, so state alone must not be mistaken for the decision's snapshot.
+    return {.kind = kind,
+            .address = device_address,
+            .value = write.payload,
+            .position = write.position,
+            .entry = write.entry,
+            .consumed = consumed.load(std::memory_order_acquire),
+            .fence = fenced_landed.load(std::memory_order_acquire),
+            .flags = u64{found} | (u64{write.known} << 1) | (u64{write.at_least} << 2) |
+                     (u64{write.fenced} << 3) | (u64{found && InMemory(write)} << 4)};
+}
+
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     u64 device_address) const {
     const auto it = semaphore_writes.find(device_address & ~u64{3});
-    if (it == semaphore_writes.end() || InMemory(it->second)) {
+    const bool queued = it != semaphore_writes.end() && !InMemory(it->second);
+    if (SemRecorder::Enabled()) {
+        auto event = SemaphoreRecordState(device_address, "lookup");
+        event.flags |= u64{queued} << 5;
+        SemRecorder::Add(event);
+    }
+    if (!queued) {
         return std::nullopt;
     }
     return QueuedSemaphoreWrite{it->second.payload, it->second.known,  it->second.at_least,

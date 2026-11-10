@@ -18,6 +18,7 @@
 
 #include "common/bit_util.h"
 #include "common/common_types.h"
+#include "video_core/nx2_sem_recorder.h"
 
 namespace Tegra {
 
@@ -183,6 +184,12 @@ public:
             direct_words.insert(word);
             has_direct.store(true, std::memory_order_release);
         }
+        if (VideoCommon::SemRecorder::Enabled()) {
+            VideoCommon::SemRecorder::Add({.kind = "shadow-direct-drop",
+                                           .address = word,
+                                           .gpu = gpu_address,
+                                           .flags = words.contains(word)});
+        }
         words.erase(word);
     }
 
@@ -214,6 +221,7 @@ public:
     /// guest: what guest memory holds at the word now.
     void Set(u64 device_address, u32 value, u32 guest) {
         std::scoped_lock lock{mutex};
+        VideoCommon::SemRecorder::Record("shadow-set", device_address, value, guest);
         words.insert_or_assign(device_address & ~u64{3}, Word{value, guest});
         has_words.store(true, std::memory_order_release);
     }
@@ -229,7 +237,11 @@ public:
         if (it == words.end()) {
             return std::nullopt;
         }
+        VideoCommon::SemRecorder::Record("shadow-read", device_address, it->second.value,
+                                         it->second.guest, guest);
         if (it->second.guest != guest) {
+            VideoCommon::SemRecorder::Record("shadow-changed-drop", device_address,
+                                             it->second.value, it->second.guest, guest);
             words.erase(it);
             return std::nullopt;
         }
@@ -265,6 +277,7 @@ inline void Nx2ClearSemaphoreRegions() {
         g_nx2_semaphore_regions.clear();
     }
     Nx2MirrorShadow::Get().Clear();
+    VideoCommon::SemRecorder::Reset();
 }
 
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
@@ -569,6 +582,7 @@ public:
 
     /// A GPU write of value to the u32 at device_address.
     void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown) {
+        VideoCommon::SemRecorder::Record("waiter-write", device_address, value);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -576,6 +590,8 @@ public:
         for (Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
                 slot.address == device_address && Matches(slot, value)) {
+                VideoCommon::SemRecorder::Record("waiter-latch", device_address, value, slot.value,
+                                                 slot.operation);
                 const u8 previous = slot.latched.load(std::memory_order_relaxed);
                 // Keep the first source, and retain the release publication on every matching
                 // write: the acquire sees the engine's preceding writes as before.

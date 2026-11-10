@@ -949,6 +949,11 @@ void DmaPusher::NoteEngineWrites(Engines::EngineTypes type, u32 method) {
     if (!device) {
         return;
     }
+    VideoCommon::SemRecorder::Add({.kind = "front-dma",
+                                   .address = *device,
+                                   .gpu = writes.semaphore.address,
+                                   .value = dma_registers[MaxwellDMA::SemaphoreMethod + 2],
+                                   .position = split.Position()});
     split.NoteSemaphoreWrite(*device, dma_registers[MaxwellDMA::SemaphoreMethod + 2], true,
                              VideoCommon::GpuSplit::Landing::Fenced, false,
                              VideoCommon::GpuSplit::SemaphoreWriter::Copy);

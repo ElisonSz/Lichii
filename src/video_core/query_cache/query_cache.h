@@ -277,6 +277,28 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    if (SemRecorder::Enabled()) {
+        SemRecorder::Track(cpu_addr);
+        if (has_timestamp) {
+            SemRecorder::Track(cpu_addr + 4);
+            SemRecorder::Track(cpu_addr + 8);
+            SemRecorder::Track(cpu_addr + 12);
+        }
+        const GPUVAddr partner = Tegra::Nx2SemaphoreMirror(addr);
+        const GPUVAddr pair_gpu = partner != 0                           ? partner
+                                  : Tegra::Nx2InSemaphoreFirstPage(addr) ? addr + 0x1000
+                                                                         : 0;
+        SemRecorder::Add(
+            {.kind = "report-request",
+             .address = cpu_addr,
+             .size = has_timestamp ? 16U : 4U,
+             .gpu = addr,
+             .pair = pair_gpu != 0 ? gpu_memory->GpuToCpuAddress(pair_gpu).value_or(0) : 0,
+             .value = payload,
+             .before = static_cast<u64>(counter_type),
+             .entry = GpuSplit::Get().BackEntry().value_or(0),
+             .flags = static_cast<u64>(flags)});
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -300,8 +322,16 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                      counter_type, mirrored, report_size, report_noted,
                                      split_completion = std::move(split_completion),
                                      split_entry = VideoCommon::GpuSplit::Get().BackEntry(),
-                                     watched = watch != 0 &&
-                                               (addr & ~GPUVAddr{0xf}) == watch]() mutable {
+                                     watched =
+                                         watch != 0 && (addr & ~GPUVAddr{0xf}) == watch]() mutable {
+        if (SemRecorder::Enabled()) {
+            SemRecorder::Add({.kind = "report-callback",
+                              .address = cpu_addr,
+                              .gpu = addr,
+                              .value = query_base->value,
+                              .entry = split_entry.value_or(0),
+                              .flags = static_cast<u64>(query_base->flags)});
+        }
         SCOPE_EXIT {
             if (report_noted) {
                 impl->rasterizer.FinishReport(cpu_addr, report_size);
@@ -336,12 +366,28 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         streamer->SetAccumulationValue(query_base->value);
         FinishReads(cpu_addr, True(query_base->flags & QueryFlagBits::HasTimestamp) ? 16 : 4);
         auto& shadow = Tegra::Nx2MirrorShadow::Get();
+        if (SemRecorder::Enabled()) {
+            u32 guest_before;
+            std::memcpy(&guest_before, pointer, sizeof(guest_before));
+            SemRecorder::Add(
+                {.kind = "report-write-begin",
+                 .address = cpu_addr,
+                 .gpu = addr,
+                 .value = query_base->value,
+                 .before = guest_before,
+                 .entry = split_entry.value_or(0),
+                 .flags =
+                     u64{mirrored} | (u64{True(query_base->flags & QueryFlagBits::IsFence)} << 1)});
+        }
         if (mirrored && shadow.Diverts(cpu_addr)) {
             u32 guest;
             std::memcpy(&guest, pointer, sizeof(guest));
             shadow.Set(cpu_addr, static_cast<u32>(query_base->value), guest);
         } else if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
+            SemRecorder::Bytes("report-timestamp", cpu_addr + 8, &timestamp, sizeof(timestamp));
+            SemRecorder::Bytes("report-wide", cpu_addr, &query_base->value,
+                               sizeof(query_base->value));
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
@@ -350,6 +396,19 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         if (!mirrored && counter_type == QueryType::Payload) {
             shadow.NoteDirectRelease(cpu_addr, addr);
+        }
+        if (SemRecorder::Enabled()) {
+            u32 guest;
+            std::memcpy(&guest, pointer, sizeof(guest));
+            SemRecorder::Add(
+                {.kind = "report-landed",
+                 .address = cpu_addr,
+                 .gpu = addr,
+                 .value = query_base->value,
+                 .after = guest,
+                 .entry = split_entry.value_or(0),
+                 .flags =
+                     u64{mirrored} | (u64{True(query_base->flags & QueryFlagBits::IsFence)} << 1)});
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
             cpu_addr, static_cast<u32>(query_base->value),
@@ -383,6 +442,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (immediate) {
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
             auto& shadow = Tegra::Nx2MirrorShadow::Get();
+            if (SemRecorder::Enabled()) {
+                u32 guest_before;
+                std::memcpy(&guest_before, pointer, sizeof(guest_before));
+                SemRecorder::Add({.kind = "report-immediate-begin",
+                                  .address = cpu_addr,
+                                  .gpu = addr,
+                                  .value = payload,
+                                  .before = guest_before,
+                                  .entry = GpuSplit::Get().BackEntry().value_or(0),
+                                  .flags = u64{mirrored}});
+            }
             if (mirrored && shadow.Diverts(cpu_addr)) {
                 u32 guest;
                 std::memcpy(&guest, pointer, sizeof(guest));
@@ -390,6 +460,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             } else if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
+                SemRecorder::Bytes("report-timestamp", cpu_addr + 8, &timestamp, sizeof(timestamp));
+                SemRecorder::Bytes("report-wide", cpu_addr, &value, sizeof(value));
                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
                 std::memcpy(pointer, &value, sizeof(value));
             } else {
@@ -397,6 +469,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             if (!mirrored) {
                 shadow.NoteDirectRelease(cpu_addr, addr);
+            }
+            if (SemRecorder::Enabled()) {
+                u32 guest;
+                std::memcpy(&guest, pointer, sizeof(guest));
+                SemRecorder::Add({.kind = "report-immediate",
+                                  .address = cpu_addr,
+                                  .gpu = addr,
+                                  .value = payload,
+                                  .after = guest,
+                                  .entry = GpuSplit::Get().BackEntry().value_or(0),
+                                  .flags = u64{mirrored}});
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                 cpu_addr, payload, Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease);

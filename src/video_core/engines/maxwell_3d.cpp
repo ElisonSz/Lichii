@@ -1531,6 +1531,12 @@ void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& 
         operation == Regs::ReportSemaphore::Operation::Release && report.query.short_query != 0;
     const auto landing = payload && !fence_flagged ? VideoCommon::GpuSplit::Landing::AtRun
                                                    : VideoCommon::GpuSplit::Landing::Fenced;
+    VideoCommon::SemRecorder::Add({.kind = "front-3d",
+                                   .address = *device,
+                                   .gpu = report.Address(),
+                                   .value = report.payload,
+                                   .position = split.Position(),
+                                   .flags = u64{payload}});
     split.NoteSemaphoreWrite(*device, report.payload, payload, landing, false,
                              VideoCommon::GpuSplit::SemaphoreWriter::Report3D);
     if (report.query.short_query == 0) {

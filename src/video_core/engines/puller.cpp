@@ -56,6 +56,15 @@ u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<D
         return guest;
     }
     const auto mirrored = Nx2MirrorShadow::Get().Read(*device, guest);
+    if (VideoCommon::SemRecorder::Enabled()) {
+        VideoCommon::SemRecorder::Track(*device);
+        VideoCommon::SemRecorder::Add({.kind = "memory",
+                                       .address = *device,
+                                       .gpu = address,
+                                       .value = mirrored.value_or(guest),
+                                       .before = guest,
+                                       .flags = u64{mirrored.has_value()}});
+    }
     if (WatchSemaphore(address)) {
         LOG_INFO(HW_GPU, "Semaphore watch: memory {:#x} guest {:#x} shadow {} seen {:#x}", address,
                  guest, mirrored.has_value(), mirrored.value_or(guest));
@@ -73,7 +82,9 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
         const u32 before = watched ? dma_pusher.memory_manager.Read<u32>(address) : 0;
         VideoCommon::GpuSplit::Get().Run(
             [rasterizer = dma_pusher.rasterizer, device = *device] {
+                VideoCommon::SemRecorder::Record("drain-flush-begin", device);
                 rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+                VideoCommon::SemRecorder::Record("drain-flush-end", device);
             },
             VideoCommon::DrainSite::SemaphoreFlush);
         if (watched) {
@@ -134,6 +145,12 @@ void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
     const auto landing = True(properties & QueryPropertiesFlags::IsAFence)
                              ? VideoCommon::GpuSplit::Landing::Fenced
                              : VideoCommon::GpuSplit::Landing::AtRun;
+    VideoCommon::SemRecorder::Add({.kind = "front-puller",
+                                   .address = *device,
+                                   .gpu = address,
+                                   .value = payload,
+                                   .position = split.Position(),
+                                   .flags = static_cast<u64>(properties)});
     split.NoteSemaphoreWrite(*device, payload, true, landing, false,
                              VideoCommon::GpuSplit::SemaphoreWriter::Puller);
     if (True(properties & QueryPropertiesFlags::HasTimeout)) {
@@ -183,11 +200,21 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
         // Guest memory is not authoritative while the cache owns these bytes. A direct
         // semaphore release may have advanced RAM without updating that copy; the download
         // used by the drain path can therefore lower the word, even for a >= acquire.
+        VideoCommon::SemRecorder::Record("decision-flush", device, acquire.value);
         return {Kind::Flush};
     }
-    return VideoCommon::GpuSplit::Get().ViewSemaphore(
+    const auto answer = VideoCommon::GpuSplit::Get().ViewSemaphore(
         device, advances, acquire.writers_before,
         [&acquire](u32 value) { return acquire.Matches(value); }, memory);
+    VideoCommon::SemRecorder::Add({.kind = "decision",
+                                   .address = device,
+                                   .gpu = acquire.address,
+                                   .value = acquire.value,
+                                   .before = acquire.writers_before,
+                                   .position = answer.position,
+                                   .flags = static_cast<u64>(answer.kind) |
+                                            (u64{acquire.operation} << 8) | (u64{advances} << 16)});
+    return answer;
 }
 
 // Has the back flush the word out of the buffer cache after the work sent before: memory holds
@@ -200,7 +227,9 @@ void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, DAddr 
          address = acquire.address, target = acquire.value,
          watched = WatchSemaphore(acquire.address)] {
             const u32 before = watched ? memory_manager->Read<u32>(address) : 0;
+            VideoCommon::SemRecorder::Record("view-flush-begin", device);
             rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+            VideoCommon::SemRecorder::Record("view-flush-end", device);
             if (watched) {
                 LOG_INFO(HW_GPU,
                          "Semaphore watch: view flush {:#x} target {:#x} guest {:#x} -> {:#x}",
@@ -254,15 +283,65 @@ void ReportLongWait(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire,
 // release the back ran latches it).
 bool MetAfterDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, const void* waiter,
                    VideoCommon::DrainSite site) {
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    VideoCommon::SemRecorder::Add({.kind = "verify-drain-begin",
+                                   .address = device.value_or(0),
+                                   .gpu = acquire.address,
+                                   .value = acquire.value});
     DrainBack(site);
-    return acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address)) ||
-           Nx2SemaphoreWaiters::Get().Latched(waiter);
+    const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
+    const bool met = acquire.Matches(current) || Nx2SemaphoreWaiters::Get().Latched(waiter);
+    VideoCommon::SemRecorder::Add({.kind = "verify-drain-end",
+                                   .address = device.value_or(0),
+                                   .gpu = acquire.address,
+                                   .value = acquire.value,
+                                   .after = current,
+                                   .flags = u64{met}});
+    return met;
 }
 
 // Whether a fence-flagged release to the word at `device` may still land.
 bool FencedWritePending(DAddr device) {
     const auto queued = VideoCommon::GpuSplit::Get().QueuedSemaphoreWriteAt(device);
     return queued && queued->fenced;
+}
+
+void DumpSemaphoreHistory(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
+    using namespace VideoCommon;
+    if (!SemRecorder::TakeDump()) {
+        return;
+    }
+    // Region membership is GPU-VA based; events and their pairs use device addresses so aliases
+    // of this word share one history. Resolve both pages without assuming contiguous backing.
+    const GPUVAddr mirror = Nx2SemaphoreMirror(address);
+    const GPUVAddr paired = mirror != 0                        ? mirror
+                            : Nx2InSemaphoreFirstPage(address) ? address + 0x1000
+                                                               : 0;
+    const u64 pair =
+        paired != 0 ? dma_pusher.memory_manager.GpuToCpuAddress(paired).value_or(0) : 0;
+    const auto history = SemRecorder::Snapshot(device, pair);
+    LOG_WARNING(HW_GPU,
+                "Sem history begin: gpu={:#x} word={:#x} pair={:#x} events={} end={} dropped={} "
+                "busy={} untracked={}",
+                address, device, pair, history.events.size(), history.end, history.dropped,
+                history.busy, SemRecorder::Get().untracked.load(std::memory_order_relaxed));
+    const auto log_event = [](const SemRecorder::Event& event) {
+        LOG_WARNING(HW_GPU,
+                    "Sem history: seq={} ns={} tid={} kind={} word={:#x} size={:#x} gpu={:#x} "
+                    "pair={:#x} value={:#x} before={:#x} after={:#x} pos={:#x} entry={:#x} "
+                    "consumed={:#x} fence={:#x} flags={:#x}",
+                    event.sequence, event.timestamp, event.thread, event.kind, event.address,
+                    event.size, event.gpu, event.pair, event.value, event.before, event.after,
+                    event.position, event.entry, event.consumed, event.fence, event.flags);
+    };
+    for (const auto& event : history.events) {
+        log_event(event);
+    }
+    log_event(GpuSplit::Get().SemaphoreRecordState(device, "state"));
+    if (pair != 0) {
+        log_event(GpuSplit::Get().SemaphoreRecordState(pair, "state"));
+    }
+    LOG_WARNING(HW_GPU, "Sem history end: word={:#x}", device);
 }
 
 // EDEN_NX2_ACQUIRE_VERIFY: whether a pass of the view stands against the drain path. One the
@@ -275,6 +354,11 @@ bool VerifyPass(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, co
     }
     auto& stats = VideoCommon::g_acquire_stats;
     const bool fenced = FencedWritePending(device);
+    VideoCommon::SemRecorder::Add({.kind = "verify-pass",
+                                   .address = device,
+                                   .gpu = acquire.address,
+                                   .value = acquire.value,
+                                   .flags = u64{after_wait} | (u64{fenced} << 1)});
     if (WatchSemaphore(acquire.address)) {
         const u32 guest = dma_pusher.memory_manager.Read<u32>(acquire.address);
         const auto queued = VideoCommon::GpuSplit::Get().QueuedSemaphoreWriteAt(device);
@@ -289,7 +373,9 @@ bool VerifyPass(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, co
     if (MetAfterDrain(dma_pusher, acquire, waiter, site)) {
         return true;
     }
-    if (fenced && !FencedWritePending(device)) {
+    const bool fence_landed = fenced && !FencedWritePending(device);
+    DumpSemaphoreHistory(dma_pusher, acquire.address, device);
+    if (fence_landed) {
         VideoCommon::Count(stats.raced);
         return false;
     }

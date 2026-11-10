@@ -37,6 +37,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_sem_recorder.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -352,33 +353,45 @@ struct Memory::Impl {
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
-        return WalkBlock(addr, size,
-        [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
-            LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
-        },
-        [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
-        },
-        [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            if (!unsafe) {
-                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-            }
-            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
-        });
+        return WalkBlock(
+            addr, size,
+            [addr, size](const std::size_t offset, const std::size_t copy_amount,
+                         const Common::ProcessAddress current_vaddr) {
+                LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})",
+                          GetInteger(current_vaddr), GetInteger(addr), size);
+            },
+            [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+                RecordCpuStore(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            },
+            [&](const Common::ProcessAddress current_vaddr, const std::size_t offset,
+                const std::size_t copy_amount, u8* const ptr) {
+                if (!unsafe) {
+                    HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                }
+                RecordCpuStore(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            });
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
-        return WalkBlock(addr, size,
-        [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
-            LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
-        },
-        [=](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            std::memset(ptr, 0, copy_amount);
-        },
-        [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-            std::memset(ptr, 0, copy_amount);
-        });
+        return WalkBlock(
+            addr, size,
+            [addr, size](const std::size_t offset, const std::size_t copy_amount,
+                         const Common::ProcessAddress current_vaddr) {
+                LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})",
+                          GetInteger(current_vaddr), GetInteger(addr), size);
+            },
+            [this](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+                RecordCpuStore(ptr, nullptr, copy_amount);
+                std::memset(ptr, 0, copy_amount);
+            },
+            [&](const Common::ProcessAddress current_vaddr, const std::size_t offset,
+                const std::size_t copy_amount, u8* const ptr) {
+                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                RecordCpuStore(ptr, nullptr, copy_amount);
+                std::memset(ptr, 0, copy_amount);
+            });
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
@@ -822,16 +835,46 @@ struct Memory::Impl {
         return T{};
     }
 
+    void RecordCpuStore(const u8* destination, const void* bytes, size_t count) {
+        if (!VideoCommon::SemRecorder::Enabled()) {
+            return;
+        }
+        auto& device_manager = system.Host1x().MemoryManager();
+        if (!device_manager.IsPhysicalPointer(destination)) {
+            return;
+        }
+        Common::ScratchBuffer<u32> addresses;
+        const auto* source_bytes = static_cast<const u8*>(bytes);
+        for (size_t offset = 0; offset < count;) {
+            const auto* target = destination + offset;
+            const size_t amount = (std::min)(
+                count - offset, size_t{0x1000} - (reinterpret_cast<uintptr_t>(target) & 0xfff));
+            device_manager.ApplyOpOnPointer(target, addresses, [&](DAddr device_address) {
+                VideoCommon::SemRecorder::TrackedBytes(
+                    bytes != nullptr ? "cpu-store" : "cpu-zero", device_address,
+                    source_bytes != nullptr ? source_bytes + offset : nullptr, amount, false);
+            });
+            offset += amount;
+        }
+    }
+
     /// @brief Writes a particular data type to memory at the given virtual address.
     /// @param vaddr The virtual address to write the data type to.
     /// @tparam T The data type to write to memory.
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
-            LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
+        if (auto const ptr = GetPointerImpl(
+                addr,
+                [addr, data]() {
+                    LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8,
+                              addr, u64(data));
+                },
+                [&]() { HandleRasterizerWrite(addr, sizeof(T)); });
+            ptr) {
+            RecordCpuStore(ptr, &data, sizeof(T));
             std::memcpy(ptr, &data, sizeof(T));
+        }
     }
 
     template <typename T>
@@ -844,7 +887,12 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            if (stored) {
+                RecordCpuStore(ptr, &data, sizeof(T));
+            }
+            return stored;
         }
         return true;
     }
@@ -858,7 +906,12 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            if (stored) {
+                RecordCpuStore(ptr, &data, sizeof(data));
+            }
+            return stored;
         }
         return true;
     }
@@ -944,6 +997,8 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            VideoCommon::SemRecorder::Add(
+                {.kind = "cpu-write-notify", .address = address, .size = size, .gpu = v_address});
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:

@@ -122,10 +122,39 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
-        rasterizer->SignalFence([this, address, payload, reduction] {
+        const u64 recorder_device = VideoCommon::SemRecorder::Enabled()
+                                        ? memory_manager.GpuToCpuAddress(address).value_or(0)
+                                        : 0;
+        const auto recorder_entry = VideoCommon::SemRecorder::Enabled()
+                                        ? VideoCommon::GpuSplit::Get().BackEntry().value_or(0)
+                                        : 0;
+        VideoCommon::SemRecorder::Add({.kind = "compute-reduce-schedule",
+                                       .address = recorder_device,
+                                       .gpu = address,
+                                       .value = payload,
+                                       .entry = recorder_entry,
+                                       .flags = reduction});
+        rasterizer->SignalFence([this, address, payload, reduction, recorder_device,
+                                 recorder_entry] {
             const u32 before = memory_manager.Read<u32>(address);
             const u32 result = ReduceSemaphore(reduction, false, before, payload);
+            VideoCommon::SemRecorder::Add({.kind = "compute-reduce-begin",
+                                           .address = recorder_device,
+                                           .gpu = address,
+                                           .value = payload,
+                                           .before = before,
+                                           .after = result,
+                                           .entry = recorder_entry,
+                                           .flags = reduction});
             memory_manager.Write<u32>(address, result);
+            VideoCommon::SemRecorder::Add({.kind = "compute-reduce-end",
+                                           .address = recorder_device,
+                                           .gpu = address,
+                                           .value = payload,
+                                           .before = before,
+                                           .after = result,
+                                           .entry = recorder_entry,
+                                           .flags = reduction});
             static const GPUVAddr watch = [] {
                 const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
                 return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
@@ -407,14 +436,45 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         }
                     }
                 };
+                const u64 recorder_device =
+                    VideoCommon::SemRecorder::Enabled()
+                        ? memory_manager.GpuToCpuAddress(address).value_or(0)
+                        : 0;
+                const u64 recorder_entry =
+                    VideoCommon::SemRecorder::Enabled()
+                        ? VideoCommon::GpuSplit::Get().BackEntry().value_or(0)
+                        : 0;
+                VideoCommon::SemRecorder::Add({.kind = "qmd-schedule",
+                                               .address = recorder_device,
+                                               .gpu = address,
+                                               .value = payload,
+                                               .entry = recorder_entry,
+                                               .flags = flags});
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags, checked] {
+                    rasterizer->SignalFence([this, address, payload, flags, checked,
+                                             recorder_device, recorder_entry] {
                         const auto combine = [&](u32 current) {
                             return ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1, current, payload);
                         };
                         const u32 guest = memory_manager.Read<u32>(address);
                         const u32 value = combine(guest);
+                        VideoCommon::SemRecorder::Add({.kind = "qmd-reduce-begin",
+                                                       .address = recorder_device,
+                                                       .gpu = address,
+                                                       .value = payload,
+                                                       .before = guest,
+                                                       .after = value,
+                                                       .entry = recorder_entry,
+                                                       .flags = flags});
                         memory_manager.Write<u32>(address, value);
+                        VideoCommon::SemRecorder::Add({.kind = "qmd-reduce-end",
+                                                       .address = recorder_device,
+                                                       .gpu = address,
+                                                       .value = payload,
+                                                       .before = guest,
+                                                       .after = value,
+                                                       .entry = recorder_entry,
+                                                       .flags = flags});
                         checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
@@ -446,11 +506,26 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload, checked] {
+                    rasterizer->SignalFence([this, address, payload, checked, recorder_device,
+                                             recorder_entry] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
                         const u32 guest = memory_manager.Read<u32>(address);
                         const u32 value = combine(guest);
+                        VideoCommon::SemRecorder::Add({.kind = "qmd-max-begin",
+                                                       .address = recorder_device,
+                                                       .gpu = address,
+                                                       .value = payload,
+                                                       .before = guest,
+                                                       .after = value,
+                                                       .entry = recorder_entry});
                         memory_manager.Write<u32>(address, value);
+                        VideoCommon::SemRecorder::Add({.kind = "qmd-max-end",
+                                                       .address = recorder_device,
+                                                       .gpu = address,
+                                                       .value = payload,
+                                                       .before = guest,
+                                                       .after = value,
+                                                       .entry = recorder_entry});
                         checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
@@ -1903,6 +1978,12 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     if (!device) {
         return;
     }
+    VideoCommon::SemRecorder::Add({.kind = "front-compute",
+                                   .address = *device,
+                                   .gpu = address,
+                                   .value = fs.registers[0x6c2],
+                                   .position = split.Position(),
+                                   .flags = control});
     // A reduction combines the payload with the word's value then, as the back runs it (the
     // fence it signals runs it at once while releases land at once). The front knows that value
     // when no compute or copy work sent since may write the word (QMD releases): from the last

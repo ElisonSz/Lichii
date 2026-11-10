@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "video_core/nx2_sem_recorder.h"
 
 namespace Core {
 class System;
@@ -375,7 +376,18 @@ public:
     /// Waits until the back executed the entries sent before `position`, not what came after.
     /// Returns whether any of them was still queued.
     bool WaitForPosition(u64 position, DrainSite site) {
-        return WaitFor((std::min)(position, write_position), site);
+        if (SemRecorder::Enabled()) {
+            SemRecorder::Add({.kind = "wait-begin",
+                              .position = position,
+                              .consumed = consumed.load(std::memory_order_acquire)});
+        }
+        const bool waited = WaitFor((std::min)(position, write_position), site);
+        if (SemRecorder::Enabled()) {
+            SemRecorder::Add({.kind = "wait-end",
+                              .position = position,
+                              .consumed = consumed.load(std::memory_order_acquire)});
+        }
+        return waited;
     }
     /// Whether the back executed everything sent before `position`. It may tell so a little
     /// late: the back stores its position every few thousand words and when it runs out of work.
@@ -456,6 +468,8 @@ public:
     /// Only statistics calls this: retiring a write must not erase the cause of a wait.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> SemaphoreWriteForStats(
         u64 device_address) const;
+    [[nodiscard]] SemRecorder::Event SemaphoreRecordState(u64 device_address,
+                                                          const char* kind) const;
 
     /// What the front can tell of a semaphore acquire without waiting for the back (the
     /// semaphore view, Puller::AskView).

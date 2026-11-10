@@ -315,6 +315,12 @@ T MemoryManager::Read(GPUVAddr addr) const {
         // NOTE: Avoid adding any extra logic to this fast-path block
         T value;
         std::memcpy(&value, page_pointer, sizeof(T));
+        if (VideoCommon::SemRecorder::Enabled()) {
+            if (const auto device = GpuToCpuAddress(addr)) {
+                VideoCommon::SemRecorder::TrackedBytes("gpu-read", *device, &value, sizeof(T),
+                                                       false);
+            }
+        }
         return value;
     }
 
@@ -341,7 +347,12 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         }
     }
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
+        if (VideoCommon::SemRecorder::Enabled()) {
+            const auto device = GpuToCpuAddress(addr);
+            if (device) {
+                VideoCommon::SemRecorder::Bytes("gpu-store", *device, &data, sizeof(T));
+            }
+        }
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -562,6 +573,8 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+            VideoCommon::SemRecorder::TrackedBytes("gpu-block-store", dev_addr_base, src_buffer,
+                                                   copy_amount);
             std::memcpy(physical, src_buffer, copy_amount);
         }
         // After the copy: the buffer cache may upload the written bytes from guest memory.
@@ -579,8 +592,12 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {
+            VideoCommon::SemRecorder::TrackedBytes("gpu-block-store", dev_addr_base, src_buffer,
+                                                   copy_amount);
             std::memcpy(physical, src_buffer, copy_amount);
         } else {
+            VideoCommon::SemRecorder::TrackedBytes("gpu-block-store", dev_addr_base, src_buffer,
+                                                   copy_amount);
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         }
         if (!unsafe) {

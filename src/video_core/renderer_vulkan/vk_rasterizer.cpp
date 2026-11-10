@@ -2440,6 +2440,8 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    VideoCommon::SemRecorder::Add(
+        {.kind = "flush-region", .address = addr, .size = size, .flags = static_cast<u64>(which)});
     if (True(which & (VideoCommon::CacheType::TextureCache | VideoCommon::CacheType::BufferCache))) {
         // CPU writes into GPU-written memory are only collected when they happen. Apply them
         // first, or the download writes the stale GPU copy over them: the Yoshi demo writes a
@@ -3473,6 +3475,9 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    if (cpu_addr) {
+        VideoCommon::SemRecorder::TrackedBytes("inline-write", *cpu_addr, memory.data(), copy_size);
+    }
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};
         if (memory.size() >= sizeof(first_word)) std::memcpy(&first_word, memory.data(), sizeof(first_word));

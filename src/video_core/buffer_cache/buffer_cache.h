@@ -405,6 +405,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    SemRecorder::Add({.kind = "download-request", .address = device_addr, .size = size});
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
@@ -537,6 +538,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
 
 template <class P>
 void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
+    SemRecorder::Add({.kind = "download-read-request", .address = device_addr, .size = size});
     if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
         DownloadMemory(device_addr, size);
     } else {
@@ -2128,7 +2130,11 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
         ForgetEarlyLanded(device_addr, size);
     }
     if (!cpu_written.Intersects(device_addr, size)) {
+        SemRecorder::TrackedBytes("download", device_addr, data, size);
         device_memory.WriteBlockUnsafe(device_addr, data, size);
+        if (SemRecorder::Enabled()) {
+            SemRecorder::Add({.kind = "download-end", .address = device_addr, .size = size});
+        }
         return;
     }
     Common::RangeSet<DAddr> parts;
@@ -2137,7 +2143,11 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
         parts.Subtract(start, end - start);
     });
     parts.ForEach([&](DAddr start, DAddr end) {
+        SemRecorder::TrackedBytes("download", start, data + (start - device_addr), end - start);
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        if (SemRecorder::Enabled()) {
+            SemRecorder::Add({.kind = "download-end", .address = start, .size = end - start});
+        }
     });
 }
 

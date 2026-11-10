@@ -17,6 +17,7 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
@@ -457,6 +458,15 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    if (VideoCommon::SemRecorder::Enabled() && type != LaunchDMA::SemaphoreType::NONE) {
+        VideoCommon::SemRecorder::Add(
+            {.kind = "dma-release",
+             .address = memory_manager.GpuToCpuAddress(address).value_or(0),
+             .gpu = address,
+             .value = payload,
+             .entry = VideoCommon::GpuSplit::Get().BackEntry().value_or(0),
+             .flags = static_cast<u64>(type.Value())});
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;
