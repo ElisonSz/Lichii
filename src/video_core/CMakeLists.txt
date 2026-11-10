@@ -186,6 +186,8 @@ add_library(video_core STATIC
     renderer_vulkan/nx2_list_slots.cpp
     renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_failure.cpp
+    renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
@@ -311,6 +313,7 @@ add_library(video_core STATIC
     shader_cache_v2/records.h
     shader_environment.cpp
     shader_environment.h
+    evicted_pointer_slots.h
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
@@ -340,6 +343,7 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/host_memory_limit.h
     texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
