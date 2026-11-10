@@ -167,8 +167,7 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        ParallelTranslation* parallel = nullptr,
-        std::shared_ptr<GraphicsPipelineRecipe> compare = nullptr);
+        ParallelTranslation* parallel = nullptr);
 
     /// Released IR pools for a build, or new ones
     [[nodiscard]] std::shared_ptr<ShaderPools> TakeSparePools();
@@ -290,10 +289,6 @@ private:
     /// them (tick, pipeline)
     std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
-
-    // Only evicted recipes need a second owner. Live pipelines keep theirs themselves.
-    std::unordered_map<GraphicsPipelineCacheKey, std::shared_ptr<GraphicsPipelineRecipe>>
-        kept_graphics;
 
     ShaderPools main_pools;
     std::mutex spare_pools_mutex;

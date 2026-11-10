@@ -378,14 +378,15 @@ std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, PipelineBinaries* binaries_,
-    VideoCore::ShaderNotify* shader_notify, const Device& device_, DescriptorPool& descriptor_pool,
+    VideoCore::ShaderNotify* shader_notify,
+    const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
-    const PipelineBuildQueue& build_queue, PipelineStatistics* pipeline_statistics,
-    RenderPassCache& render_pass_cache, const GraphicsPipelineCacheKey& key_,
-    std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const PipelineBuildQueue& build_queue,
+    PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
-    std::optional<MeshEmulationSetup> mesh_emulation_, std::function<void()> on_built)
+    std::optional<MeshEmulationSetup> mesh_emulation_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), binaries{binaries_}, scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
@@ -590,7 +591,7 @@ GraphicsPipeline::GraphicsPipeline(
         };
     }
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-               emit_stages = std::move(emit_stages), on_built = std::move(on_built)] {
+                emit_stages = std::move(emit_stages)] {
         const auto begin = std::chrono::steady_clock::now();
         SCOPE_EXIT {
             if (shader_notify) {
@@ -623,11 +624,6 @@ GraphicsPipeline::GraphicsPipeline(
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
-        }
-        mesh_vertex_module.reset();
-        distribution_module.reset();
-        if (on_built) {
-            on_built();
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
