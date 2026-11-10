@@ -30,6 +30,7 @@
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
+#include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/video_core.h"
 
@@ -56,6 +57,10 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
 } // Anonymous namespace
 
 namespace VideoCore {
+
+void WaitForAsyncTeardown() {
+    Vulkan::AsyncTeardown::Get().Wait();
+}
 
 /// @brief Creates an emulated GPU instance using the given system context.
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {

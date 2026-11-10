@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/vulkan_common/vulkan_pipeline_handles.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -239,6 +240,12 @@ public:
     explicit Device(VkInstance instance, vk::PhysicalDevice physical, VkSurfaceKHR surface,
                     const vk::InstanceDispatch& dld);
     ~Device();
+    void DrainRetiredPipelines();
+
+    /// The renderer hands over only after shader jobs stop and the GPU is idle.
+    void RetirePipeline(PipelineHandles handles) const {
+        retired_pipelines.push_back(std::move(handles));
+    }
 
     /**
      * Returns a format supported by the device for the passed requirements.
@@ -1426,6 +1433,7 @@ private:
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
+    mutable std::vector<PipelineHandles> retired_pipelines;
 };
 
 } // namespace Vulkan

@@ -63,12 +63,25 @@ public:
         }
     }
 
-    /// Only the owning thread adds workers. One suffices during play; shutdown uses several once
-    /// the GPU is idle and the shader jobs have stopped, without competing with frame rendering.
+    /// Only the owning thread adds workers. Production uses one: increasing this did not improve
+    /// driver destruction throughput. Tests can exercise concurrent retirement with more workers.
     void AddWorkers(size_t count) {
         while (workers.size() < count) {
             workers.emplace_back([this] { Run(); });
         }
+    }
+
+    /// Withdraw queued ownership for device-lifetime teardown. Only an already active destructor
+    /// still needs Drain(); withdrawn objects are no longer included in this reaper's counts.
+    std::deque<std::unique_ptr<Pipeline>> TakePending() {
+        std::scoped_lock lock{mutex};
+        std::deque<std::unique_ptr<Pipeline>> result;
+        result.swap(pending);
+        submitted -= result.size();
+        if (active == 0) {
+            drained.notify_all();
+        }
+        return result;
     }
 
     void Drain() {

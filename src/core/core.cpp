@@ -690,7 +690,10 @@ struct System::Impl {
 
 System::System() : impl{std::make_unique<Impl>(*this)} {}
 
-System::~System() = default;
+System::~System() {
+    impl.reset();
+    VideoCore::WaitForAsyncTeardown();
+}
 
 CpuManager& System::GetCpuManager() {
     return impl->cpu_manager;

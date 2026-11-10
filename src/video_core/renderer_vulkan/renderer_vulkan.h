@@ -95,26 +95,24 @@ private:
     Tegra::GPU& gpu;
 
     VideoCommon::TeardownClock teardown_clock;
-    VideoCommon::TeardownMarker teardown_library{teardown_clock, "Vulkan library and dispatch"};
-    std::shared_ptr<Common::DynamicLibrary> library;
-    vk::InstanceDispatch dld;
-#ifdef EGLANTINE_STREAMLINE
-    bool streamline_started; ///< NVIDIA Streamline starts before the instance.
-#endif
+    VideoCommon::TeardownMarker teardown_library{teardown_clock, "driver owner handoff or join"};
+    struct DriverOwner;
+    struct DriverOwnerDeleter {
+        void operator()(DriverOwner* owner) const;
+    };
+    static DriverOwner* CreateDriverOwner(Core::Frontend::EmuWindow& window,
+                                          Core::Frontend::GraphicsContext* graphics_context);
+    std::unique_ptr<DriverOwner, DriverOwnerDeleter> driver_owner;
+    std::shared_ptr<Common::DynamicLibrary>& library;
+    vk::InstanceDispatch& dld;
 
     // Keep original handles for compatibility with existing code
-    VideoCommon::TeardownMarker teardown_instance{teardown_clock, "Vulkan instance"};
-    vk::Instance instance;
-
-    VideoCommon::TeardownMarker teardown_surface{teardown_clock, "surface and debug messenger"};
-    vk::DebugUtilsMessenger debug_messenger;
-
-    vk::SurfaceKHR surface;
-
-    VideoCommon::TeardownMarker teardown_device{teardown_clock, "Vulkan device and allocator"};
-    Device device;
-    VideoCommon::TeardownMarker teardown_memory{teardown_clock, "memory allocator and state"};
-    MemoryAllocator memory_allocator;
+    vk::Instance& instance;
+    vk::DebugUtilsMessenger& debug_messenger;
+    vk::SurfaceKHR& surface;
+    Device& device;
+    VideoCommon::TeardownMarker teardown_memory{teardown_clock, "renderer state"};
+    MemoryAllocator& memory_allocator;
     StateTracker state_tracker;
     VideoCommon::TeardownMarker teardown_scheduler{teardown_clock, "command scheduler"};
     Scheduler scheduler;

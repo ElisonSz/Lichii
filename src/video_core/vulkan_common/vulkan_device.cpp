@@ -885,7 +885,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     InitializeGPULogging();
 }
 
+void Device::DrainRetiredPipelines() {
+    const size_t count = retired_pipelines.size();
+    // Clear owning handles while both the allocator and device dispatch remain alive.
+    retired_pipelines.clear();
+    if (count != 0) {
+        LOG_INFO(Render_Vulkan, "Async Vulkan teardown: destroyed {} deferred pipelines", count);
+    }
+    const char* check = std::getenv("EDEN_NX2_PIPELINE_TEARDOWN_CHECK");
+    if (count != 0 && check != nullptr && check[0] == '1') {
+        ASSERT(retired_pipelines.empty());
+        LOG_INFO(Render_Vulkan, "Async teardown check: deferred == destroyed ({})", count);
+    }
+}
+
 Device::~Device() {
+    DrainRetiredPipelines();
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_attached) {
         Streamline::Stop();

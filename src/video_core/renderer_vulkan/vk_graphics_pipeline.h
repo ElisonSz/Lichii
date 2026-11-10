@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vulkan_common/vulkan_pipeline_handles.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -116,6 +117,10 @@ public:
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+
+    /// Call only after shader jobs and all GPU uses have completed. Release build captures while
+    /// their scheduler, caches and guest memory are alive; only handles may outlive the renderer.
+    PipelineHandles TakeHandles();
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 

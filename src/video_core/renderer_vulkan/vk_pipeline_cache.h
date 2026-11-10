@@ -273,6 +273,9 @@ private:
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
+    bool defer_destruction{};
+    size_t deferred_count{};
+    void RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     PipelineReaper<GraphicsPipeline> pipeline_reaper;
     /// IR of the pipelines whose job emits their SPIR-V
     QueuedIrBudget queued_ir{VideoCommon::DefaultShaderJobBudget()};

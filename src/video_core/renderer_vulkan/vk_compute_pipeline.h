@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vulkan_common/vulkan_pipeline_handles.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -52,6 +53,9 @@ public:
                              std::function<vk::ShaderModule()> emit = {});
 
     ~ComputePipeline();
+
+    /// Shutdown only: the cache has joined every shader job and finished GPU work.
+    PipelineHandles TakeHandles();
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;

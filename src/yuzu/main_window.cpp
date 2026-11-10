@@ -181,6 +181,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/video_core.h"
 
 #include <SDL3/SDL.h>
 
@@ -571,6 +572,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 }
 
 MainWindow::~MainWindow() {
+    VideoCore::WaitForAsyncTeardown();
     if (nup_cancel) {
         nup_cancel->store(true);
     }

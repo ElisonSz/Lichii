@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <fstream>
@@ -14,19 +15,18 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <span>
 #include <thread>
 #include <unordered_set>
 #include <vector>
-#include <bit>
-#include <numeric>
 #include "common/cityhash.h"
-#include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -39,15 +39,17 @@
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
+#include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
-#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -71,7 +73,6 @@
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/gpu_logging/gpu_logging.h"
 
 #ifdef __ANDROID__
 #include "../../android/app/src/main/jni/android_settings.h"
@@ -832,6 +833,20 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
+void PipelineCache::RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
+    if (!pipeline) {
+        return;
+    }
+    if (defer_destruction) {
+        auto handles = pipeline->TakeHandles();
+        pipeline.reset();
+        device.RetirePipeline(std::move(handles));
+        ++deferred_count;
+    } else {
+        pipeline_reaper.Retire(std::move(pipeline));
+    }
+}
+
 PipelineCache::~PipelineCache() {
     // TEST: where shutdown spends its time (the frontend stops waiting after 10 s).
     auto step_begin = std::chrono::steady_clock::now();
@@ -846,8 +861,17 @@ PipelineCache::~PipelineCache() {
     // hold a pipeline, its IR, or the cache when ownership moves to the destruction workers.
     shader_jobs->Shutdown();
     step("shader jobs (queued builds cancelled)");
-    const size_t destroy_workers = std::clamp<size_t>(std::thread::hardware_concurrency(), 2, 8);
-    pipeline_reaper.AddWorkers(destroy_workers);
+    // Eight workers did not improve AMD's destruction throughput. Keep the one worker used
+    // during play and avoid multiplying driver contention at shutdown.
+    constexpr size_t destroy_workers = 1;
+    defer_destruction = AsyncTeardownEnabled();
+    if (defer_destruction) {
+        auto pending = pipeline_reaper.TakePending();
+        for (auto& pipeline : pending) {
+            RetirePipeline(std::move(pipeline));
+        }
+    }
+    pipeline_reaper.Drain();
     StopBackgroundJobs();
     step("stopping background jobs");
     serialization_thread.WaitForRequests();
@@ -870,20 +894,22 @@ PipelineCache::~PipelineCache() {
     }};
     const size_t graphics_count = graphics_cache.size();
     for (auto& [key, pipeline] : graphics_cache) {
-        pipeline_reaper.Retire(std::move(pipeline));
+        RetirePipeline(std::move(pipeline));
     }
     graphics_cache.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} graphics pipelines", graphics_count);
     step("queueing graphics pipelines");
     const size_t evicted_count = evicted_pipelines.size();
     for (auto& [tick, pipeline] : evicted_pipelines) {
-        pipeline_reaper.Retire(std::move(pipeline));
+        RetirePipeline(std::move(pipeline));
     }
     evicted_pipelines.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} evicted pipelines", evicted_count);
     step("queueing evicted pipelines");
     pipeline_reaper.Drain();
     step("draining pipeline destruction");
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} pipelines deferred to device owner",
+             deferred_count);
     const auto [submitted, destroyed] = pipeline_reaper.Counts();
     LOG_INFO(Render_Vulkan,
              "Pipeline cache teardown: {} destruction workers, {} submitted, {} destroyed",
@@ -896,6 +922,22 @@ PipelineCache::~PipelineCache() {
     cache_cleanup.join();
     step("joining shader cache v2 cleanup");
     const size_t compute_count = compute_cache.size();
+    if (defer_destruction) {
+        const auto defer_compute = [this](std::unique_ptr<ComputePipeline>& pipeline) {
+            if (!pipeline) {
+                return;
+            }
+            auto handles = pipeline->TakeHandles();
+            pipeline.reset();
+            device.RetirePipeline(std::move(handles));
+        };
+        for (auto& [key, entry] : compute_cache) {
+            defer_compute(entry.pipeline);
+        }
+        for (auto& [tick, pipeline] : retired_compute_pipelines) {
+            defer_compute(pipeline);
+        }
+    }
     compute_cache.clear();
     retired_compute_pipelines.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} compute pipelines", compute_count);
@@ -1224,7 +1266,7 @@ void PipelineCache::StopBackgroundJobs() {
         LOG_INFO(Render_Vulkan, "Pipeline cache: retiring {} unclaimed prebuilt pipelines",
                  unclaimed.size());
         for (auto& pipeline : unclaimed) {
-            pipeline_reaper.Retire(std::move(pipeline));
+            RetirePipeline(std::move(pipeline));
         }
         scheduled_prebuild.reset();
     }

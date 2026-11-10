@@ -24,6 +24,9 @@ class GPU;
 namespace VideoCore {
 
 class RendererBase;
+
+/// Join deferred Vulkan destruction before core/frontend process resources disappear.
+void WaitForAsyncTeardown();
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system);
 
 } // namespace VideoCore

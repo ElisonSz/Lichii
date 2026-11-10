@@ -391,6 +391,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 }
 
+PipelineHandles ComputePipeline::TakeHandles() {
+    ASSERT(IsBuildTaskDone());
+    // Drop cancelled build captures before their referenced caches and guest state go away.
+    build_task = {};
+    PipelineHandles handles;
+    handles.spv_modules[0] = std::move(spv_module);
+    handles.descriptor_set_layout = std::move(descriptor_set_layout);
+    handles.pipeline_layout = std::move(pipeline_layout);
+    handles.descriptor_update_template = std::move(descriptor_update_template);
+    handles.pipeline = std::move(pipeline);
+    return handles;
+}
+
 ComputePipeline::~ComputePipeline() {
     if (jobs) {
         // Nothing needs a pipeline that goes: a build still queued is dropped.

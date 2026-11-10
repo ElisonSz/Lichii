@@ -376,6 +376,24 @@ std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
 }
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
+PipelineHandles GraphicsPipeline::TakeHandles() {
+    build.reset();
+    return {
+        .spv_modules = std::move(spv_modules),
+        .descriptor_set_layout = std::move(descriptor_set_layout),
+        .pipeline_layout = std::move(pipeline_layout),
+        .descriptor_update_template = std::move(descriptor_update_template),
+        .pipeline = std::move(pipeline),
+        .mesh_vertex_module = std::move(mesh_vertex_module),
+        .mesh_compute_pipeline = std::move(mesh_compute_pipeline),
+        .task_compute_pipeline = std::move(task_compute_pipeline),
+        .distribution_module = std::move(distribution_module),
+        .distribution_set_layout = std::move(distribution_set_layout),
+        .distribution_layout = std::move(distribution_layout),
+        .distribution_pipeline = std::move(distribution_pipeline),
+    };
+}
+
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, PipelineBinaries* binaries_,
