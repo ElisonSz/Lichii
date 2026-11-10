@@ -163,9 +163,12 @@ public:
 
     ~PipelineBuild() {
         if (jobs) {
-            // Nothing needs a pipeline that goes: a build still queued is dropped.
-            jobs->Cancel(handle);
-            handle.Wait();
+            // Nothing needs a pipeline that goes: a build still queued is dropped. A final job
+            // needs neither the scheduler lock nor the waiter's lock during bulk destruction.
+            if (!handle.Ready()) {
+                jobs->Cancel(handle);
+                handle.Wait();
+            }
         } else if (!owner_builds) {
             Wait(true);
         }

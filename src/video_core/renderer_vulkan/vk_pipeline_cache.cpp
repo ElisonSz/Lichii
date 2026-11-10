@@ -858,11 +858,14 @@ PipelineCache::~PipelineCache() {
         step_begin = now;
     };
     serialization_stop.request_stop();
+    // Cancel every queued build before waiting, including run-time misses. No worker may still
+    // hold a pipeline, its IR, or the cache when ownership moves to the destruction workers.
+    shader_jobs->Shutdown();
+    step("shader jobs (queued builds cancelled)");
+    const size_t destroy_workers = std::clamp<size_t>(std::thread::hardware_concurrency(), 2, 8);
+    pipeline_reaper.AddWorkers(destroy_workers);
     StopBackgroundJobs();
     step("stopping background jobs");
-    // The pipelines' builds end before the driver pipeline cache they build into goes.
-    shader_jobs->Shutdown();
-    step("shader jobs");
     serialization_thread.WaitForRequests();
     SaveUsedPipelines();
     step("serialization and used pipelines");
@@ -871,18 +874,48 @@ PipelineCache::~PipelineCache() {
                                      CACHE_VERSION);
     }
     step("saving the driver pipeline cache");
-    // After the records the serialization thread queued: its writer drains on destruction
+    // Its writer must preserve the queued records, but neither disk I/O nor releasing the
+    // lowered program records depends on Vulkan destruction. Join before leaving this scope.
     shader_cache_v2 = nullptr;
-    cache_v2.reset();
-    step("shader cache v2");
+    std::jthread cache_cleanup{[cache = std::move(cache_v2)]() mutable {
+        const auto begin = std::chrono::steady_clock::now();
+        cache.reset();
+        LOG_INFO(Render_Vulkan, "Pipeline cache teardown: shader cache v2 took {:.1f} ms",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                     .count());
+    }};
     const size_t graphics_count = graphics_cache.size();
+    for (auto& [key, pipeline] : graphics_cache) {
+        pipeline_reaper.Retire(std::move(pipeline));
+    }
     graphics_cache.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} graphics pipelines", graphics_count);
-    step("destroying graphics pipelines");
+    step("queueing graphics pipelines");
     const size_t evicted_count = evicted_pipelines.size();
+    for (auto& [tick, pipeline] : evicted_pipelines) {
+        pipeline_reaper.Retire(std::move(pipeline));
+    }
     evicted_pipelines.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} evicted pipelines", evicted_count);
-    step("destroying evicted pipelines");
+    step("queueing evicted pipelines");
+    pipeline_reaper.Drain();
+    step("draining pipeline destruction");
+    const auto [submitted, destroyed] = pipeline_reaper.Counts();
+    LOG_INFO(Render_Vulkan,
+             "Pipeline cache teardown: {} destruction workers, {} submitted, {} destroyed",
+             destroy_workers, submitted, destroyed);
+    const char* const check = std::getenv("EDEN_NX2_PIPELINE_TEARDOWN_CHECK");
+    if (check != nullptr && check[0] == '1') {
+        ASSERT(submitted == destroyed);
+        LOG_INFO(Render_Vulkan, "Pipeline teardown check: submitted == destroyed ({})", destroyed);
+    }
+    cache_cleanup.join();
+    step("joining shader cache v2 cleanup");
+    const size_t compute_count = compute_cache.size();
+    compute_cache.clear();
+    retired_compute_pipelines.clear();
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} compute pipelines", compute_count);
+    step("destroying compute pipelines");
     if (pipeline_binaries) {
         pipeline_binaries->LogCounts("at the end of the session");
         pipeline_binaries.reset();
@@ -1202,7 +1235,15 @@ void PipelineCache::ReturnPools(std::shared_ptr<ShaderPools> pools) {
 }
 
 void PipelineCache::StopBackgroundJobs() {
-    scheduled_prebuild.reset();
+    if (scheduled_prebuild) {
+        auto unclaimed = scheduled_prebuild->StopAndTake();
+        LOG_INFO(Render_Vulkan, "Pipeline cache: retiring {} unclaimed prebuilt pipelines",
+                 unclaimed.size());
+        for (auto& pipeline : unclaimed) {
+            pipeline_reaper.Retire(std::move(pipeline));
+        }
+        scheduled_prebuild.reset();
+    }
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TranslateCachedGraphics(
@@ -2054,16 +2095,11 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
-    // Destroying a pipeline costs the driver time, and an eviction can free thousands at once:
-    // 3,086 in Ocarina of Time after standing in one place in Hyrule Field, and those 10 s had a
-    // 375 ms frame against 20 to 26 ms before (AMD, Windows). A few go each frame instead, 4,800
-    // until the next eviction check 600 frames later.
-    constexpr size_t MaxDestroyedPerFrame = 8;
-    for (size_t destroyed = 0; destroyed < MaxDestroyedPerFrame && !evicted_pipelines.empty() &&
-                               scheduler.IsFree(evicted_pipelines.front().first);
-         ++destroyed) {
-        evicted_pipelines.pop_front();
-    }
+    // Only transfer ownership here: driver destruction can take milliseconds per frame. The
+    // eviction tick includes the last command using the pipeline, including queued worker work.
+    constexpr size_t MaxRetiredPerFrame = 8;
+    pipeline_reaper.RetireCompleted(evicted_pipelines, MaxRetiredPerFrame,
+                                    [this](u64 tick) { return scheduler.IsFree(tick); });
     while (!retired_compute_pipelines.empty() &&
            scheduler.IsFree(retired_compute_pipelines.front().first) &&
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {

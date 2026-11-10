@@ -33,6 +33,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_reaper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -266,6 +267,7 @@ private:
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
+    PipelineReaper<GraphicsPipeline> pipeline_reaper;
     /// IR of the pipelines whose job emits their SPIR-V
     QueuedIrBudget queued_ir{VideoCommon::DefaultShaderJobBudget()};
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;

@@ -109,15 +109,35 @@ public:
         return batch;
     }
 
-    /// Cancels the builds and drops every pipeline once the running ones end
-    void Stop() {
+    /// Cancels queued stages and waits only for running stages. The caller can destroy the
+    /// unclaimed pipelines in parallel; none has been handed to a draw or submitted to the GPU.
+    std::vector<std::unique_ptr<Pipeline>> StopAndTake() {
+        {
+            std::scoped_lock lock{mutex};
+            stopped = true;
+        }
         jobs.Cancel(batch);
         batch.Wait();
         std::unordered_map<Key, std::shared_ptr<Entry>> dropped;
-        std::scoped_lock lock{mutex};
-        stopped = true;
-        dropped = std::move(entries);
-        entries.clear();
+        {
+            std::scoped_lock lock{mutex};
+            dropped = std::move(entries);
+            entries.clear();
+            captured_bytes = 0;
+        }
+        std::vector<std::unique_ptr<Pipeline>> pipelines;
+        pipelines.reserve(dropped.size());
+        for (auto& [key, entry] : dropped) {
+            if (entry->pipeline) {
+                pipelines.push_back(std::move(entry->pipeline));
+            }
+        }
+        return pipelines;
+    }
+
+    /// Cancels the builds and drops every pipeline once the running ones end.
+    void Stop() {
+        StopAndTake();
     }
 
 private:

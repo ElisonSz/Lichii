@@ -191,6 +191,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
+    renderer_vulkan/pipeline_reaper.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
