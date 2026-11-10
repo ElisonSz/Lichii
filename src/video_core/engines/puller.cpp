@@ -47,17 +47,38 @@ bool WatchSemaphore(GPUVAddr address) {
     return watch != 0 && (address & ~GPUVAddr{0xf}) == watch;
 }
 
+// Register the acquire word and its mirror before the first decision, including a queued
+// answer that never reads RAM. Host pages let unrelated stores skip device translation.
+void TrackSemaphoreView(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
+    if (!VideoCommon::SemRecorder::Enabled()) {
+        return;
+    }
+    auto& memory = dma_pusher.memory_manager;
+    VideoCommon::SemRecorder::Track(device, memory.GetPointer(address));
+    const GPUVAddr mirror = Nx2SemaphoreMirror(address);
+    const GPUVAddr partner = mirror != 0                        ? mirror
+                             : Nx2InSemaphoreFirstPage(address) ? address + 0x1000
+                                                                : 0;
+    if (partner != 0) {
+        if (const auto paired_device = memory.GpuToCpuAddress(partner)) {
+            VideoCommon::SemRecorder::Track(*paired_device, memory.GetPointer(partner));
+        }
+    }
+}
+
 // Reads a semaphore word as a GPU acquire sees it in memory: a mirrored release the guest memory
 // does not hold counts (Nx2MirrorShadow). Without a flush: the buffer cache may hold the word
 // newer where the GPU wrote its page (ReadSemaphoreWord, AskView).
 u32 ReadSemaphoreMemory(DmaPusher& dma_pusher, GPUVAddr address, std::optional<DAddr> device) {
+    if (device) {
+        TrackSemaphoreView(dma_pusher, address, *device);
+    }
     const u32 guest = dma_pusher.memory_manager.Read<u32>(address);
     if (!device) {
         return guest;
     }
     const auto mirrored = Nx2MirrorShadow::Get().Read(*device, guest);
     if (VideoCommon::SemRecorder::Enabled()) {
-        VideoCommon::SemRecorder::Track(*device);
         VideoCommon::SemRecorder::Add({.kind = "memory",
                                        .address = *device,
                                        .gpu = address,
@@ -189,6 +210,7 @@ using ViewAnswer = VideoCommon::GpuSplit::SemaphoreView;
 // newer than memory.
 ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, DAddr device) {
     using Kind = ViewAnswer::Kind;
+    TrackSemaphoreView(dma_pusher, acquire.address, device);
     const auto memory = [&] { return ReadSemaphoreMemory(dma_pusher, acquire.address, device); };
     // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
     // KeplerCompute::ProcessNativeMethod). A word the mirror diverts (Nx2MirrorShadow) can

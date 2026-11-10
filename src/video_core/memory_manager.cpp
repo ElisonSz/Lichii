@@ -315,7 +315,7 @@ T MemoryManager::Read(GPUVAddr addr) const {
         // NOTE: Avoid adding any extra logic to this fast-path block
         T value;
         std::memcpy(&value, page_pointer, sizeof(T));
-        if (VideoCommon::SemRecorder::Enabled()) {
+        if (VideoCommon::SemRecorder::MayHostRange(page_pointer, sizeof(T))) {
             if (const auto device = GpuToCpuAddress(addr)) {
                 VideoCommon::SemRecorder::TrackedBytes("gpu-read", *device, &value, sizeof(T),
                                                        false);
@@ -347,10 +347,11 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         }
     }
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        if (VideoCommon::SemRecorder::Enabled()) {
+        if (VideoCommon::SemRecorder::MayHostRange(page_pointer, sizeof(T))) {
             const auto device = GpuToCpuAddress(addr);
             if (device) {
-                VideoCommon::SemRecorder::Bytes("gpu-store", *device, &data, sizeof(T));
+                VideoCommon::SemRecorder::TrackedBytes("gpu-store", *device, &data, sizeof(T),
+                                                       false);
             }
         }
         std::memcpy(page_pointer, &data, sizeof(T));

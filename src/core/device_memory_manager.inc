@@ -28,6 +28,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_sem_recorder.h"
 
 namespace Core {
 
@@ -294,6 +295,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
             continue;
         }
+        VideoCommon::SemRecorder::RemapHostPage(address + i * Memory::YUZU_PAGESIZE, ptr);
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
         tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
         InsertCPUBacking(start_page_d + i, new_vaddress, asid);

@@ -441,8 +441,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.fenced = true;
     }
     semaphore_writes.insert_or_assign(word, write);
-    if (SemRecorder::Enabled()) {
-        SemRecorder::Track(word);
+    if (SemRecorder::Relevant(word)) {
         SemRecorder::Add({.kind = "note",
                           .address = word,
                           .value = payload,
@@ -489,7 +488,7 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     u64 device_address) const {
     const auto it = semaphore_writes.find(device_address & ~u64{3});
     const bool queued = it != semaphore_writes.end() && !InMemory(it->second);
-    if (SemRecorder::Enabled()) {
+    if (SemRecorder::Relevant(device_address)) {
         auto event = SemaphoreRecordState(device_address, "lookup");
         event.flags |= u64{queued} << 5;
         SemRecorder::Add(event);

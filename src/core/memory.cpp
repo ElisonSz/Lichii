@@ -836,7 +836,7 @@ struct Memory::Impl {
     }
 
     void RecordCpuStore(const u8* destination, const void* bytes, size_t count) {
-        if (!VideoCommon::SemRecorder::Enabled()) {
+        if (!VideoCommon::SemRecorder::MayHostRange(destination, count)) {
             return;
         }
         auto& device_manager = system.Host1x().MemoryManager();
@@ -849,6 +849,10 @@ struct Memory::Impl {
             const auto* target = destination + offset;
             const size_t amount = (std::min)(
                 count - offset, size_t{0x1000} - (reinterpret_cast<uintptr_t>(target) & 0xfff));
+            if (!VideoCommon::SemRecorder::MayHostRange(target, amount)) {
+                offset += amount;
+                continue;
+            }
             device_manager.ApplyOpOnPointer(target, addresses, [&](DAddr device_address) {
                 VideoCommon::SemRecorder::TrackedBytes(
                     bytes != nullptr ? "cpu-store" : "cpu-zero", device_address,
