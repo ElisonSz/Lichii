@@ -273,10 +273,21 @@ private:
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
+    PipelineDestroyStats destroy_stats;
     bool defer_destruction{};
     size_t deferred_count{};
-    void RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline);
-    PipelineReaper<GraphicsPipeline> pipeline_reaper;
+    void RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline, PipelineOrigin origin);
+    PipelineReaper<GraphicsPipeline> pipeline_reaper{
+        [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+            const auto begin = PipelineDestroyTime::Clock::now();
+            const auto origin = pipeline->destroy_origin;
+            auto handles = pipeline->TakeHandles();
+            pipeline.reset();
+            PipelineDestroyTime time;
+            time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+            DestroyPipelineHandles(handles, time);
+            destroy_stats.Add(origin, time);
+        }};
     /// IR of the pipelines whose job emits their SPIR-V
     QueuedIrBudget queued_ir{VideoCommon::DefaultShaderJobBudget()};
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;

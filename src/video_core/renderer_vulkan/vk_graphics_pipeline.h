@@ -22,6 +22,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
+#include "video_core/renderer_vulkan/pipeline_destroy_timing.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -121,6 +122,7 @@ public:
     /// Call only after shader jobs and all GPU uses have completed. Release build captures while
     /// their scheduler, caches and guest memory are alive; only handles may outlive the renderer.
     PipelineHandles TakeHandles();
+    PipelineOrigin destroy_origin{PipelineOrigin::Evicted};
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 

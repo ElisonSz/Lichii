@@ -192,7 +192,9 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/async_teardown.h
+    renderer_vulkan/pipeline_destroy_timing.h
     renderer_vulkan/pipeline_reaper.h
+    vulkan_common/vulkan_pipeline_destroy.h
     vulkan_common/vulkan_pipeline_handles.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp

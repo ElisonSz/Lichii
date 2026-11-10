@@ -833,16 +833,21 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
-void PipelineCache::RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
+void PipelineCache::RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline,
+                                   PipelineOrigin origin) {
     if (!pipeline) {
         return;
     }
     if (defer_destruction) {
+        const auto begin = PipelineDestroyTime::Clock::now();
         auto handles = pipeline->TakeHandles();
         pipeline.reset();
-        device.RetirePipeline(std::move(handles));
+        PipelineDestroyTime time;
+        time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+        device.RetirePipeline(std::move(handles), time, origin);
         ++deferred_count;
     } else {
+        pipeline->destroy_origin = origin;
         pipeline_reaper.Retire(std::move(pipeline));
     }
 }
@@ -868,7 +873,8 @@ PipelineCache::~PipelineCache() {
     if (defer_destruction) {
         auto pending = pipeline_reaper.TakePending();
         for (auto& pipeline : pending) {
-            RetirePipeline(std::move(pipeline));
+            const auto origin = pipeline->destroy_origin;
+            RetirePipeline(std::move(pipeline), origin);
         }
     }
     pipeline_reaper.Drain();
@@ -894,20 +900,21 @@ PipelineCache::~PipelineCache() {
     }};
     const size_t graphics_count = graphics_cache.size();
     for (auto& [key, pipeline] : graphics_cache) {
-        RetirePipeline(std::move(pipeline));
+        RetirePipeline(std::move(pipeline), PipelineOrigin::GraphicsCache);
     }
     graphics_cache.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} graphics pipelines", graphics_count);
     step("queueing graphics pipelines");
     const size_t evicted_count = evicted_pipelines.size();
     for (auto& [tick, pipeline] : evicted_pipelines) {
-        RetirePipeline(std::move(pipeline));
+        RetirePipeline(std::move(pipeline), PipelineOrigin::Evicted);
     }
     evicted_pipelines.clear();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} evicted pipelines", evicted_count);
     step("queueing evicted pipelines");
     pipeline_reaper.Drain();
     step("draining pipeline destruction");
+    destroy_stats.Report();
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} pipelines deferred to device owner",
              deferred_count);
     const auto [submitted, destroyed] = pipeline_reaper.Counts();
@@ -927,9 +934,12 @@ PipelineCache::~PipelineCache() {
             if (!pipeline) {
                 return;
             }
+            const auto begin = PipelineDestroyTime::Clock::now();
             auto handles = pipeline->TakeHandles();
             pipeline.reset();
-            device.RetirePipeline(std::move(handles));
+            PipelineDestroyTime time;
+            time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+            device.RetirePipeline(std::move(handles), time, PipelineOrigin::Compute);
         };
         for (auto& [key, entry] : compute_cache) {
             defer_compute(entry.pipeline);
@@ -1266,7 +1276,7 @@ void PipelineCache::StopBackgroundJobs() {
         LOG_INFO(Render_Vulkan, "Pipeline cache: retiring {} unclaimed prebuilt pipelines",
                  unclaimed.size());
         for (auto& pipeline : unclaimed) {
-            RetirePipeline(std::move(pipeline));
+            RetirePipeline(std::move(pipeline), PipelineOrigin::UnclaimedPrebuild);
         }
         scheduled_prebuild.reset();
     }

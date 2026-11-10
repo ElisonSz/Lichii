@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -21,7 +22,8 @@ namespace Vulkan {
 template <typename Pipeline>
 class PipelineReaper {
 public:
-    PipelineReaper() {
+    explicit PipelineReaper(std::function<void(std::unique_ptr<Pipeline>)> destroy_ = {})
+        : destroy{std::move(destroy_)} {
         AddWorkers(1);
     }
 
@@ -107,7 +109,11 @@ private:
             pending.pop_front();
             ++active;
             lock.unlock();
-            pipeline.reset();
+            if (destroy) {
+                destroy(std::move(pipeline));
+            } else {
+                pipeline.reset();
+            }
             lock.lock();
             --active;
             ++destroyed;
@@ -117,6 +123,7 @@ private:
         }
     }
 
+    const std::function<void(std::unique_ptr<Pipeline>)> destroy;
     mutable std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable drained;

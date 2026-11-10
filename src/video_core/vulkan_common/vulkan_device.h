@@ -20,7 +20,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#include "video_core/vulkan_common/vulkan_pipeline_handles.h"
+#include "video_core/vulkan_common/vulkan_pipeline_destroy.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -242,9 +242,16 @@ public:
     ~Device();
     void DrainRetiredPipelines();
 
+    struct RetiredPipeline {
+        PipelineHandles handles;
+        PipelineDestroyTime time;
+        PipelineOrigin origin;
+    };
+
     /// The renderer hands over only after shader jobs stop and the GPU is idle.
-    void RetirePipeline(PipelineHandles handles) const {
-        retired_pipelines.push_back(std::move(handles));
+    void RetirePipeline(PipelineHandles handles, PipelineDestroyTime time,
+                        PipelineOrigin origin) const {
+        retired_pipelines.push_back({std::move(handles), time, origin});
     }
 
     /**
@@ -1433,7 +1440,7 @@ private:
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
-    mutable std::vector<PipelineHandles> retired_pipelines;
+    mutable std::vector<RetiredPipeline> retired_pipelines;
 };
 
 } // namespace Vulkan

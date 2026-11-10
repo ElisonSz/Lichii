@@ -144,8 +144,10 @@ struct RendererVulkan::DriverOwner {
     }
 
     ~DriverOwner() {
+        clock.Start();
         LOG_INFO(Render_Vulkan, "Vulkan driver owner: destroying pipelines, device and instance");
         device.DrainRetiredPipelines();
+        clock.Step("deferred pipeline handles");
     }
 
     // Last member to be destroyed logs after the instance and library have really gone away.
@@ -154,15 +156,20 @@ struct RendererVulkan::DriverOwner {
             LOG_INFO(Render_Vulkan, "Vulkan driver owner: destruction complete");
         }
     } completion;
+    VideoCommon::TeardownClock clock;
+    VideoCommon::TeardownMarker library_done{clock, "driver owner library and dispatch"};
     std::shared_ptr<Common::DynamicLibrary> library;
     vk::InstanceDispatch dld;
 #ifdef EGLANTINE_STREAMLINE
     bool streamline_started;
 #endif
+    VideoCommon::TeardownMarker instance_done{clock, "driver owner instance"};
     vk::Instance instance;
     vk::DebugUtilsMessenger debug_messenger;
     vk::SurfaceKHR surface;
+    VideoCommon::TeardownMarker device_done{clock, "driver owner device and allocator"};
     Device device;
+    VideoCommon::TeardownMarker memory_done{clock, "driver owner memory allocator"};
     MemoryAllocator memory_allocator;
     bool retiring{};
 };
