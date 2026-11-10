@@ -477,7 +477,7 @@ GraphicsPipeline::GraphicsPipeline(
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
                info.image_descriptors.empty() &&
                std::ranges::all_of(info.texture_descriptors, [](const auto& desc) {
-                   return desc.handle_program == ~0U && !desc.has_secondary;
+                   return desc.handle_program == ~0U && !desc.has_secondary && !desc.bind_null;
                });
     });
     writes_images = std::ranges::any_of(stage_infos, [&](const auto& shared) {
@@ -884,7 +884,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     continue;
                 }
                 for (u32 index = 0; index < desc.count; ++index) {
-                    const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                    const auto handle{VideoCommon::HandleMustBeNull(info, desc, index)
                                           ? VideoCommon::NULL_TEXTURE_HANDLE
                                           : read_handle(desc, index)};
                     views.push_back({handle.first});

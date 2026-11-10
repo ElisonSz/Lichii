@@ -540,7 +540,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             continue;
         }
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+            const auto handle{VideoCommon::HandleMustBeNull(info, desc, index)
                                   ? VideoCommon::NULL_TEXTURE_HANDLE
                                   : read_handle(desc, index)};
             views.push_back({handle.first});

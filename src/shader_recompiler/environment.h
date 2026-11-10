@@ -68,6 +68,7 @@ struct ConstBufferAddr {
     IR::U32 dynamic_offset;
     u32 count;
     bool has_secondary;
+    bool bind_null{}; ///< handle could not be resolved; bind the null sampled image
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
 };
 

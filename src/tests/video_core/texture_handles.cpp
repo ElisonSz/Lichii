@@ -953,6 +953,22 @@ TEST_CASE("Joined storage descriptors retain the bounds of both halves' writes",
     CHECK_FALSE(base.storage_buffers_descriptors.front().write_extent.bounded);
 }
 
+TEST_CASE("An unresolved sampled texture handle binds null",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    const Value cbuf_word{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x540U}})};
+    const Value float_word{shader.Emit(Opcode::BitCastF32U32, {cbuf_word})};
+    const Value is_nan{shader.Emit(Opcode::FPIsNan32, {float_word})};
+    const Value fallback{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x520U}})};
+    const Value handle{shader.Emit(Opcode::SelectU32, {is_nan, fallback, cbuf_word})};
+    auto& sample{shader.Sample(handle)};
+    shader.Run();
+
+    const auto& descriptor{shader.Descriptor(sample)};
+    CHECK(descriptor.bind_null);
+    CHECK(VideoCommon::HandleMustBeNull(shader.program.info, descriptor, 0));
+}
+
 TEST_CASE("A texture handle word that holds a storage buffer address is not a handle",
           "[video_core][texture_handles]") {
     Shader::Info info;
@@ -962,17 +978,17 @@ TEST_CASE("A texture handle word that holds a storage buffer address is not a ha
     desc.cbuf_offset = 0x520;
     desc.count = 1;
     desc.size_shift = 3;
-    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    CHECK(VideoCommon::HandleMustBeNull(info, desc, 0));
     desc.cbuf_offset = 0x524; // the address's upper word
-    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    CHECK(VideoCommon::HandleMustBeNull(info, desc, 0));
     desc.cbuf_offset = 0x528;
-    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    CHECK_FALSE(VideoCommon::HandleMustBeNull(info, desc, 0));
     desc.cbuf_offset = 0x518;
-    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 1)); // the second element
+    CHECK(VideoCommon::HandleMustBeNull(info, desc, 1)); // the second element
     desc.cbuf_offset = 0x520;
     desc.cbuf_index = 2;
-    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    CHECK_FALSE(VideoCommon::HandleMustBeNull(info, desc, 0));
     desc.cbuf_index = 0;
     desc.handle_program = 0; // computed for each draw: a real handle
-    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    CHECK_FALSE(VideoCommon::HandleMustBeNull(info, desc, 0));
 }

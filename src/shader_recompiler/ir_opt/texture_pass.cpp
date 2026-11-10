@@ -503,17 +503,17 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // floating-point 2D texture, the instruction's own type deciding the rest (see the TexturePass
 // ImageQueryDimensions case, which has none).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TextureType::Color2D;
+    if (cbuf.bind_null || cbuf.handle_program != ~0U) return TextureType::Color2D;
     return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
+    if (cbuf.bind_null || cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
     return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return false;
+    if (cbuf.bind_null || cbuf.handle_program != ~0U) return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
 
@@ -1306,55 +1306,71 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 g_handle_index = IR::Value{};
             }
             if (!built) {
-                // Not computable for a whole draw (a handle that changes in a loop): keep the
-                // earlier search through loads, which at least gives the shader a texture.
+                // A dependency of an unresolved handle is not itself a texture handle.
+                // Preserve the legacy search only for buffers and storage images.
                 const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
                     [&env, &host_info, block](const IR::Inst* candidate) {
                         return TryGetConstBuffer(candidate, env, host_info, block);
                     }, [&](IR::Value operand) { return ResolveConditionalPhi(operand, block); })};
-                if (!legacy) {
-                    throw NotImplementedException("Failed to track bindless texture constant buffer (stopped at {}, budget {})",
-                                                  g_handle_failure, budget);
+                if (!sampled) {
+                    if (!legacy) {
+                        throw NotImplementedException(
+                            "Failed to track bindless image constant buffer (stopped at {}, budget {})",
+                            g_handle_failure, budget);
+                    }
+                    return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
                 }
                 static std::atomic<int> warnings{};
                 if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
                     LOG_WARNING(Shader, "Bindless {} handle not computable per draw (stopped at {}): "
-                                "taking cbuf{}+{:#x}, likely not the texture the shader reads",
-                                inst.GetOpcode(), g_handle_failure, legacy->index, legacy->offset);
+                                "binding a null texture",
+                                inst.GetOpcode(), g_handle_failure);
                 }
-                return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
-            }
-            TrimTrailingTees(code);
-            auto& programs{*g_handle_programs};
-            auto it{std::ranges::find(programs, code)};
-            if (it == programs.end()) {
-                programs.push_back(std::move(code));
-                it = programs.end() - 1;
-            }
-            // The shader indexes the array with the index word, which must be defined wherever
-            // the texture instruction runs; where it isn't, every invocation takes the first
-            // element.
-            u32 count{1};
-            if (!index.IsEmpty() && g_program != nullptr) {
-                if (!g_dominance) {
-                    g_dominance.emplace(*g_program);
+                addr = ConstBufferAddr{
+                    .index = 0,
+                    .offset = 0,
+                    .shift_left = 0,
+                    .secondary_index = 0,
+                    .secondary_offset = 0,
+                    .secondary_shift_left = 0,
+                    .dynamic_offset = {},
+                    .count = 1,
+                    .has_secondary = false,
+                    .bind_null = true,
+                };
+            } else {
+                TrimTrailingTees(code);
+                auto& programs{*g_handle_programs};
+                auto it{std::ranges::find(programs, code)};
+                if (it == programs.end()) {
+                    programs.push_back(std::move(code));
+                    it = programs.end() - 1;
                 }
-                if (g_dominance->Dominates(index.InstRecursive(), &inst)) {
-                    count = HandleTableSize();
+                // The shader indexes the array with the index word, which must be defined wherever
+                // the texture instruction runs; where it isn't, every invocation takes the first
+                // element.
+                u32 count{1};
+                if (!index.IsEmpty() && g_program != nullptr) {
+                    if (!g_dominance) {
+                        g_dominance.emplace(*g_program);
+                    }
+                    if (g_dominance->Dominates(index.InstRecursive(), &inst)) {
+                        count = HandleTableSize();
+                    }
                 }
+                addr = ConstBufferAddr{
+                    .index = 0,
+                    .offset = 0,
+                    .shift_left = 0,
+                    .secondary_index = 0,
+                    .secondary_offset = 0,
+                    .secondary_shift_left = 0,
+                    .dynamic_offset = count > 1 ? IR::U32{index} : IR::U32{},
+                    .count = count,
+                    .has_secondary = false,
+                    .handle_program = static_cast<u32>(it - programs.begin()),
+                };
             }
-            addr = ConstBufferAddr{
-                .index = 0,
-                .offset = 0,
-                .shift_left = 0,
-                .secondary_index = 0,
-                .secondary_offset = 0,
-                .secondary_shift_left = 0,
-                .dynamic_offset = count > 1 ? IR::U32{index} : IR::U32{},
-                .count = count,
-                .has_secondary = false,
-                .handle_program = static_cast<u32>(it - programs.begin()),
-            };
         }
     } else {
         addr = ConstBufferAddr{
@@ -1445,6 +1461,7 @@ public:
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
+                   desc.bind_null == existing.bind_null &&
                    desc.handle_program == existing.handle_program;
         })};
         // TODO: Read this from TIC
@@ -1581,6 +1598,9 @@ TextureType ResolvedTextureType(Environment& env, const TextureInst& texture_ins
     const TextureType type{texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value()};
     switch (opcode) {
     case IR::Opcode::ImageQueryDimensions:
+        if (cbuf.bind_null) {
+            return type;
+        }
         if (const auto it{handle_program_types.find(cbuf.handle_program)};
             it != handle_program_types.end()) {
             return it->second;
@@ -1591,7 +1611,7 @@ TextureType ResolvedTextureType(Environment& env, const TextureInst& texture_ins
         // If the instruction is 1D and the bound type is 2D, don't change the code and let
         // the rasterizer robustness handle it
         // This happens on Fire Emblem: Three Houses
-        if (type == TextureType::Color1D &&
+        if (!cbuf.bind_null && type == TextureType::Color1D &&
             ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
             return TextureType::Buffer;
         }
@@ -1640,7 +1660,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     u32 last_cbuf_offset{};
     bool last_is_integer{false};
     const auto is_texture_pixel_format_integer{[&](const ConstBufferAddr& cbuf_addr) {
-        if (cbuf_addr.handle_program != ~0U) {
+        if (cbuf_addr.bind_null || cbuf_addr.handle_program != ~0U) {
             // Every handle program is at cbuf 0 offset 0: the cache below can't tell them apart.
             return IsTexturePixelFormatIntegerCached(env, cbuf_addr);
         }
@@ -1821,6 +1841,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     // One element has no stride (see CapTextureArrays).
                     .size_shift = count > 1 ? size_shift : DESCRIPTOR_SIZE_SHIFT,
                     .handle_program = cbuf.handle_program,
+                    .bind_null = cbuf.bind_null,
                     .is_descriptor_array = cbuf.count > 1,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
@@ -1844,8 +1865,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             PatchImageSampleImplicitLod(*texture_inst.block, *texture_inst.inst);
         }
 
-        if (!host_info.support_snorm_render_buffer && inst->GetOpcode() == IR::Opcode::ImageFetch &&
-            flags.type == TextureType::Buffer) {
+        if (!cbuf.bind_null && !host_info.support_snorm_render_buffer &&
+            inst->GetOpcode() == IR::Opcode::ImageFetch && flags.type == TextureType::Buffer) {
             const auto pixel_format = ReadTexturePixelFormatCached(env, cbuf);
             if (IsPixelFormatSNorm(pixel_format)) {
                 PatchTexelFetch(*texture_inst.block, *texture_inst.inst, pixel_format);

@@ -174,7 +174,10 @@ private:
 /// unrelated texture, a different one whenever the game moves the buffer: every frame for a
 /// double-buffered one, so the surface flickers. Bind no texture for it instead.
 template <typename Info, typename Descriptor>
-[[nodiscard]] bool HandleIsStoragePointer(const Info& info, const Descriptor& desc, u32 index) {
+[[nodiscard]] bool HandleMustBeNull(const Info& info, const Descriptor& desc, u32 index) {
+    if (desc.bind_null) {
+        return true;
+    }
     if (desc.handle_program != ~0U || desc.has_secondary) {
         return false;
     }
