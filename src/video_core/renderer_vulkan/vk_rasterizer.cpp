@@ -446,9 +446,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    teardown_clock.Start();
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
+    teardown_clock.Step("waiting for command worker");
     scheduler.Finish();
+    teardown_clock.Step("finishing rasterizer GPU work");
 }
 
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {

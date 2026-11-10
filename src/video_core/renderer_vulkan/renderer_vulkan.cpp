@@ -212,8 +212,10 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    teardown_clock.Start();
     scheduler.RegisterOnSubmit([] {});
     void(device.GetLogical().WaitIdle());
+    teardown_clock.Step("device idle before renderer destruction");
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {

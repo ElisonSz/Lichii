@@ -316,6 +316,7 @@ add_library(video_core STATIC
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
+    teardown_timing.h
     shader_notify.cpp
     shader_notify.h
     shader_stage_translation.cpp

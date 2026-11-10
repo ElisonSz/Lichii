@@ -590,6 +590,7 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+        step("network and glue registrations (shutdown complete)");
 
         LOG_DEBUG(Core, "Shutdown OK");
     }

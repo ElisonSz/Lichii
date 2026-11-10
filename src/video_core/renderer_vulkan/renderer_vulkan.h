@@ -13,6 +13,7 @@
 #include "common/dynamic_library.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_base.h"
+#include "video_core/teardown_timing.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
@@ -93,6 +94,8 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Tegra::GPU& gpu;
 
+    VideoCommon::TeardownClock teardown_clock;
+    VideoCommon::TeardownMarker teardown_library{teardown_clock, "Vulkan library and dispatch"};
     std::shared_ptr<Common::DynamicLibrary> library;
     vk::InstanceDispatch dld;
 #ifdef EGLANTINE_STREAMLINE
@@ -100,22 +103,32 @@ private:
 #endif
 
     // Keep original handles for compatibility with existing code
+    VideoCommon::TeardownMarker teardown_instance{teardown_clock, "Vulkan instance"};
     vk::Instance instance;
 
+    VideoCommon::TeardownMarker teardown_surface{teardown_clock, "surface and debug messenger"};
     vk::DebugUtilsMessenger debug_messenger;
 
     vk::SurfaceKHR surface;
 
+    VideoCommon::TeardownMarker teardown_device{teardown_clock, "Vulkan device and allocator"};
     Device device;
+    VideoCommon::TeardownMarker teardown_memory{teardown_clock, "memory allocator and state"};
     MemoryAllocator memory_allocator;
     StateTracker state_tracker;
+    VideoCommon::TeardownMarker teardown_scheduler{teardown_clock, "command scheduler"};
     Scheduler scheduler;
+    VideoCommon::TeardownMarker teardown_swapchain{teardown_clock, "swapchain"};
     Swapchain swapchain;
+    VideoCommon::TeardownMarker teardown_present{teardown_clock, "present manager"};
     PresentManager present_manager;
+    VideoCommon::TeardownMarker teardown_blits{teardown_clock, "screen blitters"};
     BlitScreen blit_swapchain;
     BlitScreen blit_capture;
     BlitScreen blit_applet;
+    VideoCommon::TeardownMarker teardown_rasterizer{teardown_clock, "rasterizer"};
     RasterizerVulkan rasterizer;
+    VideoCommon::TeardownMarker teardown_tail{teardown_clock, "applet frame, turbo and frame gen"};
 #ifdef HAS_LSFG
     FrameGen frame_gen;
 #endif

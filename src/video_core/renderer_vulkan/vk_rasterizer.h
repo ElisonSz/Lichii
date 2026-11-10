@@ -18,21 +18,22 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
-#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/teardown_timing.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -280,21 +281,34 @@ private:
     StateTracker& state_tracker;
     Scheduler& scheduler;
 
+    VideoCommon::TeardownClock teardown_clock;
+    VideoCommon::TeardownMarker teardown_staging{teardown_clock, "staging buffers"};
     StagingBufferPool staging_pool;
+    VideoCommon::TeardownMarker teardown_descriptors{teardown_clock, "descriptor pools"};
     DescriptorPool descriptor_pool;
+    VideoCommon::TeardownMarker teardown_queues{teardown_clock,
+                                                "descriptor queues and buffer ring"};
     GuestDescriptorQueue guest_descriptor_queue;
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
     DescriptorBufferRing descriptor_buffer_ring;
+    VideoCommon::TeardownMarker teardown_blit{teardown_clock, "image blitter and render passes"};
     BlitImageHelper blit_image;
     RenderPassCache render_pass_cache;
 
+    VideoCommon::TeardownMarker teardown_textures{teardown_clock, "texture cache and runtime"};
     TextureCacheRuntime texture_cache_runtime;
     TextureCache texture_cache;
+    VideoCommon::TeardownMarker teardown_buffers{teardown_clock, "buffer cache and runtime"};
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
+    VideoCommon::TeardownMarker teardown_queries{teardown_clock, "query cache and runtime"};
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
+    VideoCommon::TeardownMarker teardown_pipelines{teardown_clock,
+                                                   "pipeline cache including members"};
     PipelineCache pipeline_cache;
+    VideoCommon::TeardownMarker teardown_tail{teardown_clock,
+                                              "upscaler, frame dump, fences and DMA"};
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
     FrameDump frame_dump;
