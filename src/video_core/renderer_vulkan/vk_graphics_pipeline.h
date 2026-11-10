@@ -21,6 +21,7 @@
 #include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/graphics_stage_info.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_destroy_timing.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -109,13 +110,12 @@ public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
-        VideoCore::ShaderNotify* shader_notify,
-        const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue,
+        VideoCore::ShaderNotify* shader_notify, const Device& device,
+        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
         DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        const std::array<const Shader::Info*, NUM_STAGES>& infos, GraphicsStageInfoPool& stage_pool,
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
 
@@ -125,6 +125,26 @@ public:
     PipelineOrigin destroy_origin{PipelineOrigin::Evicted};
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
+
+    struct CpuMemory {
+        size_t count{};
+        size_t object{};
+        size_t transitions{};
+        size_t descriptors{};
+        size_t allocator{};
+        size_t helper_spirv{};
+
+        void Add(const CpuMemory& other) {
+            count += other.count;
+            object += other.object;
+            transitions += other.transitions;
+            descriptors += other.descriptors;
+            allocator += other.allocator;
+            helper_spirv += other.helper_spirv;
+        }
+    };
+    /// Called only after builds, draws and command workers have released the pipeline.
+    CpuMemory RetainedCpuMemory() const;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -167,7 +187,7 @@ public:
 
     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
-        return stage_infos[0].is_task || stage_infos[0].is_mesh;
+        return stage_infos[0]->is_task || stage_infos[0]->is_mesh;
     }
 
     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
@@ -238,9 +258,8 @@ public:
         if (key == current_key) {
             return this;
         }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        const auto it = std::ranges::find(transitions, current_key, &Transition::key);
+        return it != transitions.end() ? it->pipeline : nullptr;
     }
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
@@ -270,7 +289,6 @@ public:
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
-        transition_keys.clear();
         transitions.clear();
     }
 
@@ -384,15 +402,18 @@ private:
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
-    std::vector<GraphicsPipelineCacheKey> transition_keys;
-    std::vector<GraphicsPipeline*> transitions;
+    struct Transition {
+        GraphicsPipelineCacheKey key;
+        GraphicsPipeline* pipeline;
+    };
+    std::vector<Transition> transitions;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
-    std::array<Shader::Info, NUM_STAGES> stage_infos;
+    GraphicsStageInfos stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};

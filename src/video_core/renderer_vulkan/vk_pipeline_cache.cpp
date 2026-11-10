@@ -838,6 +838,10 @@ void PipelineCache::RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline,
     if (!pipeline) {
         return;
     }
+    const char* const memory_check = std::getenv("EDEN_NX2_PIPELINE_MEMORY_CHECK");
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        cpu_memory[static_cast<size_t>(origin)].Add(pipeline->RetainedCpuMemory());
+    }
     if (defer_destruction) {
         const auto begin = PipelineDestroyTime::Clock::now();
         auto handles = pipeline->TakeHandles();
@@ -866,6 +870,19 @@ PipelineCache::~PipelineCache() {
     // hold a pipeline, its IR, or the cache when ownership moves to the destruction workers.
     shader_jobs->Shutdown();
     step("shader jobs (queued builds cancelled)");
+    const auto stage_memory = graphics_stage_pool.LiveStats();
+    LOG_INFO(Render_Vulkan,
+             "Pipeline CPU memory: object {} bytes, Shader::Info {} bytes, {} stage references, "
+             "{} shared records, {} record bytes, {} unshared compact bytes, largest {} bytes",
+             sizeof(GraphicsPipeline), sizeof(Shader::Info), stage_memory.copies,
+             stage_memory.records, stage_memory.bytes, stage_memory.unshared_bytes,
+             stage_memory.largest);
+    const char* const memory_check = std::getenv("EDEN_NX2_PIPELINE_MEMORY_CHECK");
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        ASSERT(stage_memory.bytes <= stage_memory.unshared_bytes);
+        LOG_INFO(Render_Vulkan, "Pipeline memory check: shared stage contents verified, {} records",
+                 stage_memory.records);
+    }
     // Eight workers did not improve AMD's destruction throughput. Keep the one worker used
     // during play and avoid multiplying driver contention at shutdown.
     constexpr size_t destroy_workers = 1;
@@ -915,6 +932,17 @@ PipelineCache::~PipelineCache() {
     pipeline_reaper.Drain();
     step("draining pipeline destruction");
     destroy_stats.Report();
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        constexpr std::array names{"evicted", "graphics cache", "unclaimed prebuild", "compute"};
+        for (size_t index = 0; index < cpu_memory.size(); ++index) {
+            const auto& memory = cpu_memory[index];
+            LOG_INFO(Render_Vulkan,
+                     "Pipeline retained CPU: {} count {}, object {} bytes, transitions {} bytes, "
+                     "descriptors {} bytes, allocator {} bytes, helper SPIR-V {} bytes",
+                     names[index], memory.count, memory.object, memory.transitions,
+                     memory.descriptors, memory.allocator, memory.helper_spirv);
+        }
+    }
     LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} pipelines deferred to device owner",
              deferred_count);
     const auto [submitted, destroyed] = pipeline_reaper.Counts();
@@ -2144,6 +2172,7 @@ void PipelineCache::TickFrame() {
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
+        graphics_stage_pool.Prune();
         EvictUnusedPipelines();
     }
 }
@@ -2776,8 +2805,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
-        std::move(mesh_emulation));
+        render_pass_cache, key, std::move(modules), infos, graphics_stage_pool,
+        std::move(emit_stages), std::move(mesh_emulation));
     pipeline->SetMappedPointers(std::move(mapped_pointers));
     return pipeline;
 

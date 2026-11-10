@@ -25,8 +25,8 @@ namespace VideoCommon {
 /// it; 0 when it has none. storage_alignment is the host storage buffer offset alignment: storage
 /// offsets in a handle program are relative to the buffer address aligned down to it
 /// (StorageOffset), which is also where the buffer cache binds the buffer.
-template <typename Memory, typename CbufAddress>
-GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_memory,
+template <typename Info, typename Memory, typename CbufAddress>
+GPUVAddr StorageBufferBase(const Info& info, u32 binding, Memory& gpu_memory,
                            CbufAddress& cbuf_address, u64 storage_alignment) {
     if (binding >= info.storage_buffers_descriptors.size()) {
         return 0;
@@ -50,8 +50,8 @@ GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_me
 /// bound constant buffer's address, 0 when none is bound. storage_alignment is as for
 /// StorageBufferBase. element is the descriptor array element, for a program computing one handle
 /// per element.
-template <typename Memory, typename CbufAddress>
-u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_memory,
+template <typename Info, typename Memory, typename CbufAddress>
+u32 EvaluateTextureHandle(const Info& info, u32 program, Memory& gpu_memory,
                           CbufAddress&& cbuf_address, u64 storage_alignment, u32 element = 0) {
     return Shader::EvaluateHandleProgram(
                info.handle_programs[program],
@@ -71,8 +71,8 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
 /// The handles of elements 0 to count - 1 of a descriptor array of handle program results, as
 /// EvaluateTextureHandle computes each, passed to output(element, handle). The constant buffer
 /// words and storage buffer addresses the program reads are read once for all the elements.
-template <typename Memory, typename CbufAddress, typename Output>
-void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_memory,
+template <typename Info, typename Memory, typename CbufAddress, typename Output>
+void EvaluateTextureHandles(const Info& info, u32 program, Memory& gpu_memory,
                             CbufAddress&& cbuf_address, u64 storage_alignment, u32 count,
                             Output&& output) {
     struct CbufWord {
@@ -173,9 +173,8 @@ private:
 /// read in a clustered light loop, Ocarina of Time's waterfall). Its low bits then name an
 /// unrelated texture, a different one whenever the game moves the buffer: every frame for a
 /// double-buffered one, so the surface flickers. Bind no texture for it instead.
-template <typename Descriptor>
-[[nodiscard]] bool HandleIsStoragePointer(const Shader::Info& info, const Descriptor& desc,
-                                          u32 index) {
+template <typename Info, typename Descriptor>
+[[nodiscard]] bool HandleIsStoragePointer(const Info& info, const Descriptor& desc, u32 index) {
     if (desc.handle_program != ~0U || desc.has_secondary) {
         return false;
     }

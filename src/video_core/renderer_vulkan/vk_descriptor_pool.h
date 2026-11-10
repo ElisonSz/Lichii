@@ -50,6 +50,14 @@ public:
 
     VkDescriptorSet Commit();
 
+    size_t RetainedBytes() const noexcept {
+        size_t bytes = RetainedTickBytes() + sets.capacity() * sizeof(vk::DescriptorSets);
+        for (const auto& chunk : sets) {
+            bytes += chunk.size() * sizeof(VkDescriptorSet);
+        }
+        return bytes;
+    }
+
 private:
     explicit DescriptorAllocator(const Device& device_, MasterSemaphore& master_semaphore_,
                                  DescriptorBank& bank_, VkDescriptorSetLayout layout_);

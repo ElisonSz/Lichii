@@ -28,6 +28,10 @@ public:
     ResourcePool& operator=(const ResourcePool&) = default;
     ResourcePool(const ResourcePool&) = default;
 
+    size_t RetainedTickBytes() const noexcept {
+        return ticks.capacity() * sizeof(u64);
+    }
+
 protected:
     size_t CommitResource();
 

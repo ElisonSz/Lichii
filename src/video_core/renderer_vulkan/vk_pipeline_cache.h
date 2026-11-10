@@ -274,6 +274,8 @@ private:
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
     PipelineDestroyStats destroy_stats;
+    std::array<GraphicsPipeline::CpuMemory, static_cast<size_t>(PipelineOrigin::Count)> cpu_memory;
+
     bool defer_destruction{};
     size_t deferred_count{};
     void RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline, PipelineOrigin origin);
@@ -312,6 +314,7 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
+    GraphicsStageInfoPool graphics_stage_pool;
     ShaderPools main_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;

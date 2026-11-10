@@ -69,7 +69,7 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
 // The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
-VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
+VkShaderStageFlagBits StageFlag(const GraphicsStageInfo& info, VkShaderStageFlagBits slot_stage) {
     if (info.is_task) {
         return VK_SHADER_STAGE_TASK_BIT_EXT;
     }
@@ -79,7 +79,7 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+DescriptorLayoutBuilder MakeBuilder(const Device& device, const GraphicsStageInfos& infos,
                                     const std::optional<MeshEmulationSetup>& mesh_emulation = {}) {
     DescriptorLayoutBuilder builder{device};
     if (mesh_emulation) {
@@ -94,12 +94,12 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
             VK_SHADER_STAGE_FRAGMENT_BIT,
         };
         // Mesh emulation: the mesh program's resources are read by its compute shader.
-        const bool emulated{infos[index].is_mesh || infos[index].is_task};
+        const bool emulated{infos[index]->is_mesh || infos[index]->is_task};
         const VkShaderStageFlags stage{
             mesh_emulation && emulated
                 ? static_cast<VkShaderStageFlags>(VK_SHADER_STAGE_COMPUTE_BIT)
-                : static_cast<VkShaderStageFlags>(StageFlag(infos[index], stages.at(index)))};
-        builder.Add(infos[index], stage);
+                : static_cast<VkShaderStageFlags>(StageFlag(*infos[index], stages.at(index)))};
+        builder.Add(*infos[index], stage);
     }
     if (mesh_emulation) {
         builder.AddMeshEmulationOutput(mesh_emulation->output_binding);
@@ -201,13 +201,12 @@ size_t NumAttachments(const FixedPipelineState& state) {
 }
 
 template <typename Spec>
-bool Passes(const std::array<bool, NUM_STAGES>& stages,
-            const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
+bool Passes(const std::array<bool, NUM_STAGES>& stages, const GraphicsStageInfos& stage_infos) {
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!Spec::enabled_stages[stage] && stages[stage]) {
             return false;
         }
-        const auto& info{stage_infos[stage]};
+        const auto& info{*stage_infos[stage]};
         if constexpr (!Spec::has_storage_buffers) {
             if (!info.storage_buffers_descriptors.empty()) {
                 return false;
@@ -236,7 +235,7 @@ using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
 template <typename Spec, typename... Specs>
 ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
-                          const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
+                          const GraphicsStageInfos& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
         if (!Passes<Spec>(stages, stage_infos)) {
             return FindSpec<Specs...>(stages, stage_infos);
@@ -286,7 +285,7 @@ struct DefaultSpec {
 };
 
 ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
-                               const std::array<Shader::Info, NUM_STAGES>& infos) {
+                               const GraphicsStageInfos& infos) {
     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
                     DefaultSpec>(stages, infos);
 }
@@ -376,6 +375,29 @@ std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
 }
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
+GraphicsPipeline::CpuMemory GraphicsPipeline::RetainedCpuMemory() const {
+    return {
+        .count = 1,
+        .object = sizeof(*this),
+        .transitions = transitions.capacity() * sizeof(Transition),
+        .descriptors =
+            sampled_images.capacity() * sizeof(SampledImage) +
+            texture_memo.entries.capacity() * sizeof(VideoCommon::SampledTextureMemo::Entry) +
+            delta_views.capacity() * sizeof(VideoCommon::ImageViewInOut) +
+            delta_samplers.capacity() * sizeof(VideoCommon::SamplerId) +
+            kept_image_entries.capacity() * sizeof(DescriptorUpdateEntry) +
+            last_descriptor_payload.capacity() * sizeof(DescriptorUpdateEntry) +
+            (descriptor_buffer_layout.bindings.capacity() > 32
+                 ? descriptor_buffer_layout.bindings.capacity() * sizeof(DescriptorBufferBinding)
+                 : 0),
+        .allocator = descriptor_allocator.RetainedBytes() + distribution_allocator.RetainedBytes(),
+        .helper_spirv = mesh_emulation ? (mesh_emulation->vertex_spirv.capacity() +
+                                          mesh_emulation->distribution_spirv.capacity()) *
+                                             sizeof(u32)
+                                       : 0,
+    };
+}
+
 PipelineHandles GraphicsPipeline::TakeHandles() {
     build.reset();
     return {
@@ -397,13 +419,12 @@ PipelineHandles GraphicsPipeline::TakeHandles() {
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, PipelineBinaries* binaries_,
-    VideoCore::ShaderNotify* shader_notify,
-    const Device& device_, DescriptorPool& descriptor_pool,
+    VideoCore::ShaderNotify* shader_notify, const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
-    const PipelineBuildQueue& build_queue,
-    PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    const PipelineBuildQueue& build_queue, PipelineStatistics* pipeline_statistics,
+    RenderPassCache& render_pass_cache, const GraphicsPipelineCacheKey& key_,
+    std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const std::array<const Shader::Info*, NUM_STAGES>& infos, GraphicsStageInfoPool& stage_pool,
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
@@ -416,11 +437,18 @@ GraphicsPipeline::GraphicsPipeline(
         shader_notify->MarkShaderBuilding();
     }
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        const Shader::Info* const info{infos[stage]};
-        if (!info) {
+        stage_infos[stage] = stage_pool.Intern(key.unique_hashes[stage + 1], infos[stage]);
+        static const bool verify_stage_info = [] {
+            const char* const value = std::getenv("EDEN_NX2_PIPELINE_MEMORY_CHECK");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (verify_stage_info && infos[stage]) {
+            ASSERT(stage_infos[stage]->Matches(*infos[stage]));
+        }
+        const GraphicsStageInfo* const info{stage_infos[stage].get()};
+        if (!infos[stage]) {
             continue;
         }
-        stage_infos[stage] = *info;
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_image_elements += Shader::NumDescriptors(info->texture_buffer_descriptors);
@@ -430,28 +458,30 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
-    fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    fragment_has_color0_output = stage_infos.back()->stores_frag_color[0];
     // The guest leaves render target components the fragment shader doesn't output untouched,
     // while Vulkan writes undefined values to them (AMD writes garbage), so they are masked out.
     for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
-        color_output_mask |= u32{stage_infos[NUM_STAGES - 1].frag_color_components[rt]}
-                             << (rt * 4);
+        color_output_mask |= u32{stage_infos.back()->frag_color_components[rt]} << (rt * 4);
     }
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
-    writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+    writes_storage = std::ranges::any_of(stage_infos, [&](const auto& shared) {
+        const auto& info = *shared;
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
-    texture_memo_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+    texture_memo_eligible = std::ranges::all_of(stage_infos, [](const auto& shared) {
+        const auto& info = *shared;
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
                info.image_descriptors.empty() &&
                std::ranges::all_of(info.texture_descriptors, [](const auto& desc) {
                    return desc.handle_program == ~0U && !desc.has_secondary;
                });
     });
-    writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+    writes_images = std::ranges::any_of(stage_infos, [&](const auto& shared) {
+        const auto& info = *shared;
         return any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
     const auto block = [&](DeltaBlocker blocker) {
@@ -466,7 +496,7 @@ GraphicsPipeline::GraphicsPipeline(
         block(DeltaBlocker::Mesh);
     }
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        const Shader::Info& info = stage_infos[stage];
+        const GraphicsStageInfo& info = *stage_infos[stage];
         u32& handles = handle_constant_buffers[stage];
         for (const auto& desc : info.texture_buffer_descriptors) {
             if (desc.handle_program != ~0U) {
@@ -524,6 +554,20 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    DescriptorBankInfo bank_info;
+    for (const auto& shared : stage_infos) {
+        const auto& info = *shared;
+        bank_info.uniform_buffers += Shader::NumDescriptors(info.constant_buffer_descriptors);
+        bank_info.storage_buffers += Shader::NumDescriptors(info.storage_buffers_descriptors);
+        bank_info.texture_buffers += Shader::NumDescriptors(info.texture_buffer_descriptors);
+        bank_info.image_buffers += Shader::NumDescriptors(info.image_buffer_descriptors);
+        bank_info.textures += Shader::NumDescriptors(info.texture_descriptors);
+        bank_info.images += Shader::NumDescriptors(info.image_descriptors);
+    }
+    bank_info.storage_buffers += emulation_buffers;
+    bank_info.score = static_cast<s32>(bank_info.uniform_buffers + bank_info.storage_buffers +
+                                       bank_info.texture_buffers + bank_info.image_buffers +
+                                       bank_info.textures + bank_info.images);
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
     pipeline_layout = builder.CreatePipelineLayout(set_layout);
     if (!uses_descriptor_buffer) {
@@ -531,16 +575,8 @@ GraphicsPipeline::GraphicsPipeline(
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor && mesh_emulation) {
             // The set also holds the emulation's buffers.
-            std::array<Shader::Info, NUM_STAGES + 1> bank_infos{};
-            std::ranges::copy(stage_infos, bank_infos.begin());
-            bank_infos.back().storage_buffers_descriptors.push_back({
-                .cbuf_index = 0,
-                .cbuf_offset = 0,
-                .count = emulation_buffers,
-                .is_written = true,
-            });
             descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos);
+                descriptor_pool.Allocator(device, scheduler, set_layout, bank_info);
             if (mesh_emulation->has_task) {
                 // The distribution pass: payload, offsets, map and arguments, plus its push
                 // constants (Shader::Backend::SPIRV::MeshEmulationDistributionConstants).
@@ -584,7 +620,7 @@ GraphicsPipeline::GraphicsPipeline(
             }
         } else if (!uses_push_descriptor) {
             descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+                descriptor_pool.Allocator(device, scheduler, set_layout, bank_info);
         }
     }
 
@@ -617,6 +653,17 @@ GraphicsPipeline::GraphicsPipeline(
                 shader_notify->MarkShaderComplete();
             }
         };
+        SCOPE_EXIT {
+            for (vk::ShaderModule& module : spv_modules) {
+                module.reset();
+            }
+            mesh_vertex_module.reset();
+            distribution_module.reset();
+            if (mesh_emulation) {
+                std::vector<u32>{}.swap(mesh_emulation->vertex_spirv);
+                std::vector<u32>{}.swap(mesh_emulation->distribution_spirv);
+            }
+        };
         try {
             if (emit_stages) {
                 spv_modules = emit_stages();
@@ -640,11 +687,6 @@ GraphicsPipeline::GraphicsPipeline(
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
-        // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
-        // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
-        for (vk::ShaderModule& module : spv_modules) {
-            module.reset();
-        }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
             static std::atomic<u32> logged{};
@@ -665,8 +707,7 @@ GraphicsPipeline::GraphicsPipeline(
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
-    transition_keys.push_back(transition->key);
-    transitions.push_back(transition);
+    transitions.push_back({transition->key, transition});
 }
 
 template <typename Spec>
@@ -699,7 +740,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (use_memo) {
         const auto collect_addresses{[&](size_t stage) LAMBDA_FORCEINLINE {
             const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
-            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+            for (const auto& desc : stage_infos[stage]->texture_descriptors) {
                 ASSERT(cbufs[desc.cbuf_index].enabled);
                 for (u32 index = 0; index < desc.count; ++index) {
                     handle_addresses.push_back(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
@@ -746,7 +787,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const bool resolve_in_full{!memo_hit || verify_memo};
 
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
-        const Shader::Info& info{stage_infos[stage]};
+        const GraphicsStageInfo& info{*stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
         if constexpr (Spec::has_storage_buffers) {
             size_t ssbo_index{};
@@ -942,7 +983,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if (!Spec::enabled_stages[stage]) {
                 continue;
             }
-            const Shader::Info& info{stage_infos[stage]};
+            const GraphicsStageInfo& info{*stage_infos[stage]};
             if constexpr (Spec::has_texture_buffers) {
                 view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
             }
@@ -1008,7 +1049,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }};
             buffer_cache.UnbindGraphicsTextureBuffers(stage);
 
-            const Shader::Info& info{stage_infos[stage]};
+            const GraphicsStageInfo& info{*stage_infos[stage]};
             if constexpr (Spec::has_texture_buffers) {
                 for (const auto& desc : info.texture_buffer_descriptors) {
                     add_buffer(desc);
@@ -1085,13 +1126,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, *stage_infos[stage],
                                  rescaling, samplers_it, views_it);
             if (captured_delta) {
                 KeepImageDescriptors(stage, first_entry);
             }
         }
-        const auto& info{stage_infos[stage]};
+        const auto& info{*stage_infos[stage]};
         if (info.uses_render_area) {
             render_area.uses_render_area = true;
             // Switch 2 titles may never program the surface clip; use colour target 0 then.
@@ -1175,7 +1216,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             }
             buffer_cache.UnbindGraphicsStorageBuffers(stage);
             size_t ssbo_index{};
-            for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+            for (const auto& desc : stage_infos[stage]->storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
@@ -1229,11 +1270,11 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         } else {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, *stage_infos[stage],
                                  rescaling, samplers_it, views_it);
             KeepImageDescriptors(stage, first_entry);
         }
-        if (stage_infos[stage].uses_render_area) {
+        if (stage_infos[stage]->uses_render_area) {
             render_area.uses_render_area = true;
             const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
             const bool clip_set = clip_width != 0 && clip_height != 0;
@@ -1591,7 +1632,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         // Their binaries are stored under the graphics key, one key per program
         const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
-                                      const Shader::Info* info, u64 program) {
+                                      const GraphicsStageInfo* info, u64 program) {
             const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
                                               info->uses_subgroup_invocation_id ||
                                               info->uses_subgroup_shuffles ||
@@ -1623,12 +1664,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                                                                         *pipeline_cache);
         };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
-        mesh_compute_pipeline = make_compute(*spv_modules[mesh_emulation->mesh_stage],
-                                             *pipeline_layout,
-                                             &stage_infos[mesh_emulation->mesh_stage], 1);
+        mesh_compute_pipeline =
+            make_compute(*spv_modules[mesh_emulation->mesh_stage], *pipeline_layout,
+                         stage_infos[mesh_emulation->mesh_stage].get(), 1);
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0], 2);
+                make_compute(*spv_modules[0], *pipeline_layout, stage_infos[0].get(), 2);
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
                 make_compute(*distribution_module, *distribution_layout, nullptr, 3);
@@ -1664,7 +1705,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
         for (size_t index = 0; index < key.state.attributes.size(); ++index) {
             const auto& attribute = key.state.attributes[index];
-            if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
+            if (!attribute.enabled || !stage_infos[0]->loads.Generic(index)) {
                 continue;
             }
             vertex_attributes.push_back({
@@ -2025,7 +2066,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (mesh_emulation && mesh_emulation->has_task && stage == mesh_emulation->mesh_stage) {
             continue; // the mesh program runs as a compute shader
         }
-        const Shader::Info& info{stage_infos[stage]};
+        const GraphicsStageInfo& info{*stage_infos[stage]};
         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
         const bool emulated_vertex{mesh_emulation && stage == 0};
         const VkShaderStageFlagBits stage_flag{
@@ -2122,7 +2163,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
 
 void GraphicsPipeline::Validate() {
     size_t num_images{};
-    for (const auto& info : stage_infos) {
+    for (const auto& shared : stage_infos) {
+        const auto& info = *shared;
         num_images += Shader::NumDescriptors(info.texture_buffer_descriptors);
         num_images += Shader::NumDescriptors(info.image_buffer_descriptors);
         num_images += Shader::NumDescriptors(info.texture_descriptors);
