@@ -7,6 +7,8 @@
 add_library(frontend_common STATIC
     config.cpp
     config.h
+    profile_import.cpp
+    profile_import.h
     content_manager.h
     firmware_manager.h
     firmware_manager.cpp

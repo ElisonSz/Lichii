@@ -10,13 +10,14 @@
 #include <exception>
 #include <stdexcept>
 #endif
+#include <atomic>
 #include <compare>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <string_view>
 #include <type_traits>
-#include <deque>
 #include <fmt/core.h>
 
 #include "common/settings_enums.h"
@@ -47,6 +48,8 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -83,6 +86,23 @@ SWITCHABLE(ConfirmStop, true);
 #endif
 
 Values values;
+
+namespace {
+std::atomic<u32> nvidia_dlss_runtime_options{};
+}
+
+void RefreshNvidiaDlssRuntimeSettings() {
+    nvidia_dlss_runtime_options.store(
+        static_cast<u32>(values.nvidia_dlss_quality.GetValue()) |
+            (static_cast<u32>(values.nvidia_dlss_preset.GetValue()) << 8),
+        std::memory_order_relaxed);
+}
+
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
+    const u32 options = nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
+    return {static_cast<NvidiaDlssQuality>(options & 0xff),
+            static_cast<NvidiaDlssPreset>((options >> 8) & 0xff)};
+}
 
 std::string GetTimeZoneString(TimeZone time_zone) {
     const auto time_zone_index = static_cast<std::size_t>(time_zone);
@@ -230,6 +250,10 @@ static bool current_program_is_switch2 = false;
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
     current_program_is_switch2 = is_switch2;
+}
+
+bool ReactiveFlushing() {
+    return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
 }
 
 bool CurrentProgramIsSwitch2() {

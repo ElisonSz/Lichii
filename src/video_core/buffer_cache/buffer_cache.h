@@ -1901,7 +1901,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         table_pointer && holder == 0
             ? NULL_BINDING
             : StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
-                                   table_pointer);
+                                   table_pointer, true);
     channel_state->compute_storage_buffers[ssbo_index] = binding;
     if (table_pointer && holder != 0) {
         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
@@ -4250,7 +4250,8 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                             bool native_pointer, bool table_pointer) const {
+                                             bool native_pointer, bool table_pointer,
+                                             bool compute) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -4272,7 +4273,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     constexpr size_t ways = 4;
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
     const u32 flags =
-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U);
+        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
+        (compute ? 8U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -4295,16 +4297,19 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
             // culled every blade), and its light probe records reach about 130 MiB past theirs: a
             // 64 MiB cap left the far probes outside the binding, and the fog took one overbright
-            // constant from them. Written pools keep a cap: a write marks the whole binding
-            // GPU-modified.
-            if (table_pointer && !is_written) {
+            // constant from them. A native (Switch 2) compute pointer has no size either, and
+            // Mario Kart World's lighting passes read past 8 MiB from theirs: capped there, the
+            // reads came back zero and lit land and characters too dark. Written bindings keep
+            // a cap: a write marks the whole binding GPU-modified.
+            const bool native_compute = native_pointer && compute;
+            if ((table_pointer || native_compute) && !is_written) {
                 const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
                 const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
                 return (std::min)(memory_layout_size, limit);
             }
-            // A native (Switch 2) compute program's pointer is bare: the word after it is another
-            // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
-            // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+            // A native compute program's pointer is bare: the word after it is another parameter
+            // (a dimension, stride or texture handle), not an NVN buffer size. Taking it as one
+            // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
                 return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
             }
@@ -4319,7 +4324,34 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and
             // a written one isn't split into separate ranges without sparse sources.
+            const u32 wanted = size;
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+            if (native_pointer && compute) {
+                static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
+                static std::atomic<s64> next_log{};
+                const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (size > 8_MiB) {
+                    past_cap.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (size < wanted) {
+                    at_gap.fetch_add(1, std::memory_order_relaxed);
+                }
+                const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                const u64 long_bindings = past_cap.load(std::memory_order_relaxed);
+                const u64 gap_bindings = at_gap.load(std::memory_order_relaxed);
+                s64 due = next_log.load(std::memory_order_relaxed);
+                if (now >= due && logged.load(std::memory_order_relaxed) !=
+                                      long_bindings + gap_bindings &&
+                    next_log.compare_exchange_strong(due, now + 10)) {
+                    logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
+                    LOG_INFO(HW_GPU,
+                             "Native compute storage bindings: {} reach past the old 8 MiB cap, "
+                             "{} stop at a mapping gap, of {} bound",
+                             long_bindings, gap_bindings, total);
+                }
+            }
         }
 
         // Alignment only applies to the offset of the buffer

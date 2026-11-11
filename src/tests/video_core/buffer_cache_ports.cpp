@@ -264,9 +264,10 @@ namespace VideoCommon {
 
 struct BufferCacheTestAccess {
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
-                        bool written = false, bool native = false, bool table = false) {
+                        bool written = false, bool native = false, bool table = false,
+                        bool compute = false) {
         cache.gpu_memory = &memory;
-        return cache.StorageBufferBinding(descriptor, 0, written, native, table);
+        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute);
     }
     template <class C>
     static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
@@ -441,8 +442,9 @@ struct BasicFixture {
         std::memcpy(bytes, &address, sizeof(address));
         std::memcpy(bytes + 8, &size, sizeof(size));
     }
-    VideoCommon::Binding Bind(bool written = false, bool native = false, bool table = false) {
-        return Access::Bind(*cache, *memory, 0x100000, written, native, table);
+    VideoCommon::Binding Bind(bool written = false, bool native = false, bool table = false,
+                              bool compute = false) {
+        return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute);
     }
 };
 
@@ -623,6 +625,8 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     f.Descriptor(base, 256);
     REQUIRE(f.Bind().size == 4096);
     REQUIRE(f.Bind(false, true).size == 8 << 20);
+    REQUIRE(f.Bind(false, true, false, true).size == 80 << 20);
+    REQUIRE(f.Bind(true, true, false, true).size == 8 << 20);
     REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     REQUIRE(f.Bind(true, false, true).size == 256);
     f.Descriptor(base, (1ULL << 32) | 256);

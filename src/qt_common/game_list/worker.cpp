@@ -457,7 +457,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                        (file_type == Loader::FileType::XCI ||
                         file_type == Loader::FileType::XCZ ||
                         file_type == Loader::FileType::NSP ||
-                        file_type == Loader::FileType::NSZ)) {
+                        file_type == Loader::FileType::NSZ ||
+                        file_type == Loader::FileType::NUP)) {
                 void(provider->AddEntriesFromContainer(file));
             }
         } else {

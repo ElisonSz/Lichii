@@ -247,13 +247,34 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        auto old_filename = filename;
-        old_filename += ".old.txt";
-        // Existence checks are done within the functions themselves.
-        // We don't particularly care if these succeed or not.
-        void(FS::RemoveFile(old_filename));
-        void(FS::RenameFile(filename, old_filename));
-        file.emplace(filename, FS::FileAccessMode::Write, FS::FileType::TextFile);
+        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
+        // if the log is still open elsewhere (e.g. in a Lichii process that hasn't exited yet).
+        // A log that can't even be checked counts as a failure, so it is never truncated.
+        const auto rotate = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec))
+                return !ec;
+            auto old_path = path;
+            old_path += ".old.txt";
+            std::filesystem::rename(path, old_path, ec);
+            return !ec;
+        };
+        // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
+        // the previous session is kept and this one still gets the full size limit. If that one
+        // can't be moved either, append to it.
+        auto path = filename;
+        auto mode = FS::FileAccessMode::Write;
+        if (!rotate(path)) {
+            path = filename.parent_path() / filename.stem();
+            path += "_2";
+            path += filename.extension();
+            if (!rotate(path))
+                mode = FS::FileAccessMode::Append;
+        }
+        file.emplace(path, mode, FS::FileType::TextFile);
+        // Count what is already there so the size limit still applies when appending.
+        if (mode == FS::FileAccessMode::Append)
+            bytes_written = file->GetSize();
     }
     ~FileBackend() noexcept override = default;
 

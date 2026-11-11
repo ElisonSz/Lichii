@@ -183,7 +183,30 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "download button below.\nFire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+              "upscaler at 1x resolution scale.\nThe window adapting filter (the FSR 1, Bilinear "
+              "and similar button in the status bar) is separate and runs after DLSS. While DLSS "
+              "runs, the status bar shows DLSS, its mode and its preset. If DLSS fails, it stays "
+              "off until the game restarts and the log says why.\nTakes effect when a game "
+              "starts."));
+    INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
+           tr("Applies only when a game uses its own DLSS.\nAutomatic selects a mode for the "
+              "game's render/output sizes. Native (DLAA) "
+              "applies anti-aliasing at the game's render resolution, then scales to its output; "
+              "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
+              "Explicit modes only apply when the game's render size is within NVIDIA's "
+              "supported range; otherwise Automatic is used and the fallback is logged. "
+              "This does not change the game's render resolution. Apply/OK updates it while "
+              "playing."));
+    INSERT(
+        Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
+        tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
+           "every quality mode. NVIDIA recommends K for "
+           "DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.\n"
+           "L/M cost more on RTX 20/30 GPUs; consider K. J may reduce ghosting but flicker more. "
+           "E/F are deprecated CNN models. NVIDIA default lets the runtime choose.\n"
+           "L/M require DLSS 310.5 or newer; the download button provides 310.9.16. "
+           "If Fire Emblem shows horizontal lines with L/M at 2x, try K. "
+           "NVIDIA app overrides may supersede this choice. Apply/OK updates it while playing."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -472,6 +495,21 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(SpirvOptimizeMode, OnLoad, tr("On Load")),
                               PAIR(SpirvOptimizeMode, Always, tr("Always")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
+                          {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (game resolution)")),
+                           PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
+                           PAIR(NvidiaDlssQuality, Quality, tr("Quality")),
+                           PAIR(NvidiaDlssQuality, Balanced, tr("Balanced")),
+                           PAIR(NvidiaDlssQuality, Performance, tr("Performance")),
+                           PAIR(NvidiaDlssQuality, UltraPerformance, tr("Ultra Performance"))}});
+    translations->insert(
+        {Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Index(),
+         {PAIR(NvidiaDlssPreset, M, tr("M (DLSS 4.5, default)")),
+          PAIR(NvidiaDlssPreset, NvidiaDefault, tr("NVIDIA default")),
+          PAIR(NvidiaDlssPreset, E, tr("E (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, F, tr("F (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, J, tr("J (DLSS 4)")), PAIR(NvidiaDlssPreset, K, tr("K (DLSS 4)")),
+          PAIR(NvidiaDlssPreset, L, tr("L (DLSS 4.5)"))}});
     translations->insert({Settings::EnumMetadata<Settings::AstcDecodeMode>::Index(),
                           {
                               PAIR(AstcDecodeMode, Cpu, tr("CPU")),

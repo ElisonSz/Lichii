@@ -28,6 +28,8 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 0400D1D02399A000 | The Duskbloods network test |
 | 0400486024DEC000 | The Legend of Zelda: Ocarina of Time |
 | 0400245021D2C000 | Yoshi and the Mysterious Book |
+| 0400DDB020648000 | Cyberpunk 2077: Ultimate Edition |
+| 0100606026F12000 | Final Fantasy Resonance |
 
 Add ids here when a report identifies a new game.
 

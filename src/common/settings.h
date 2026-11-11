@@ -65,6 +65,8 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -411,6 +413,20 @@ struct Values {
                                                   false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
+                                                             NvidiaDlssQuality::Automatic,
+                                                             "nvidia_dlss_quality",
+                                                             Category::Renderer,
+                                                             Specialization::Default,
+                                                             true,
+                                                             true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{linkage,
+                                                           NvidiaDlssPreset::M,
+                                                           "nvidia_dlss_preset",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
     SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
     // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
     SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
@@ -1026,10 +1042,7 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
-    // The recommended settings offer (common/recommended_settings.h): whether the user has
-    // answered it, and the values its settings held before they were applied.
-    Setting<bool> recommended_settings_prompt_shown{
-        linkage, false, "recommended_settings_prompt_shown", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
     Setting<std::string> recommended_settings_backup{
         linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
@@ -1051,10 +1064,21 @@ struct Values {
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
+    /// A title that reads GPU-written memory on the CPU needs reactive flushing whatever the
+    /// setting says. Set per boot by the game overrides; the settings dialog never touches it.
+    bool force_reactive_flushing{};
 
 };
 
 extern Values values;
+
+struct NvidiaDlssRuntimeSettings {
+    NvidiaDlssQuality quality;
+    NvidiaDlssPreset preset;
+};
+
+void RefreshNvidiaDlssRuntimeSettings();
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
@@ -1087,6 +1111,10 @@ u64 GetCurrentProgramID();
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
+
+/// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
+/// that requires it.
+bool ReactiveFlushing();
 
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.

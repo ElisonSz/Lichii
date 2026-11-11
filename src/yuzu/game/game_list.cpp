@@ -23,6 +23,7 @@
 #include <qlayoutitem.h>
 
 #include "common/common_types.h"
+#include "common/fs/fs_util.h"
 #include "core/core.h"
 #include "core/file_sys/nup_writer.h"
 #ifdef LICHII_NX_TOOLS
@@ -510,8 +511,11 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QMenu* play_time_menu = context_menu.addMenu(tr("Manage Play Time"));
     QAction* set_play_time = play_time_menu->addAction(tr("Edit Play Time Data"));
     QAction* remove_play_time_data = play_time_menu->addAction(tr("Remove Play Time Data"));
+    const bool is_loose_dump =
+        FileSys::Nup::DumpRootFromMain(std::filesystem::path{Common::FS::ToU8String(path)})
+            .has_value();
     const bool is_nup_archive =
-        !FileSys::Nup::DumpRootFromMain(path) &&
+        !is_loose_dump &&
         QString::fromStdString(path).endsWith(QStringLiteral(".nup"), Qt::CaseInsensitive);
     QAction* extract_nup = nullptr;
     if (is_nup_archive) {
@@ -524,7 +528,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QAction* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
     QAction* copy_tid = context_menu.addAction(tr("Copy Title ID to Clipboard"));
     QAction* convert_nup = nullptr;
-    if (FileSys::Nup::DumpRootFromMain(path)) {
+    if (is_loose_dump) {
         convert_nup = context_menu.addAction(tr("Convert to NUP..."));
         convert_nup->setEnabled(!nup_conversion_running);
     }

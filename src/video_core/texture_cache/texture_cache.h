@@ -1407,6 +1407,84 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     }
 }
 
+// A 2D-engine copy between two 3D surfaces names one depth slice by its address inside the
+// volume (The Duskbloods network test copies its 16x16x16 grading table slice by slice). Copy
+// that slice of the cached 3D images when both exist with the surface's size and format;
+// otherwise the generic path treats each slice as its own 2D image.
+template <class P>
+bool TextureCache<P>::CopyVolumeSlice(const Tegra::Engines::Fermi2D::Surface& dst,
+                                      const Tegra::Engines::Fermi2D::Surface& src,
+                                      const Tegra::Engines::Fermi2D::Config& copy) {
+    using Tegra::Engines::Fermi2D;
+    const auto is_volume = [](const Fermi2D::Surface& surface) {
+        return surface.depth > 1 && surface.linear == Fermi2D::MemoryLayout::BlockLinear &&
+               surface.layer == 0;
+    };
+    const bool whole_slice = copy.src_x0 == 0 && copy.src_y0 == 0 && copy.dst_x0 == 0 &&
+                             copy.dst_y0 == 0 && copy.src_x1 == static_cast<s32>(src.width) &&
+                             copy.src_y1 == static_cast<s32>(src.height) &&
+                             copy.dst_x1 == static_cast<s32>(dst.width) &&
+                             copy.dst_y1 == static_cast<s32>(dst.height);
+    if (!is_volume(src) || !is_volume(dst) || !whole_slice || src.format != dst.format ||
+        src.width != dst.width || src.height != dst.height) {
+        return false;
+    }
+    const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(src.format);
+    struct Slice {
+        ImageId id;
+        s32 depth;
+    };
+    const auto find_slice = [&](const Fermi2D::Surface& surface) -> std::optional<Slice> {
+        std::optional<Slice> found;
+        const GPUVAddr address = surface.Address();
+        ForEachImageInRegionGPU(channel_state->gpu_memory.GetID(), address, 1,
+                                [&](ImageId id, Image& image) {
+            if (image.info.type != ImageType::e3D || image.info.format != format ||
+                image.info.size.width != surface.width ||
+                image.info.size.height != surface.height ||
+                image.info.size.depth != surface.depth || address < image.gpu_addr) {
+                return false;
+            }
+            const auto offset = static_cast<u32>(address - image.gpu_addr);
+            const auto it = std::ranges::find(image.slice_offsets, offset);
+            if (it == image.slice_offsets.end()) {
+                return false;
+            }
+            const SubresourceBase base =
+                image.slice_subresources[std::distance(image.slice_offsets.begin(), it)];
+            if (base.level != 0) {
+                return false;
+            }
+            found = Slice{id, base.layer};
+            return true;
+        });
+        return found;
+    };
+    const auto src_slice = find_slice(src);
+    const auto dst_slice = find_slice(dst);
+    if (!src_slice || !dst_slice || src_slice->id == dst_slice->id) {
+        static u32 reported{};
+        if (reported++ < 16) {
+            LOG_WARNING(HW_GPU, "2D copy between 3D surfaces {:#x} -> {:#x} without cached volumes",
+                        src.Address(), dst.Address());
+        }
+        return false;
+    }
+    runtime.FlushDeferredClear();
+    PrepareImage(src_slice->id, false, false);
+    PrepareImage(dst_slice->id, true, false);
+    const ImageCopy slice_copy{
+        .src_subresource = {.base_level = 0, .base_layer = 0, .num_layers = 1},
+        .dst_subresource = {.base_level = 0, .base_layer = 0, .num_layers = 1},
+        .src_offset = {0, 0, src_slice->depth},
+        .dst_offset = {0, 0, dst_slice->depth},
+        .extent = {src.width, src.height, 1},
+    };
+    runtime.CopyImage(slot_images[dst_slice->id], slot_images[src_slice->id],
+                      std::span{&slice_copy, 1});
+    return true;
+}
+
 template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
@@ -1421,6 +1499,9 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     // Only when the copy proceeds: a rejected blit writes nothing and must not realize the
     // clear ahead of the next draw that consumes it as its load-op. GetBlitImages cannot
     // invalidate the parked clear: framebuffer removal flushes first (RemoveFramebuffers).
+    if (CopyVolumeSlice(dst, src, copy)) {
+        return true;
+    }
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
@@ -1583,7 +1664,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
-                                      bool use_history) {
+                                      bool use_history,
+                                      std::optional<std::array<u32, 2>> render_region) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -1660,11 +1742,14 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (src_size.width != src.width || src_size.height != src.height) {
             return false;
         }
+        // The game may render only part of its colour target.
+        const std::array<u32, 2> guest_size =
+            render_region.value_or(std::array{src_size.width, src_size.height});
         const std::array<u32, 2> render_size =
             rescaled(src_id)
-                ? std::array{Settings::values.resolution_info.ScaleUp(src_size.width),
-                             Settings::values.resolution_info.ScaleUp(src_size.height)}
-                : std::array{src_size.width, src_size.height};
+                ? std::array{Settings::values.resolution_info.ScaleUp(guest_size[0]),
+                             Settings::values.resolution_info.ScaleUp(guest_size[1])}
+                : guest_size;
         // The jitter is in the input's guest pixels.
         if (rescaled(src_id)) {
             const f32 factor = Settings::values.resolution_info.up_factor;

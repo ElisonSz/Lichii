@@ -219,6 +219,22 @@ VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u3
     return scissor;
 }
 
+// The part of a volume slice a clear writes: the scissor (when the clear uses it) limited to the
+// render area and the slice.
+VkRect2D VolumeClearRect(const Maxwell& regs, VkExtent2D render_area, VideoCommon::Extent3D slice) {
+    VkRect2D rect = regs.clear_control.use_scissor ? GetScissorState(regs, 0)
+                                                   : VkRect2D{{0, 0}, {slice.width, slice.height}};
+    const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
+        const s64 begin = std::clamp<s64>(offset, 0, limit);
+        const s64 end = std::clamp<s64>(s64{offset} + extent, begin, limit);
+        offset = static_cast<s32>(begin);
+        extent = static_cast<u32>(end - begin);
+    };
+    clamp_axis(rect.offset.x, rect.extent.width, (std::min)(render_area.width, slice.width));
+    clamp_axis(rect.offset.y, rect.extent.height, (std::min)(render_area.height, slice.height));
+    return rect;
+}
+
 DrawParams MakeDrawParams(const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state, u32 num_instances, bool is_indexed) {
     DrawParams params{
         .base_instance = draw_state.base_instance,
@@ -1849,6 +1865,86 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
+// A 1-layer depth target bound with a 3D color target limits the framebuffer to one layer, so
+// vkCmdClearAttachments can't reach the target's other slices. Those slices are zeroed by copying
+// zeros into the clear's rectangle of exactly the slices the clear names; the rest of the volume
+// keeps its contents. The rectangle can be smaller than the target: in handheld mode the game
+// clears a 48-wide fog volume through a 64-wide render target.
+bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice,
+                                         u32 slice_count) {
+    const auto& regs = maxwell3d->regs;
+    const u32 target_index = regs.clear_surface.RT;
+    const auto& color_buffer_ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    // Depth and stencil clears take the normal path, so only a colour-only clear qualifies.
+    if (target_index >= color_buffer_ids.size() || regs.clear_surface.Z || regs.clear_surface.S) {
+        return false;
+    }
+    const auto view_id = color_buffer_ids[target_index];
+    const u32 depth = regs.rt[target_index].depth;
+    if (!view_id || depth <= framebuffer->Layers() || first_slice >= depth) {
+        return false;
+    }
+    const auto& view = texture_cache.GetImageView(view_id);
+    const bool is_volume = True(view.flags & VideoCommon::ImageViewFlagBits::Slice);
+    const bool clears_all_channels = regs.clear_surface.R && regs.clear_surface.G &&
+                                     regs.clear_surface.B && regs.clear_surface.A;
+    const bool clears_to_zero =
+        std::ranges::all_of(regs.clear_color, [](f32 value) { return value == 0.0f; });
+    if (!is_volume || !clears_all_channels || !clears_to_zero) {
+        return false;
+    }
+    const VkRect2D rect = VolumeClearRect(regs, framebuffer->RenderArea(), view.size);
+    if (rect.extent.width == 0 || rect.extent.height == 0) {
+        return true;
+    }
+    const u32 width = rect.extent.width;
+    const u32 height = rect.extent.height;
+    // The host image can use a wider format than the guest's (B10G11R11 falls back to
+    // R16G16B16A16): size the zeros for the widest color texel, 16 bytes.
+    constexpr size_t WidestTexelBytes = 16;
+    const size_t slice_bytes = size_t{width} * height * WidestTexelBytes;
+    const auto zeros = staging_pool.Request(slice_bytes, MemoryUsage::Upload);
+    std::memset(zeros.mapped_span.data(), 0, slice_bytes);
+    const u32 count = std::min(slice_count, depth - first_slice);
+    const VkImage image = view.ImageHandle();
+    const u32 level = view.range.base.level;
+    // The clear's slices count from the view's first slice.
+    const u32 base_slice = static_cast<u32>(view.range.base.layer);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([image, level, base_slice, rect, width, height, first_slice, count,
+                      buffer = zeros.buffer, offset = zeros.offset](vk::CommandBuffer cmdbuf) {
+        // Earlier passes may still be reading or writing the volume.
+        constexpr VkMemoryBarrier clear_waits{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, clear_waits);
+        for (u32 slice = first_slice; slice < first_slice + count; ++slice) {
+            const VkBufferImageCopy zero_slice{
+                .bufferOffset = offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
+                .imageOffset = {rect.offset.x, rect.offset.y, static_cast<s32>(base_slice + slice)},
+                .imageExtent = {width, height, 1},
+            };
+            cmdbuf.CopyBufferToImage(buffer, image, VK_IMAGE_LAYOUT_GENERAL, zero_slice);
+        }
+        constexpr VkMemoryBarrier clear_finished{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, clear_finished);
+    });
+    return true;
+}
+
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -1885,6 +1981,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         LOG_DEBUG(Render_Vulkan,
                   "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
                   base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
+    }
+    if (ClearVolumeSlices(framebuffer, base_array_layer, layer_count)) {
+        return;
     }
     if (clear_layers.count == 0) {
         return;
@@ -3123,10 +3222,14 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const bool upscale_4k = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
+    const bool pass_1440p = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
+    const bool native_resolution =
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+        Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
+    const bool upscale_4k = pass_1440p && !native_resolution;
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;
@@ -3209,13 +3312,12 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
-    const bool valid_extents = upscale_4k
-        ? extent.width == 2560 && extent.height == 1440 &&
-            target.size.width == 2560 && target.size.height == 1440
-        : native_size
-        ? target.size.width == extent.width && target.size.height == extent.height
-        : target.size.width == extent.width * 4 / 3 &&
-            target.size.height == extent.height * 4 / 3;
+    const bool valid_extents =
+        pass_1440p ? extent.width == 2560 && extent.height == 1440 && target.size.width == 2560 &&
+                         target.size.height == 1440
+        : native_size ? target.size.width == extent.width && target.size.height == extent.height
+                      : target.size.width == extent.width * 4 / 3 &&
+                            target.size.height == extent.height * 4 / 3;
     if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
         color.IsRescaled() || target.IsRescaled() ||
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
@@ -3256,7 +3358,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         if (oot_jitter_frame == render_trace_frame) {
             jitter = oot_jitter_offset;
         }
-        const VkExtent2D output_extent = upscale_4k ? VkExtent2D{3840, 2160} : target_extent;
+        const VkExtent2D output_extent = native_resolution ? extent
+                                         : upscale_4k      ? VkExtent2D{3840, 2160}
+                                                           : target_extent;
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
@@ -3465,10 +3569,11 @@ std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
 bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
-    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
+    std::optional<std::array<u32, 2>> render_region) {
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                          use_history);
+                                          use_history, render_region);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {
