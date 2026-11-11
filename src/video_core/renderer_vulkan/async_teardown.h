@@ -13,10 +13,12 @@
 
 namespace Vulkan {
 
+/// On unless EDEN_NX2_ASYNC_TEARDOWN=0: a stop with thousands of pipelines otherwise takes
+/// longer than the frontend waits for the emulation thread.
 inline bool AsyncTeardownEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_TEARDOWN");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
