@@ -17,6 +17,8 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 using namespace FSR;
 
@@ -151,7 +153,8 @@ void FSR3::UploadImages(const Device& device, Scheduler& scheduler) {
             }
             ClearColorImage(cmdbuf, *m_prev_frame_image);
         });
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                           [&] { scheduler.Finish(); });
     }
 }
 

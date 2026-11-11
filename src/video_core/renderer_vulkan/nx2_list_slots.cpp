@@ -9,6 +9,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace Stats = Tegra::Nx2ListIndirect::Stats; // TEST
@@ -137,7 +139,8 @@ void Nx2ListSlots::Read(std::span<const u32> slots, std::span<u32> words) {
         }
         RecordCopies(*buffer, *readback, copies);
         RecordHostBarrier();
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::GpuWrittenList,
+                                           [&] { scheduler.Finish(); });
         readback.Invalidate();
         const size_t bytes =
             (std::min)(count * SlotWordBytes, words.size_bytes() - first * SlotWordBytes);
@@ -307,7 +310,8 @@ void Nx2ListSlots::CheckFlush() {
         return;
     }
     RecordHostBarrier();
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Trace,
+                                       [&] { scheduler.Finish(); });
     check_buffer.Invalidate();
     const std::span<const u8> data = std::as_const(check_buffer).Mapped();
     for (size_t i = 0; i < check_entries.size(); ++i) {

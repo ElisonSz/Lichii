@@ -51,6 +51,8 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -303,7 +305,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         Frame* generated = present_manager.GetRenderFrame();
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
-        scheduler.Flush(*generated->render_ready);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Present,
+                                           [&] { scheduler.Flush(*generated->render_ready); });
         present_manager.Present(generated);
     }
 #endif
@@ -311,7 +314,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
-    scheduler.Flush(*frame->render_ready);
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Present,
+                                       [&] { scheduler.Flush(*frame->render_ready); });
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -396,7 +400,8 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
     });
 
     // Ensure the copy is fully completed before saving the capture
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 
     // Copy backing image data to the capture buffer
     dst_buffer.Invalidate();
@@ -439,7 +444,8 @@ std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
     });
 
     // Ensure the copy is fully completed before writing the capture
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 
     // Swizzle image data to the capture buffer
     dst_buffer.Invalidate();

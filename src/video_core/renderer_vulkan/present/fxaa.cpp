@@ -14,6 +14,8 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 FXAA::FXAA(const Device& device, MemoryAllocator& allocator, size_t image_count, VkExtent2D extent)
@@ -109,7 +111,8 @@ void FXAA::UploadImages(const Device& device, Scheduler& scheduler) {
             ClearColorImage(cmdbuf, *image.image);
         }
     });
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
 
     m_images_ready = true;
 }

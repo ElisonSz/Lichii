@@ -18,6 +18,8 @@
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 
@@ -334,6 +336,7 @@ void PresentManager::WaitPresent() {
 
 void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
+    const VideoCommon::WaitStats::ThreadScope wait_thread{VideoCommon::WaitStats::Thread::Present};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
     while (!token.stop_requested()) {

@@ -34,6 +34,8 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
+#include "video_core/wait_stats.h"
+
 namespace VideoCommon {
 
 namespace {
@@ -882,6 +884,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
+    const VideoCommon::WaitStats::ThreadScope wait_thread{VideoCommon::WaitStats::Thread::Back};
     on_back_thread = true;
     tick_state.store(tick_state.load(std::memory_order_relaxed) + TickGeneration + TickAccepting,
                      std::memory_order_release);

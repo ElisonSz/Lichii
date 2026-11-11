@@ -9,6 +9,8 @@
 #include <vulkan/vulkan_core.h>
 #include "video_core/renderer_vulkan/present/util.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 vk::Buffer CreateWrappedBuffer(MemoryAllocator& allocator, VkDeviceSize size, MemoryUsage usage) {
@@ -111,7 +113,8 @@ void UploadImage(const Device& device, MemoryAllocator& allocator, Scheduler& sc
         TransitionImageLayout(cmdbuf, *image, VK_IMAGE_LAYOUT_GENERAL,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     });
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
 }
 
 void DownloadColorImage(vk::CommandBuffer& cmdbuf, VkImage image, VkBuffer buffer,

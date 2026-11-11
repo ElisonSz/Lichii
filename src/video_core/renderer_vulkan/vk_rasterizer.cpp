@@ -80,6 +80,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
@@ -471,7 +473,8 @@ RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
     teardown_clock.Step("waiting for command worker");
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
     teardown_clock.Step("finishing rasterizer GPU work");
 }
 
@@ -2657,10 +2660,13 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{
+        VideoCommon::WaitStats::Reason::GpuWrittenList};
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::GpuWrittenList,
+                                           [&] { scheduler.Flush(); });
     }
 }
 
@@ -2782,6 +2788,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::HostRead};
     VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Flush, addr, size, 1);
     if (addr == 0 || size == 0) {
         return;
@@ -2801,6 +2808,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::HostRead};
     buffer_cache.FinishReadDownloads(addr, size);
 }
 
@@ -3046,6 +3054,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::Query};
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
@@ -3119,6 +3128,7 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::Fence};
     if (draw_counter == 0 && !pending_native_work) {
         return;
     }
@@ -3127,7 +3137,8 @@ void RasterizerVulkan::FlushCommands() {
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Fence,
+                                           [&] { scheduler.Flush(); });
     }
 }
 
@@ -3678,6 +3689,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::WaitStats::Report();
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -3989,7 +4001,8 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork();
         break;
     case SubmissionPolicy::Action::Flush:
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ChunkLimit,
+                                           [&] { scheduler.Flush(); });
         pending_native_work = false;
         break;
     }
@@ -4012,7 +4025,8 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::GpuWrittenList,
+                                           [&] { scheduler.Flush(); });
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;

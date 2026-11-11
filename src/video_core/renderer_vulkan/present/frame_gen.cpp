@@ -15,6 +15,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -204,7 +206,8 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
 
     if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
-            scheduler.Finish();
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                               [&] { scheduler.Finish(); });
             chain.reset();
             fsr3_chain.reset();
         }
@@ -311,7 +314,8 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
 }
 
 void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale) {
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
     chain.reset();
     fsr3_chain.reset();
 
@@ -352,7 +356,8 @@ void FrameGen::DumpDebugImages(u64 count) {
                     cmdbuf, handle, dst,
                     VkExtent3D{.width = extent.width, .height = extent.height, .depth = 1});
             });
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Trace,
+                                           [&] { scheduler.Finish(); });
 
         buffer.Invalidate();
         const std::span<u8> mapped = buffer.Mapped();

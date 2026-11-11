@@ -29,6 +29,8 @@
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/textures/decoders.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -111,7 +113,8 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
 
     // Finish any pending renderpass
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Wait(resource_ticks[image_index]);
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Present,
+                                       [&] { scheduler.Wait(resource_ticks[image_index]); });
     SCOPE_EXIT {
         resource_ticks[image_index] = scheduler.CurrentTick();
     };
@@ -270,7 +273,8 @@ void Layer::SetPostProcessPass(const Device& device, bool is_applet) {
     }
 
     for (const u64 tick : resource_ticks) {
-        scheduler.Wait(tick);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                           [&] { scheduler.Wait(tick); });
     }
 
     post_process_generation = generation;
@@ -292,7 +296,8 @@ void Layer::SetPostProcessPass(const Device& device, bool is_applet) {
 
 void Layer::ReleaseRawImages() {
     for (const u64 tick : resource_ticks) {
-        scheduler.Wait(tick);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                           [&] { scheduler.Wait(tick); });
     }
     raw_images.clear();
     buffer.reset();

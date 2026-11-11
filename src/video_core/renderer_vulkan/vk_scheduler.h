@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/wait_stats.h"
 
 namespace VideoCommon {
 template <typename Trait>
@@ -333,6 +334,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    u64 deferred_wait_reasons{};
 
     class Command {
     public:

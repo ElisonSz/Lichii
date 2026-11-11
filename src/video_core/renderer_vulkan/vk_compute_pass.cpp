@@ -50,6 +50,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -1260,7 +1262,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     CopyAstcSnapshot(scheduler, verify_snapshot, vk_image, info, skip,
                                      target.levels, true, true);
                     download(*cached);
-                    scheduler.Finish();
+                    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Trace,
+                                                       [&] { scheduler.Finish(); });
                     reference.Invalidate();
                     cached.Invalidate();
                     u64 differing{};
@@ -1364,9 +1367,11 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     const auto start = std::chrono::steady_clock::now();
     const VideoCommon::StreamStats::Scope submit_scope{StreamCounter::SubmitNs};
     if (flush_only) {
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::AstcDecode,
+                                           [&] { scheduler.Flush(); });
     } else {
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::AstcDecode,
+                                           [&] { scheduler.Finish(); });
     }
     const auto end = std::chrono::steady_clock::now();
     static u32 decodes{};

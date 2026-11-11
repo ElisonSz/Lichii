@@ -31,6 +31,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/wait_stats.h"
 
 namespace VideoCommon {
 
@@ -84,6 +85,9 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
+        const WaitStats::ReasonScope wait_reason{VideoCore::g_signaling_query_report_fence
+                                                     ? WaitStats::Reason::Query
+                                                     : WaitStats::Reason::Fence};
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
         // fence runs its operation at once, before the host GPU has run the work the report
@@ -250,6 +254,7 @@ private:
 
     void ReleaseThreadFunc(std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPUFencingThread");
+        const WaitStats::ThreadScope wait_thread{WaitStats::Thread::Fencing};
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
 

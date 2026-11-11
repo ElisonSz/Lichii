@@ -35,6 +35,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -875,7 +877,9 @@ void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 
     if (!state.effects || state.effects->extent.width != extent.width ||
         state.effects->extent.height != extent.height) {
         if (state.effects) {
-            state.scheduler.Finish(); // the old images may still be in use
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+                state.scheduler.Finish();
+            }); // the old images may still be in use
         }
         state.effects = std::make_unique<OcarinaEffects>(state.device, state.allocator, extent);
     }

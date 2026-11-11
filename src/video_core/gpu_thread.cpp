@@ -32,6 +32,8 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 
+#include "video_core/wait_stats.h"
+
 namespace VideoCommon::GPUThread {
 
 namespace {
@@ -62,6 +64,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         const VideoCommon::StutterTrace::ThreadScope stutter_thread{
             VideoCommon::StutterTrace::Thread::Front};
         Common::SetCurrentThreadName("GPU");
+        const VideoCommon::WaitStats::ThreadScope wait_thread{
+            VideoCommon::WaitStats::Thread::Front};
         VideoCommon::GpuSplit::MarkGpuThread();
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.

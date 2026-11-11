@@ -23,6 +23,10 @@ void InnerFence::Queue() {
     if (is_stubbed) {
         return;
     }
+    const VideoCommon::WaitStats::ReasonScope reason_scope{VideoCommon::WaitStats::Reason::Fence};
+    if (VideoCommon::WaitStats::Enabled()) {
+        wait_reason = VideoCommon::WaitStats::CurrentReason();
+    }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
     if (!scheduler.DeferFlush()) {
@@ -38,6 +42,7 @@ bool InnerFence::IsSignaled() const {
 }
 
 void InnerFence::Wait() {
+    const VideoCommon::WaitStats::ReasonScope reason_scope{wait_reason};
     if (is_stubbed) {
         return;
     }

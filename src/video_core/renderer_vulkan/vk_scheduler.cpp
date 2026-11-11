@@ -37,6 +37,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -161,7 +163,8 @@ Scheduler::~Scheduler() {
         worker_thread.request_stop();
         worker_thread.join();
         if (trace_gpu_tick != 0) {
-            master_semaphore->Wait(trace_gpu_tick);
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Trace,
+                                               [&] { master_semaphore->Wait(trace_gpu_tick); });
         }
     }
 }
@@ -198,6 +201,9 @@ bool Scheduler::DeferFlush() {
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;
+    }
+    if (VideoCommon::WaitStats::Enabled()) {
+        deferred_wait_reasons |= VideoCommon::WaitStats::CurrentReasonBit();
     }
     flush_pending = true;
     return true;
@@ -241,6 +247,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::Finish};
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -547,6 +554,7 @@ bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
+    const VideoCommon::WaitStats::ThreadScope wait_thread{VideoCommon::WaitStats::Thread::Worker};
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
     const VideoCommon::StutterTrace::ThreadScope stutter_thread{
         VideoCommon::StutterTrace::Thread::Worker};
@@ -840,6 +848,16 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     EndPendingOperations();
     InvalidateState();
 
+    if (VideoCommon::WaitStats::Enabled()) {
+        const u64 trigger = VideoCommon::WaitStats::CurrentReasonBit();
+        // An idle-hook flush has no new cause; keep the causes that requested it.
+        const u64 reasons = deferred_wait_reasons != 0 && VideoCommon::WaitStats::CurrentReason() ==
+                                                              VideoCommon::WaitStats::Reason::Other
+                                ? deferred_wait_reasons
+                                : trigger | deferred_wait_reasons;
+        VideoCommon::WaitStats::RecordSubmission(reasons, flush_pending);
+        deferred_wait_reasons = 0;
+    }
     VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Submissions);
     const u64 signal_value = master_semaphore->NextTick();
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,

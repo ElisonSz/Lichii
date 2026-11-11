@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/wait_stats.h"
 
 namespace Core {
 class System;
@@ -37,6 +38,7 @@ public:
 private:
     Scheduler& scheduler;
     u64 wait_tick = 0;
+    VideoCommon::WaitStats::Reason wait_reason{VideoCommon::WaitStats::Reason::Fence};
 };
 using Fence = std::shared_ptr<InnerFence>;
 

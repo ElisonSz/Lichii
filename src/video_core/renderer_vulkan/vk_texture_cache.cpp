@@ -59,6 +59,8 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/textures/decoders.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 using Tegra::Engines::Fermi2D;
@@ -1347,7 +1349,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 }
 
 void TextureCacheRuntime::Finish() {
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
@@ -2144,7 +2147,9 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         temporal_history.extent.width != extent.width ||
         temporal_history.extent.height != extent.height) {
         if (temporal_history.images[0]) {
-            scheduler.Finish(); // the old history may still be in use
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+                scheduler.Finish();
+            }); // the old history may still be in use
         }
         for (size_t i = 0; i < temporal_history.images.size(); ++i) {
             temporal_history.images[i] = memory_allocator.CreateImage(VkImageCreateInfo{

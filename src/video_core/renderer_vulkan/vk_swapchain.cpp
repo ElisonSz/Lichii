@@ -23,6 +23,8 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "vulkan/vulkan_core.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -196,26 +198,38 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     const auto wait_with_frame_pacing = [this, may_flush] {
     switch (Settings::values.frame_pacing_mode.GetValue()) {
     case Settings::FramePacingMode::Target_Auto:
-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_30:
-        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_60:
-        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_90:
-        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_120:
-        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+        });
         break;
     }
     };
 
 #ifdef __ANDROID__
     if (android_get_device_api_level() >= 30) {
-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        });
     } else {
         wait_with_frame_pacing();
     }
