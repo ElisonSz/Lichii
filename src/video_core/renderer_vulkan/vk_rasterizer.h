@@ -418,6 +418,7 @@ private:
         const Tegra::Engines::Maxwell3D* maxwell3d{};
         u64 serial{};
         u64 map_serial{};
+        u64 match_serial{};
         u64 tick{};
         u64 render_pass{};
         Maxwell::PrimitiveTopology topology{};
@@ -458,6 +459,10 @@ private:
         /// PrepareDraw time and draws per path.
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// Exact experiment union (id=1, layout=2, queries=4), then full/delta path.
+        std::array<std::array<u64, 2>, 8> matched_ns{};
+        std::array<std::array<u64, 2>, 8> matched_draws{};
+        std::array<u64, 8> matched_rejected{};
         /// EDEN_NX2_FAST_DRAW_VERIFY
         u64 verified{};
         u64 pipeline_mismatches{};
@@ -481,9 +486,9 @@ private:
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
-    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    bool DeltaStillHolds(u64 serial, u64 map_serial, bool matching = false);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
-                          u64 map_serial);
+                          u64 map_serial, u64 match_serial);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
@@ -495,6 +500,7 @@ private:
     VideoCommon::Nx2FastDraw::Delta taken_delta;
     FastDrawStats fast_draw_stats;
     u32 taken_break_classes{};
+    bool matched_candidate{};
     u64 fast_draw_window{};
     void NoteStateChanged();
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.

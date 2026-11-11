@@ -495,6 +495,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
     taken_delta = delta;
+    matched_candidate = false;
+    if (FastDraw::DrawCostStatsEnabled() && delta.overflowed) {
+        FastDraw::g_overflow_draws.fetch_add(1, std::memory_order_relaxed);
+    }
     taken_break_classes = FastDraw::DrawCostStatsEnabled()
                               ? FastDraw::g_break_classes.exchange(0, std::memory_order_relaxed)
                               : 0;
@@ -514,13 +518,19 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         frame_dump.Capturing()) {
         return full(FullDraw::Kind);
     }
-    if (draw.serial != FastDraw::Serial()) {
+    const bool serial_changed = draw.serial != FastDraw::Serial();
+    const bool diagnostic =
+        FastDraw::DrawCostStatsEnabled() && delta.match_cases != 0 &&
+        draw.match_serial == FastDraw::g_match_serial.load(std::memory_order_relaxed);
+    if (serial_changed) {
         const u32 last_break = FastDraw::g_last_break.load(std::memory_order_relaxed);
         ++fast_draw_stats.breaks[last_break & 0xff];
         if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
             ++fast_draw_stats.break_methods[method];
         }
-        return full(FullDraw::StateChanged);
+        if (!diagnostic) {
+            return full(FullDraw::StateChanged);
+        }
     }
     if (draw.map_serial != gpu_memory->MapSerial()) {
         taken_break_classes |= FastDraw::ClassBit(FastDraw::BreakClass::Other);
@@ -538,7 +548,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
     }
-    if (delta.vertex_layout) {
+    if (delta.vertex_layout || (diagnostic && (delta.match_cases & 2U) != 0)) {
         // Dynamic vertex formats still specialize the shader's input types. Rebuild the key,
         // and only keep the previous bindings when it selects exactly the same pipeline object.
         if (!draw.pipeline->HasDynamicVertexInput() ||
@@ -567,20 +577,29 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         }
     }
     taken_draw = draw;
-    return draw.pipeline;
+    matched_candidate = diagnostic;
+    // The diagnostic serial permits measurement only. Actual reuse still requires the original
+    // serial, so an off-window experiment always performs full preparation.
+    return serial_changed ? full(FullDraw::StateChanged) : draw.pipeline;
 }
 
-bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
+bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial, bool matching) {
     const auto full = [&](FullDraw reason) {
-        if (reason == FullDraw::StateChanged) {
-            NoteStateChanged();
+        if (!matching) {
+            if (reason == FullDraw::StateChanged) {
+                NoteStateChanged();
+            }
+            ++fast_draw_stats.full[static_cast<size_t>(reason)];
         }
-        ++fast_draw_stats.full[static_cast<size_t>(reason)];
         return false;
     };
     // TakeReusableDraw ran before the caches were locked, while other threads could still write,
     // unmap or delete what the delta draw keeps.
-    if (taken_draw.serial != serial || taken_draw.map_serial != map_serial) {
+    const bool state_changed =
+        matching ? taken_draw.match_serial !=
+                       VideoCommon::Nx2FastDraw::g_match_serial.load(std::memory_order_relaxed)
+                 : taken_draw.serial != serial;
+    if (state_changed || taken_draw.map_serial != map_serial) {
         return full(FullDraw::StateChanged);
     }
     if (taken_draw.tick != scheduler.CurrentTick()) {
@@ -589,7 +608,8 @@ bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
     if (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
         return full(FullDraw::RenderPass);
     }
-    if (taken_delta.vertex_layout && buffer_cache_runtime.AnyVertexRepacked()) {
+    if ((taken_delta.vertex_layout || (matching && (taken_delta.match_cases & 2U) != 0)) &&
+        buffer_cache_runtime.AnyVertexRepacked()) {
         taken_break_classes |=
             VideoCommon::Nx2FastDraw::ClassBit(VideoCommon::Nx2FastDraw::BreakClass::VertexLayout);
         return full(FullDraw::StateChanged);
@@ -603,7 +623,8 @@ bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
 }
 
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
-                                        bool is_indirect, u64 serial, u64 map_serial) {
+                                        bool is_indirect, u64 serial, u64 map_serial,
+                                        u64 match_serial) {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto topology = draw_state.topology;
     const auto ineligible = [&]() -> std::optional<Ineligible> {
@@ -632,6 +653,7 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
         .maxwell3d = maxwell3d,
         .serial = serial,
         .map_serial = map_serial,
+        .match_serial = match_serial,
         .tick = scheduler.CurrentTick(),
         .render_pass = scheduler.RenderPassSerial(),
         .topology = topology,
@@ -646,11 +668,7 @@ void RasterizerVulkan::ReportFastDraws() {
         // Event counters start with the same window as draw counts and preparation time.
         namespace FastDraw = VideoCommon::Nx2FastDraw;
         if (FastDraw::DrawCostStatsEnabled()) {
-            for (auto& count : FastDraw::g_method_breaks) {
-                count.exchange(0, std::memory_order_relaxed);
-            }
-            FastDraw::g_gpu_overflows.exchange(0, std::memory_order_relaxed);
-            FastDraw::g_device_overflows.exchange(0, std::memory_order_relaxed);
+            FastDraw::ResetCostEvents();
         }
         stats = FastDrawStats{.window_start = now};
         return;
@@ -840,6 +858,58 @@ void RasterizerVulkan::ReportFastDraws() {
                  stats.experiment_draws[0], stats.experiment_draws[1], stats.experiment_draws[2],
                  stats.experiment_verified[0], stats.experiment_verified[1],
                  stats.experiment_verified[2]);
+        for (size_t mask = 1; mask < stats.matched_draws.size(); ++mask) {
+            const auto& counts = stats.matched_draws[mask];
+            const auto& times = stats.matched_ns[mask];
+            LOG_INFO(Render_Vulkan,
+                     "Fast draw matched mask={}: full={} delta={} full_us={:.3f} delta_us={:.3f} "
+                     "rejected={} verify={}",
+                     mask, counts[0], counts[1],
+                     counts[0] == 0
+                         ? 0.0
+                         : static_cast<double>(times[0]) / 1e3 / static_cast<double>(counts[0]),
+                     counts[1] == 0
+                         ? 0.0
+                         : static_cast<double>(times[1]) / 1e3 / static_cast<double>(counts[1]),
+                     stats.matched_rejected[mask], fast_draw_verify);
+        }
+        LOG_INFO(
+            Render_Vulkan,
+            "Fast draw diagnostics: overflow_draw_attempts={} shader_identical={} "
+            "shader_changed={} bookkeeping_samples={} bookkeeping_sample_ns={} sample_stride=1024",
+            FastDraw::g_overflow_draws.exchange(0, std::memory_order_relaxed),
+            FastDraw::g_shader_writes[0].exchange(0, std::memory_order_relaxed),
+            FastDraw::g_shader_writes[1].exchange(0, std::memory_order_relaxed),
+            FastDraw::g_bookkeeping_samples.exchange(0, std::memory_order_relaxed),
+            FastDraw::g_bookkeeping_ns.exchange(0, std::memory_order_relaxed));
+        std::string operations;
+        for (size_t effect = 0; effect < FastDraw::NumEffects; ++effect) {
+            operations +=
+                fmt::format(" {}={:.0f}", FastDraw::effect_names[effect],
+                            static_cast<double>(FastDraw::g_effect_operations[effect].exchange(
+                                0, std::memory_order_relaxed)) /
+                                seconds);
+        }
+        LOG_INFO(Render_Vulkan, "Fast draw backend effects/s:{}", operations);
+        for (size_t handler = 0; handler < FastDraw::NumHandlers; ++handler) {
+            auto& counters = FastDraw::g_handlers[handler];
+            const u64 calls = counters.calls.exchange(0, std::memory_order_relaxed);
+            const u64 elapsed = counters.ns.exchange(0, std::memory_order_relaxed);
+            std::string effects;
+            for (size_t effect = 0; effect < FastDraw::NumEffects; ++effect) {
+                effects += fmt::format(
+                    " {}={}/{}", FastDraw::effect_names[effect],
+                    counters.effects[effect].exchange(0, std::memory_order_relaxed),
+                    counters.with_effect[effect].exchange(0, std::memory_order_relaxed));
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Fast draw handler {}: calls={} us/call={:.3f} ms/s={:.3f} "
+                     "effects=operations/handlers{}",
+                     FastDraw::handler_names[handler], calls,
+                     calls == 0 ? 0.0
+                                : static_cast<double>(elapsed) / 1e3 / static_cast<double>(calls),
+                     static_cast<double>(elapsed) / 1e6 / seconds, effects);
+        }
         ++fast_draw_window;
         if (settings.Alternating()) {
             FastDraw::g_alternate_on.store(
@@ -1191,6 +1261,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // break from here on, this draw's own resolve included, ends the delta chain.
     const u64 draw_serial = FastDraw::Serial();
     const u64 draw_map_serial = gpu_memory->MapSerial();
+    const u64 draw_match_serial = FastDraw::DrawCostStatsEnabled()
+                                      ? FastDraw::g_match_serial.load(std::memory_order_relaxed)
+                                      : 0;
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
@@ -1208,6 +1281,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+    const bool matched_holds = matched_candidate && taken_draw.pipeline == pipeline &&
+                               DeltaStillHolds(draw_serial, draw_map_serial, true);
     if (taken_delta.vertex_layout && pipeline->HasDynamicVertexInput()) {
         // Buffer binding consumes VertexBuffers before UpdateDynamicStates runs. Preserve the
         // need to emit SetVertexInputEXT for a stride/enable-only change as well as a format
@@ -1361,10 +1436,21 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     if (fast_draw_on) {
-        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
+        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial,
+                         draw_match_serial);
         const size_t index = static_cast<size_t>(path);
-        fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
+        const u64 elapsed = Profile::Now() - fast_draw_start;
+        fast_draw_stats.prepare_ns[index] += elapsed;
         ++fast_draw_stats.prepare_draws[index];
+        if (FastDraw::DrawCostStatsEnabled() && taken_delta.match_cases != 0) {
+            const size_t mask = taken_delta.match_cases;
+            if (matched_holds) {
+                fast_draw_stats.matched_ns[mask][index] += elapsed;
+                ++fast_draw_stats.matched_draws[mask][index];
+            } else {
+                ++fast_draw_stats.matched_rejected[mask];
+            }
+        }
     }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
@@ -3072,6 +3158,7 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
     std::unique_lock lock{wait_mutex};
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::GuestWait);
     wait_cv.wait(lock, [&written] { return written; });
 }
 
@@ -3084,6 +3171,7 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
+    const VideoCommon::Nx2FastDraw::HandlerScope cost{VideoCommon::Nx2FastDraw::Handler::WFI};
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
     VkPipelineStageFlags flags =
@@ -3104,6 +3192,7 @@ void RasterizerVulkan::WaitForIdle() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::GpuBarrier);
     scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
         // Later work waits for the earlier work and sees its writes.
         static constexpr VkMemoryBarrier WFI_BARRIER{
@@ -3118,6 +3207,7 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    const VideoCommon::Nx2FastDraw::HandlerScope cost{VideoCommon::Nx2FastDraw::Handler::Fragment};
     // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
     // ended ~5,900 render passes a second here.
     scheduler.DeferFragmentBarrier();

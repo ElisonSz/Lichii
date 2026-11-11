@@ -3298,10 +3298,14 @@ private:
     /// pipeline and reapplies vertex input; query methods still execute their side effects.
     bool NoteFastDrawState(u32 method) {
         namespace FastDraw = VideoCommon::Nx2FastDraw;
-        if (method == MAXWELL3D_REG_INDEX(vertex_id_base) &&
-            FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
-            FastDraw::g_delta.vertex_id = true;
-            return true;
+        if (method == MAXWELL3D_REG_INDEX(vertex_id_base)) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 1U;
+            }
+            if (FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
+                FastDraw::g_delta.vertex_id = true;
+                return true;
+            }
         }
         constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
         constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
@@ -3309,17 +3313,26 @@ private:
             (method >= streams && method < streams + Regs::NumVertexArrays * 4 &&
              (method - streams) % 4 == 0) ||
             (method >= attributes && method < attributes + Regs::NumVertexAttributes);
-        if (layout && FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
-            FastDraw::g_delta.vertex_layout = true;
-            return true;
+        if (layout) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 2U;
+            }
+            if (FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
+                FastDraw::g_delta.vertex_layout = true;
+                return true;
+            }
         }
         constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
-        if ((method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-             (method >= condition &&
-              method < condition + sizeof(Regs::RenderEnable) / sizeof(u32))) &&
-            FastDraw::ExperimentActive(draw_experiments.queries)) {
-            FastDraw::g_delta.queries = true;
-            return true;
+        if (method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+            (method >= condition &&
+             method < condition + sizeof(Regs::RenderEnable) / sizeof(u32))) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 4U;
+            }
+            if (FastDraw::ExperimentActive(draw_experiments.queries)) {
+                FastDraw::g_delta.queries = true;
+                return true;
+            }
         }
         return false;
     }
@@ -3341,6 +3354,18 @@ private:
         return argument;
     }
 
+    /// Count effective shader-slot writes, after shadow replay, including writes skipped as
+    /// identical. Called once: by ProcessDirtyRegisters, or at the skip site.
+    void NoteShaderWrite(u32 method, u32 argument) {
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        constexpr u32 first = MAXWELL3D_REG_INDEX(pipelines);
+        if (FastDraw::DrawCostStatsEnabled() && method >= first &&
+            method < first + sizeof(Regs::Pipeline) * Regs::MaxShaderProgram / sizeof(u32)) {
+            const size_t changed = regs.reg_array[method] != argument ? 1 : 0;
+            FastDraw::g_shader_writes[changed].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
     void ProcessDirtyRegisters(u32 method, u32 argument) {
         // The instances after the first are drawn together once their loop ends, and they must see
@@ -3349,6 +3374,7 @@ private:
         if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
             draw_manager.DrawDeferred(*this, true);
         }
+        NoteShaderWrite(method, argument);
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
             !IsFastDrawParameter(method) && !NoteFastDrawState(method)) {
@@ -3366,6 +3392,8 @@ private:
         const u32 argument = ProcessShadowRam(method, method_argument);
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
             ProcessDirtyRegisters(method, argument);
+        } else {
+            NoteShaderWrite(method, argument);
         }
     }
 

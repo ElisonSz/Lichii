@@ -338,6 +338,8 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const auto process = [&](u32 method, u32 value) {
         if (!skip_same || regs.reg_array[method] != value) {
             ProcessDirtyRegisters(method, value);
+        } else {
+            NoteShaderWrite(method, value);
         }
     };
     if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
@@ -475,8 +477,11 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         return ProcessCBBind(3);
     case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
         return ProcessCBBind(4);
-    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query): {
+        const VideoCommon::Nx2FastDraw::HandlerScope cost{
+            VideoCommon::Nx2FastDraw::Handler::Report};
         return ProcessQueryGet();
+    }
     case MAXWELL3D_REG_INDEX(render_enable.mode):
         return ProcessQueryCondition();
     case MAXWELL3D_REG_INDEX(clear_report_value):
@@ -490,9 +495,12 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         return;
     case MAXWELL3D_REG_INDEX(fragment_barrier):
         return rasterizer->FragmentBarrier();
-    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache): {
+        const VideoCommon::Nx2FastDraw::HandlerScope cost{
+            VideoCommon::Nx2FastDraw::Handler::TextureInvalidate};
         rasterizer->InvalidateGPUCache();
         return rasterizer->WaitForIdle();
+    }
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
         return rasterizer->TiledCacheBarrier();
     default:
@@ -740,6 +748,8 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
         // ProcessMethodCall (and the draw manager behind it) acts only on executable methods.
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
             ProcessDirtyRegisters(method, argument);
+        } else {
+            NoteShaderWrite(method, argument);
         }
         return;
     }

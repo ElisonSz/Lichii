@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -165,18 +166,147 @@ inline std::array<std::atomic<u64>, 0xe00> g_method_breaks{};
 inline std::atomic<u64> g_gpu_overflows{};
 inline std::atomic<u64> g_device_overflows{};
 
+inline std::atomic<u64> g_overflow_draws{};
+inline std::array<std::atomic<u64>, 2> g_shader_writes{}; // identical, changed
+inline std::atomic<u64> g_bookkeeping_samples{};
+inline std::atomic<u64> g_bookkeeping_ns{};
+
+[[nodiscard]] inline u64 CostNow() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+/// Recording-thread attribution, including nested WFI work inside cache invalidation. Counts
+/// both operations and handlers containing each effect; no worker-thread globals are sampled.
+enum class Handler : size_t { Report, TextureInvalidate, WFI, Fragment, FragmentResolve, Count };
+enum class Effect : size_t {
+    QueryEnd,
+    PassEnd,
+    Submit,
+    HostWait,
+    GpuBarrier,
+    QueryCopyWait,
+    WorkerWait,
+    GuestWait,
+    Count
+};
+inline constexpr size_t NumHandlers = static_cast<size_t>(Handler::Count);
+inline constexpr size_t NumEffects = static_cast<size_t>(Effect::Count);
+inline constexpr std::array<const char*, NumHandlers> handler_names{
+    "report", "texture_invalidate", "wfi", "fragment", "fragment_resolve"};
+inline constexpr std::array<const char*, NumEffects> effect_names{
+    "query_end",   "pass_end",        "submit",      "host_wait",
+    "gpu_barrier", "query_copy_wait", "worker_wait", "guest_wait"};
+struct HandlerStats {
+    std::atomic<u64> calls{};
+    std::atomic<u64> ns{};
+    std::array<std::atomic<u64>, NumEffects> effects{};
+    std::array<std::atomic<u64>, NumEffects> with_effect{};
+};
+inline std::array<HandlerStats, NumHandlers> g_handlers;
+inline std::array<std::atomic<u64>, NumEffects> g_effect_operations{};
+struct HandlerScope;
+inline thread_local HandlerScope* g_handler_scope{};
+struct HandlerScope {
+    HandlerScope* previous{};
+    u64 start{};
+    Handler kind;
+    u32 effects{};
+    explicit HandlerScope(Handler handler) : kind{handler} {
+        if (DrawCostStatsEnabled()) {
+            previous = g_handler_scope;
+            g_handler_scope = this;
+            start = CostNow();
+        }
+    }
+    ~HandlerScope() {
+        if (start == 0) {
+            return;
+        }
+        const u64 elapsed = CostNow() - start;
+        g_handler_scope = previous;
+        auto& stats = g_handlers[static_cast<size_t>(kind)];
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        stats.ns.fetch_add(elapsed, std::memory_order_relaxed);
+        for (size_t index = 0; index < NumEffects; ++index) {
+            if ((effects & (1U << index)) != 0) {
+                stats.with_effect[index].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    HandlerScope(const HandlerScope&) = delete;
+    HandlerScope& operator=(const HandlerScope&) = delete;
+};
+inline void NoteEffect(Effect effect) {
+    if (!DrawCostStatsEnabled()) {
+        return;
+    }
+    const size_t index = static_cast<size_t>(effect);
+    g_effect_operations[index].fetch_add(1, std::memory_order_relaxed);
+    for (auto* scope = g_handler_scope; scope != nullptr; scope = scope->previous) {
+        scope->effects |= 1U << index;
+        g_handlers[static_cast<size_t>(scope->kind)].effects[index].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+/// Start a clean report window; diagnostic serials deliberately remain monotonic.
+inline void ResetCostEvents() {
+    for (auto& count : g_method_breaks) {
+        count.exchange(0, std::memory_order_relaxed);
+    }
+    g_gpu_overflows.exchange(0, std::memory_order_relaxed);
+    g_device_overflows.exchange(0, std::memory_order_relaxed);
+    g_overflow_draws.exchange(0, std::memory_order_relaxed);
+    for (auto& count : g_shader_writes) {
+        count.exchange(0, std::memory_order_relaxed);
+    }
+    g_bookkeeping_samples.exchange(0, std::memory_order_relaxed);
+    g_bookkeeping_ns.exchange(0, std::memory_order_relaxed);
+    for (auto& operation : g_effect_operations) {
+        operation.exchange(0, std::memory_order_relaxed);
+    }
+    for (auto& stats : g_handlers) {
+        stats.calls.exchange(0, std::memory_order_relaxed);
+        stats.ns.exchange(0, std::memory_order_relaxed);
+        for (size_t index = 0; index < NumEffects; ++index) {
+            stats.effects[index].exchange(0, std::memory_order_relaxed);
+            stats.with_effect[index].exchange(0, std::memory_order_relaxed);
+        }
+    }
+}
+
 inline std::atomic<u64> g_serial{1};
+/// Diagnostic serial ignoring only the three experiment-eligible register/method breaks. It
+/// never authorizes reuse: off-window candidates still execute full preparation.
+inline std::atomic<u64> g_match_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
+
+[[nodiscard]] bool IsExperimentBreak(Reason reason, u32 method);
 
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
         if (DrawCostStatsEnabled()) {
+            // Sample only the optional bookkeeping, including its extra serial. The clock pair
+            // and sample-result atomics are outside this interval. Sampling avoids two clock
+            // reads on every break; report sample count so extrapolation is explicit.
+            static thread_local u32 sample_sequence{};
+            const bool sample = (++sample_sequence & 1023U) == 0;
+            const u64 start = sample ? CostNow() : 0;
+            if (!IsExperimentBreak(reason, method)) {
+                g_match_serial.fetch_add(1, std::memory_order_relaxed);
+            }
             g_break_classes.fetch_or(ClassifyBreak(reason, method), std::memory_order_relaxed);
             if (reason == Reason::Method && method < g_method_breaks.size()) {
                 g_method_breaks[method].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (sample) {
+                g_bookkeeping_ns.fetch_add(CostNow() - start, std::memory_order_relaxed);
+                g_bookkeeping_samples.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -222,6 +352,8 @@ struct Delta {
     bool vertex_layout{}; ///< Requires a fresh pipeline lookup, then dynamic vertex input.
     bool queries{};       ///< Query side effects already ran, including conditional rendering.
     bool vertex_id{};
+    u8 match_cases{};  ///< Three-bit experiment class, observed in both on and off windows.
+    bool overflowed{}; ///< At least one lost interval since the preceding draw attempt.
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
@@ -276,6 +408,7 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
     }
     Delta& delta = g_delta;
     if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
+        delta.overflowed = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
             g_gpu_overflows.fetch_add(1, std::memory_order_relaxed);
@@ -290,6 +423,7 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
     }
     Delta& delta = g_delta;
     if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
+        delta.overflowed = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
             g_device_overflows.fetch_add(1, std::memory_order_relaxed);

@@ -1195,6 +1195,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            const VideoCommon::Nx2FastDraw::HandlerScope cost{
+                VideoCommon::Nx2FastDraw::Handler::FragmentResolve};
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
@@ -1327,6 +1329,8 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            const VideoCommon::Nx2FastDraw::HandlerScope cost{
+                VideoCommon::Nx2FastDraw::Handler::FragmentResolve};
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }

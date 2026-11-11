@@ -94,6 +94,27 @@ u32 ClassifyBreak(Reason reason, u32 method) {
     return ClassBit(BreakClass::Other);
 }
 
+bool IsExperimentBreak(Reason reason, u32 method) {
+    using Maxwell3D = Tegra::Engines::Maxwell3D;
+    using Regs = Maxwell3D::Regs;
+    if (reason == Reason::Method) {
+        return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+               method == MAXWELL3D_REG_INDEX(render_enable.mode);
+    }
+    if (reason != Reason::Register) {
+        return false;
+    }
+    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+    constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
+    return method == MAXWELL3D_REG_INDEX(vertex_id_base) ||
+           (method >= streams && method < streams + Regs::NumVertexArrays * 4 &&
+            (method - streams) % 4 == 0) ||
+           (method >= attributes && method < attributes + Regs::NumVertexAttributes) ||
+           method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           (method >= condition && method < condition + sizeof(Regs::RenderEnable) / sizeof(u32));
+}
+
 void DeviceSpans::Update(const Tegra::MemoryManager& memory_, GPUVAddr address_, u64 size_) {
     const u64 serial = memory_.MapSerial();
     if (memory == &memory_ && address == address_ && size == size_ && map_serial == serial) {

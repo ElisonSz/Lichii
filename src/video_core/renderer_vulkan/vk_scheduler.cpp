@@ -275,6 +275,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::WorkerWait);
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -837,6 +838,7 @@ void Scheduler::TraceGpuSubmission() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::Submit);
     if (uploads_pending) {
         // Keep the copies in the tick that protects their staging regions and buffer lifetimes.
         FlushUploads();
@@ -956,6 +958,7 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
+        VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::PassEnd);
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;

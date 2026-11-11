@@ -85,6 +85,7 @@ public:
 
     void Sync(size_t start, size_t size) {
         const auto& dev = device.GetLogical();
+        VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::HostWait);
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
             &host_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
@@ -188,6 +189,7 @@ public:
         if (!has_started) {
             return;
         }
+        VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::QueryEnd);
         scheduler.Record([query_pool = current_query_pool,
                           query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
             cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
@@ -284,6 +286,8 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
+            // Each batch records one WAIT_BIT copy, including AMD's newest-query-only path.
+            VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::QueryCopyWait);
             scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
