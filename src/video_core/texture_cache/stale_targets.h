@@ -23,11 +23,16 @@ namespace VideoCommon::StaleTargets {
 // Incompatible targets are disposable only with all four overwrite conditions proved.
 inline bool enabled = true;
 inline bool verify = false;
+/// Frames a bad-overlap render target stays unused before RetireStaleTargets drops it: the age
+/// at which the collector deletes one at its critical threshold. 0 turns the pass off.
+inline u64 retire_age = 10;
 inline void ReadSwitch() {
     const char* const keep = std::getenv("EDEN_NX2_KEEP_STALE_TARGETS");
     enabled = keep == nullptr || keep[0] != '1';
     const char* const check = std::getenv("EDEN_NX2_STALE_TARGET_VERIFY");
     verify = check != nullptr && check[0] == '1';
+    const char* const age = std::getenv("EDEN_NX2_STALE_TARGET_AGE");
+    retire_age = age != nullptr ? std::strtoull(age, nullptr, 10) : 10;
 }
 
 /// Why an older target a whole clear overlapped stays, for the memory trace.

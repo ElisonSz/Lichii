@@ -120,19 +120,23 @@ struct TextureCacheOperations {
         return *std::ranges::max_element(image_ids, image_ids_compare);
     }
 
-    // Condition 1: history is monotonic; a later clear cannot erase a guest-data origin.
-    // Whether the target's own contents were ever defined by a whole clear doesn't matter for
-    // dropping it: a colour target bound while only depth is cleared is made at that clear and
-    // then only drawn, and most stale targets are of that kind.
-    static bool GpuOnlyRenderTarget(const ImageBase& image) {
-        return image.stale_target.render_target_origin && !image.stale_target.forbidden_history &&
-               image.info.num_samples == 1 &&
+    // A render target the GPU wrote last, in storage the rule handles.
+    static bool GpuWrittenRenderTarget(const ImageBase& image) {
+        return image.stale_target.render_target_origin && image.info.num_samples == 1 &&
                !image.info.is_sparse && !image.HasScaled() &&
                True(image.flags & ImageFlagBits::GpuModified) &&
                False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
                                     ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
                                     ImageFlagBits::Unbacked | ImageFlagBits::Rescaled |
                                     ImageFlagBits::Remapped | ImageFlagBits::TrimmedLevels));
+    }
+
+    // Condition 1: history is monotonic; a later clear cannot erase a guest-data origin.
+    // Whether the target's own contents were ever defined by a whole clear doesn't matter for
+    // dropping it: a colour target bound while only depth is cleared is made at that clear and
+    // then only drawn, and most stale targets are of that kind.
+    static bool GpuOnlyRenderTarget(const ImageBase& image) {
+        return GpuWrittenRenderTarget(image) && !image.stale_target.forbidden_history;
     }
 
     // The stale marker a drop leaves behind is kept per whole 4 KiB page inside the image.

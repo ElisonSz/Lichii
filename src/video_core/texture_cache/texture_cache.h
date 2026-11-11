@@ -368,6 +368,53 @@ void TextureCache<P>::CollectStaleReferences() {
 }
 
 template <class P>
+void TextureCache<P>::RetireStaleTargets() {
+    const u64 age = StaleTargets::retire_age;
+    if (!StaleTargets::enabled || age == 0 || frame_tick <= age ||
+        !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // Ocarina of Time allocates its render targets anew every frame, and when the camera moves
+    // the whole layout shifts: each target lands on a new address, over the previous frames'
+    // targets. Those are flagged bad-overlap and were left to the collector, which deletes
+    // them without a download once they are ten frames old, but only above its thresholds, at
+    // most 60 a frame, and behind the textures it has to skip first. So they filled the cache
+    // to the thresholds (7 to 8 GB of 9 GB at a town spot, 27 GB and out of device memory in
+    // one room), and the collector then also deleted textures that were out of view for a
+    // second. This pass makes the same deletion without waiting for memory to run short.
+    constexpr size_t MaxPerFrame = 512;
+    boost::container::small_vector<ImageId, 64> aged;
+    lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::BadOverlap) &&
+            TextureCacheOperations::GpuWrittenRenderTarget(image) &&
+            TextureCacheOperations::StaleMarkerCovers(image)) {
+            aged.push_back(image_id);
+        }
+        return aged.size() >= MaxPerFrame;
+    });
+    if (aged.empty()) {
+        return;
+    }
+    CollectStaleReferences();
+    for (const ImageId image_id : aged) {
+        Image& image = slot_images[image_id];
+        if (!TextureCacheOperations::NoReferences(*this, image_id, image)) {
+            ++trace_stale_aged_kept;
+            continue;
+        }
+        ++trace_stale_aged;
+        trace_stale_aged_bytes += image.guest_size_bytes;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+    }
+}
+
+template <class P>
 bool TextureCache<P>::StaleTargetReferenced(ImageId id) const {
     const auto& proof = slot_images[id].stale_target;
     if (proof.pending_transfer) {
@@ -746,6 +793,7 @@ void TextureCache<P>::TickFrame() {
             }
         }
     }
+    RetireStaleTargets();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
@@ -937,14 +985,16 @@ void TextureCache<P>::TraceMemory() {
         "footprint-verified {} failures {} drops {} drop-bytes {} clears {} clear-ns {} zeroes {} "
         "zero-bytes {} zero-ns {} creations {} create-ns {} verified-drops {} reference-scans {} "
         "conditional-clears {}; kept: origin {} history {} flags {} marker {} referenced {} "
-        "layout {} partial {}",
+        "layout {} partial {}; aged {} aged-bytes {} aged-referenced {}",
         StaleTargets::enabled && StaleTargets::verify, StaleTargets::enabled, trace_stale_layout,
         trace_stale_contents, trace_stale_footprints, trace_stale_failures, trace_stale_drops,
         trace_stale_drop_bytes, trace_stale_clears, trace_stale_clear_ns, trace_stale_zeroes,
         trace_stale_zero_bytes, trace_stale_zero_ns, trace_stale_creations, trace_stale_create_ns,
         trace_stale_verified, trace_stale_reference_scans, trace_stale_unconfirmed,
         trace_stale_kept[0], trace_stale_kept[1], trace_stale_kept[2], trace_stale_kept[3],
-        trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6]);
+        trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6], trace_stale_aged,
+        trace_stale_aged_bytes, trace_stale_aged_kept);
+    trace_stale_aged = trace_stale_aged_bytes = trace_stale_aged_kept = 0;
     trace_stale_creations = trace_stale_create_ns = trace_stale_verified = 0;
     trace_stale_reference_scans = trace_stale_unconfirmed = 0;
     trace_stale_kept = {};

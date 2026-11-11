@@ -765,6 +765,22 @@ TEST_CASE("A target that was only drawn is dropped once overwritten", "[video_co
     CHECK(cache.trace_stale_drops == 1);
 }
 
+TEST_CASE("The age pass takes render targets the GPU wrote last", "[video_core][stale_targets]") {
+    Nx2State state;
+    CacheFixture cache;
+    auto& image = cache.slot_images[cache.Add(MakeInfo(16, 64, 0), 0x31)];
+    CHECK(TextureCacheOperations::GpuWrittenRenderTarget(image));
+    // Earlier guest data keeps a target out of the overwrite proof, not out of the age pass.
+    image.stale_target.Forbid();
+    CHECK(TextureCacheOperations::GpuWrittenRenderTarget(image));
+    CHECK_FALSE(TextureCacheOperations::GpuOnlyRenderTarget(image));
+    image.flags |= ImageFlagBits::CpuModified;
+    CHECK_FALSE(TextureCacheOperations::GpuWrittenRenderTarget(image));
+    image.flags = ImageFlagBits::GpuModified;
+    image.stale_target.render_target_origin = false;
+    CHECK_FALSE(TextureCacheOperations::GpuWrittenRenderTarget(image));
+}
+
 TEST_CASE("A whole clear of an older image counts as an overwrite", "[video_core][stale_targets]") {
     Nx2State state;
     // The writer was made before the stale target and is cleared again after it: the target's

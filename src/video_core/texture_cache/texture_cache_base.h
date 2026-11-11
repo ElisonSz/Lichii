@@ -241,6 +241,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 trace_stale_reference_scans{};
     std::array<u64, StaleTargets::NumKept> trace_stale_kept{};
     u64 trace_stale_unconfirmed{};
+    u64 trace_stale_aged{};
+    u64 trace_stale_aged_bytes{};
+    u64 trace_stale_aged_kept{};
     u64 trace_stale_zeroes{};
     u64 trace_stale_zero_bytes{};
     u64 trace_stale_zero_ns{};
@@ -411,6 +414,9 @@ public:
     }
 
     void CollectStaleReferences();
+    /// Drops the render targets other images were made over and nothing has used for
+    /// StaleTargets::retire_age frames, every frame and whatever the memory use.
+    void RetireStaleTargets();
     bool StaleTargetReferenced(ImageId id) const;
     void MarkStaleTransfer(ImageBase& image);
     ::Common::unordered_set<ImageId> stale_references;
