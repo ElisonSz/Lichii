@@ -3291,11 +3291,38 @@ public:
 private:
     void InitializeRegisterDefaults();
 
-    /// TEST: EDEN_NX2_REUSE_VERTEX_ID=1, read per engine (after nx2_switches.txt is loaded).
-    const bool reuse_vertex_id = [] {
-        const char* const value = std::getenv("EDEN_NX2_REUSE_VERTEX_ID");
-        return value != nullptr && value[0] == '1';
-    }();
+    const VideoCommon::Nx2FastDraw::Experiments& draw_experiments =
+        VideoCommon::Nx2FastDraw::ExperimentSettings();
+
+    /// Only these writes may use the experimental delta path. The rasterizer still checks the
+    /// pipeline and reapplies vertex input; query methods still execute their side effects.
+    bool NoteFastDrawState(u32 method) {
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        if (method == MAXWELL3D_REG_INDEX(vertex_id_base) &&
+            FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
+            FastDraw::g_delta.vertex_id = true;
+            return true;
+        }
+        constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+        constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+        const bool layout =
+            (method >= streams && method < streams + Regs::NumVertexArrays * 4 &&
+             (method - streams) % 4 == 0) ||
+            (method >= attributes && method < attributes + Regs::NumVertexAttributes);
+        if (layout && FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
+            FastDraw::g_delta.vertex_layout = true;
+            return true;
+        }
+        constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
+        if ((method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+             (method >= condition &&
+              method < condition + sizeof(Regs::RenderEnable) / sizeof(u32))) &&
+            FastDraw::ExperimentActive(draw_experiments.queries)) {
+            FastDraw::g_delta.queries = true;
+            return true;
+        }
+        return false;
+    }
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
@@ -3323,11 +3350,8 @@ private:
             draw_manager.DrawDeferred(*this, true);
         }
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
-        // TEST (EDEN_NX2_REUSE_VERTEX_ID=1): vertex_id_base has no reader in the renderers (the
-        // host's vertex index already includes the base vertex), so its change doesn't end reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method) &&
-            !(reuse_vertex_id && method == MAXWELL3D_REG_INDEX(vertex_id_base))) {
+            !IsFastDrawParameter(method) && !NoteFastDrawState(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         regs.reg_array[method] = argument;

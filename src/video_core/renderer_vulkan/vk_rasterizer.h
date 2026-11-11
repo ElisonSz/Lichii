@@ -468,6 +468,12 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        /// StateChanged draws by the union of all break classes since the previous draw.
+        std::array<u64, 1U << VideoCommon::Nx2FastDraw::NumBreakClasses> break_sets{};
+        /// New cases actually accepted, and compared by FAST_DRAW_VERIFY, respectively.
+        std::array<u64, 3> experiment_draws{};
+        std::array<u64, 3> experiment_verified{};
+        u64 frames{};
         u64 window_start{};
     };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
@@ -488,6 +494,9 @@ private:
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
     FastDrawStats fast_draw_stats;
+    u32 taken_break_classes{};
+    u64 fast_draw_window{};
+    void NoteStateChanged();
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};

@@ -33,6 +33,9 @@ class MemoryManager;
 /// the bound pipeline are the ones the previous draw left.
 /// EDEN_NX2_FAST_DRAW_VERIFY=1 resolves those draws in full and counts where the pipeline, views,
 /// samplers or kept buffer bindings differ.
+/// Experimental query reuse still executes every query handler. Experimental vertex-layout
+/// reuse requires dynamic vertex input, rechecks the full pipeline key and emits vertex input
+/// again; static input or a different shader input type falls back to full preparation.
 namespace VideoCommon::Nx2FastDraw {
 
 enum class Reason : u8 {
@@ -82,6 +85,86 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
+/// Experiments are read once when the first 3D engine is created, after switch-file loading.
+/// 0 = off, 1 = on, 2 = alternate off/on in successive ten-second draw report windows.
+struct Experiments {
+    u8 vertex_id{};
+    u8 vertex_layout{};
+    u8 queries{};
+
+    [[nodiscard]] bool Alternating() const {
+        return vertex_id == 2 || vertex_layout == 2 || queries == 2;
+    }
+};
+
+[[nodiscard]] inline u8 ReadExperiment(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && (value[0] == '1' || value[0] == '2')
+               ? static_cast<u8>(value[0] - '0')
+               : u8{0};
+}
+
+[[nodiscard]] inline const Experiments& ExperimentSettings() {
+    static const Experiments settings{ReadExperiment("EDEN_NX2_REUSE_VERTEX_ID"),
+                                      ReadExperiment("EDEN_NX2_REUSE_VERTEX_LAYOUT"),
+                                      ReadExperiment("EDEN_NX2_REUSE_QUERIES")};
+    return settings;
+}
+
+inline std::atomic<bool> g_alternate_on{};
+
+[[nodiscard]] inline bool ExperimentActive(u8 mode) {
+    return mode == 1 || (mode == 2 && g_alternate_on.load(std::memory_order_relaxed));
+}
+
+/// A plain flag: checked for every draw and every break, where a function's static is checked
+/// for its initialization on every call (MSVC reads a thread-local for it).
+inline std::atomic<bool> g_draw_cost_stats{};
+
+/// Called by VideoCore::CreateGPU, after the frontend has loaded nx2_switches.txt.
+inline void ReadDrawCostStatsSwitch() {
+    const char* const value = std::getenv("EDEN_NX2_DRAW_COST_STATS");
+    g_draw_cost_stats.store((value != nullptr && value[0] == '1') ||
+                                ExperimentSettings().Alternating(),
+                            std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool DrawCostStatsEnabled() {
+    return g_draw_cost_stats.load(std::memory_order_relaxed);
+}
+
+/// A draw's union of breaks, rather than just its last break. Only collected with cost stats.
+/// Method classes describe side effects; register classes describe the state being changed.
+enum class BreakClass : u8 {
+    VertexLayout,
+    QueryCondition,
+    Shader,
+    FixedFunction,
+    MethodReport,
+    MethodBarrier,
+    MethodUpload,
+    MethodControl,
+    DeltaOverflow,
+    VertexId,
+    Other,
+    Count,
+};
+inline constexpr size_t NumBreakClasses = static_cast<size_t>(BreakClass::Count);
+inline constexpr std::array<const char*, NumBreakClasses> class_names{
+    "vertex_layout",  "query_condition", "shader",        "fixed_function",
+    "method_report",  "method_barrier",  "method_upload", "method_control",
+    "delta_overflow", "vertex_id",       "other"};
+
+[[nodiscard]] constexpr u32 ClassBit(BreakClass kind) {
+    return 1U << static_cast<u32>(kind);
+}
+[[nodiscard]] u32 ClassifyBreak(Reason reason, u32 method);
+inline std::atomic<u32> g_break_classes{};
+/// All method break events, including those hidden by a later break (not draw counts).
+inline std::array<std::atomic<u64>, 0xe00> g_method_breaks{};
+inline std::atomic<u64> g_gpu_overflows{};
+inline std::atomic<u64> g_device_overflows{};
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
@@ -90,6 +173,12 @@ inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+        if (DrawCostStatsEnabled()) {
+            g_break_classes.fetch_or(ClassifyBreak(reason, method), std::memory_order_relaxed);
+            if (reason == Reason::Method && method < g_method_breaks.size()) {
+                g_method_breaks[method].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -130,6 +219,9 @@ struct Delta {
     std::array<DAddr, MaxWrites> device_begin{};
     std::array<DAddr, MaxWrites> device_end{};
     u32 num_device_writes{};
+    bool vertex_layout{}; ///< Requires a fresh pipeline lookup, then dynamic vertex input.
+    bool queries{};       ///< Query side effects already ran, including conditional rendering.
+    bool vertex_id{};
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
@@ -185,6 +277,9 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
     Delta& delta = g_delta;
     if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
         Break(Reason::DeltaOverflow);
+        if (DrawCostStatsEnabled()) {
+            g_gpu_overflows.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -196,6 +291,9 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
     Delta& delta = g_delta;
     if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
         Break(Reason::DeltaOverflow);
+        if (DrawCostStatsEnabled()) {
+            g_device_overflows.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 

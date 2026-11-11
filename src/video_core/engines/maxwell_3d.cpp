@@ -65,8 +65,13 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
         execution_mask[i] = IsMethodExecutable(u32(i));
     fast_maxwell3d = !record_write_history &&
                      !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
-    if (reuse_vertex_id) {
-        LOG_INFO(HW_GPU, "TEST: a changed vertex_id_base doesn't end fast draw reuse");
+    if (draw_experiments.vertex_id != 0 || draw_experiments.vertex_layout != 0 ||
+        draw_experiments.queries != 0) {
+        LOG_INFO(HW_GPU,
+                 "Draw reuse experiments: vertex_id={} vertex_layout={} queries={} "
+                 "(0 off, 1 on, 2 alternate; first window off)",
+                 draw_experiments.vertex_id, draw_experiments.vertex_layout,
+                 draw_experiments.queries);
     }
 }
 
@@ -402,7 +407,10 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
+    const bool query_method = method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+                              method == MAXWELL3D_REG_INDEX(render_enable.mode);
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        !(VideoCommon::Nx2FastDraw::Enabled() && query_method && NoteFastDrawState(method))) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
