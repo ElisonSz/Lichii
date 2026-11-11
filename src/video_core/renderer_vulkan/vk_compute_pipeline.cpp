@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -326,6 +327,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             return;
         }
 
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::DriverBuilt, shader_hash);
         // Log compute pipeline creation
         if (GPU::Logging::IsActive()) {
             GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
@@ -717,6 +719,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
+            const auto whiteout_begin = VideoCommon::OotWhiteout::Enabled()
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
             if (jobs) {
                 // Raised to NeedNow, and built here unless a driver worker builds it already
                 jobs->RunOrWait(job);
@@ -728,6 +733,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             }
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            if (VideoCommon::OotWhiteout::Enabled()) {
+                VideoCommon::OotWhiteout::Add(
+                    VideoCommon::OotWhiteout::Event::ComputeWait, ShaderHash(),
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - whiteout_begin)
+                                         .count()));
+            }
         });
     }
 

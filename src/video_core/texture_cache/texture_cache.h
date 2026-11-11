@@ -27,12 +27,13 @@
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
-#include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -176,6 +177,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        OotWhiteout::Add(
+            must_download ? OotWhiteout::Event::CollectDownload : OotWhiteout::Event::CollectDrop,
+            image.gpu_addr, image.cpu_addr, image.guest_size_bytes, static_cast<u64>(image.flags));
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
@@ -2149,6 +2153,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
+    OotWhiteout::Count(OotWhiteout::Event::Refresh);
     image.flags &= ~ImageFlagBits::CpuModified;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
@@ -2163,6 +2168,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
+            OotWhiteout::Add(OotWhiteout::Event::StaleSkip, image.gpu_addr, image.cpu_addr,
+                             image.guest_size_bytes);
             ++tc_stale_skips;
             tc_stale_skip_bytes += image.guest_size_bytes;
             runtime.TransitionImageLayout(image);

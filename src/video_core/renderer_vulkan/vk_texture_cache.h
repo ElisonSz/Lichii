@@ -518,6 +518,11 @@ public:
         return *(this->*current_image);
     }
 
+    // A failed scale helper can restore the original handle while leaving Rescaled set.
+    [[nodiscard]] bool HandleMatchesRescaling() const noexcept {
+        return current_image == (IsRescaled() ? &Image::scaled_image : &Image::original_image);
+    }
+
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
         return aspect_mask;
     }

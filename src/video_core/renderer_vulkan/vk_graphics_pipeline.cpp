@@ -23,6 +23,7 @@
 
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -671,6 +672,8 @@ GraphicsPipeline::GraphicsPipeline(
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
             MakePipeline(render_pass);
+            VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::DriverBuilt, key.Hash(),
+                                          key.unique_hashes[1], key.unique_hashes[5]);
         } catch (const Shader::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
             throw;
@@ -1519,10 +1522,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
             const auto begin = std::chrono::steady_clock::now();
             build->Wait(!worker_only_build);
-            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - begin)
-                                       .count(),
-                                   std::memory_order::relaxed);
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            VideoCommon::OotWhiteout::Add(
+                VideoCommon::OotWhiteout::Event::GraphicsWait, key.unique_hashes[1],
+                key.unique_hashes[5],
+                static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+            hold_time_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                std::memory_order::relaxed);
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
@@ -1563,6 +1571,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (bind_pipeline) {
             scheduler.SetGraphicsPipelineMissing(!pipeline || build->Failed());
             if (!pipeline || build->Failed()) {
+                VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 4,
+                                              key.Hash());
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);

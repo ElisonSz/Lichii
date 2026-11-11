@@ -44,6 +44,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/async_teardown.h"
@@ -2259,6 +2260,8 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
+    VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Evict, evicted, built, budget,
+                                  tick);
     LOG_INFO(Render_Vulkan,
              "Evicted {} graphics pipelines, least recently used first: {} were built, over the "
              "budget of {} ({} MiB of driver memory at ~0.45 MB each); {} left",
@@ -2346,6 +2349,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
         }
     }
     if (discard) {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Skip,
+                                      pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]);
         static std::atomic<u64> skipped{};
         if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
             // Counts lookups, not draws: a draw state can look its pipeline up more than once.
@@ -2932,6 +2937,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const auto begin = std::chrono::steady_clock::now();
     std::optional<ParallelTranslation> parallel;
     SCOPE_EXIT {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Build, graphics_key.Hash(),
+                                      graphics_key.unique_hashes[1], graphics_key.unique_hashes[5]);
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
             if (graphics_key.unique_hashes[stage] != 0) {
@@ -3035,6 +3042,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
         VideoCommon::Nx2Profile::Zone::ComputePipelineMiss};
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Build, key.Hash(),
+                                      key.unique_hash);
         ReportRuntimePipeline("Compute", begin,
                               fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
                                           key.unique_hash,

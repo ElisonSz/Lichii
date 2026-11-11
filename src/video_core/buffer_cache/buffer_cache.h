@@ -32,6 +32,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -1493,6 +1494,8 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     const auto& copy = copies[0];
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
+    OotWhiteout::Add(OotWhiteout::Event::Copy, *cpu_src_address, *cpu_dest_address, amount,
+                     has_new_downloads);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
@@ -1947,6 +1950,10 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                 const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 mark = std::min<u64>(binding.size, pad + *extent);
+            }
+            if (!grid) {
+                OotWhiteout::Add(OotWhiteout::Event::GridUnknown, binding.gpu_addr, binding.size,
+                                 kepler_compute->GetIndirectListSlot().has_value(), mark);
             }
             break;
         }
@@ -3842,6 +3849,11 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             return true;
         }
         const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
+        if (OotWhiteout::Enabled()) {
+            for (const auto &copy : copies_span)
+                OotWhiteout::Add(OotWhiteout::Event::UploadBytes,
+                                 buffer.CpuAddr() + copy.dst_offset, copy.size, 0, 0, copy.size);
+        }
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         // Mapped uploads carry their own barriers (or run in the upload command buffer, which
         // ends with one); another barrier here only ended the render pass (~50 times a frame in

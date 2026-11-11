@@ -7,6 +7,7 @@
 #include "shader_recompiler/storage_write_extent.h"
 #include "video_core/buffer_cache/compute_write_grid.h"
 #include "video_core/buffer_cache/indirect_buffer.h"
+#include "video_core/oot_whiteout_pixels.h"
 
 #ifdef WHITEOUT_STANDALONE
 #include <iostream>
@@ -21,6 +22,44 @@
 #endif
 
 namespace {
+using namespace VideoCommon::OotWhiteout;
+void PixelCases() {
+    std::array<u8, 8> bytes{};
+    auto stats = Inspect(std::span{bytes}.first(4), Encoding::Rgba8);
+    WHITEOUT_CHECK(stats.pixels == 1);
+    WHITEOUT_CHECK(stats.nonfinite == 0);
+    WHITEOUT_CHECK(!stats.Suspicious(true));
+    bytes.fill(255);
+    stats = Inspect(std::span{bytes}.first(4), Encoding::Rgba8);
+    WHITEOUT_CHECK(stats.white == 1);
+    WHITEOUT_CHECK(stats.Suspicious(true));
+    // B10G11R11: 1, 2, 4. Channel order and exponent bias matter for finite HDR.
+    u32 packed = (15U << 6) | ((16U << 6) << 11) | ((17U << 5) << 22);
+    std::memcpy(bytes.data(), &packed, 4);
+    stats = Inspect(std::span{bytes}.first(4), Encoding::R11G11B10);
+    WHITEOUT_CHECK(stats.maximum == 4);
+    WHITEOUT_CHECK(stats.nonfinite == 0);
+    WHITEOUT_CHECK(!stats.Suspicious(false));
+    packed = 31U << 6; // +Inf
+    std::memcpy(bytes.data(), &packed, 4);
+    WHITEOUT_CHECK(Inspect(std::span{bytes}.first(4), Encoding::R11G11B10).nonfinite == 1);
+    packed |= 1; // NaN
+    std::memcpy(bytes.data(), &packed, 4);
+    WHITEOUT_CHECK(Inspect(std::span{bytes}.first(4), Encoding::R11G11B10).nonfinite == 1);
+    const std::array<u16, 4> half{0xbc00, 0x4000, 0x7bff, 0x7e00};
+    std::memcpy(bytes.data(), half.data(), 8);
+    stats = Inspect(bytes, Encoding::Rgba16);
+    WHITEOUT_CHECK(stats.nonfinite == 0);
+    WHITEOUT_CHECK(stats.maximum == 65504);
+    WHITEOUT_CHECK(stats.bright == 1);
+    // Alpha NaN is irrelevant; RGB NaN is detected.
+    bytes[1] = 0x7e;
+    WHITEOUT_CHECK(Inspect(bytes, Encoding::Rgba16).nonfinite == 1);
+    WHITEOUT_CHECK(UnsignedFloat(1, 10) == std::ldexp(1.0f, -24));
+    WHITEOUT_CHECK(UnsignedFloat(0, 6) == 0);
+    WHITEOUT_CHECK(!PixelStats{}.Suspicious(false));
+}
+
 struct Dimension {
     u32 value;
     u32 Value() const { return value; }
@@ -116,11 +155,15 @@ int main() {
             std::cout << "FAIL " << name << ": " << error.what() << '\n';
         }
     };
+    run("pixel-decoding", PixelCases);
     run("indirect-grid-write-bounds", GridCases);
     run("indirect-argument-retention", IndirectCases);
     return failures ? 1 : 0;
 }
 #else
+TEST_CASE("OoT whiteout samples distinguish finite HDR and nonfinite RGB", "[whiteout]") {
+    PixelCases();
+}
 TEST_CASE("List-slot group counts cannot narrow GPU write tracking", "[whiteout]") { GridCases(); }
 TEST_CASE("Indirect arguments retain GPU writes and mark their read usage", "[whiteout]") {
     IndirectCases();

@@ -37,7 +37,6 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
-#include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
@@ -56,6 +55,13 @@
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#include "video_core/buffer_cache/indirect_buffer.h"
+#include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/renderer_vulkan/submission_policy.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -73,11 +79,6 @@
 #include "video_core/textures/texture.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/memory_manager.h"
-#include "video_core/nx2.h"
-#include "video_core/nx2_debug_control.h"
-#include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_profile.h"
 
 namespace Vulkan {
 
@@ -424,10 +425,10 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     return *it;
 }
 
-RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
-                                   Tegra::MaxwellDeviceMemoryManager& device_memory_,
-                                   const Device& device_, MemoryAllocator& memory_allocator_,
-                                   StateTracker& state_tracker_, Scheduler& scheduler_)
+RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow &emu_window_, Tegra::GPU &gpu_,
+                                   Tegra::MaxwellDeviceMemoryManager &device_memory_,
+                                   const Device &device_, MemoryAllocator &memory_allocator_,
+                                   StateTracker &state_tracker_, Scheduler &scheduler_)
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
       staging_pool(device, memory_allocator, scheduler), descriptor_pool(device, scheduler),
@@ -444,14 +445,16 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                            guest_descriptor_queue, compute_pass_descriptor_queue, descriptor_pool),
       buffer_cache(device_memory, buffer_cache_runtime),
       query_cache_runtime(this, device_memory, buffer_cache, device, memory_allocator, scheduler,
-                          staging_pool, compute_pass_descriptor_queue, descriptor_pool, texture_cache),
+                          staging_pool, compute_pass_descriptor_queue, descriptor_pool,
+                          texture_cache),
       query_cache(gpu, *this, device_memory, query_cache_runtime),
       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
                      descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache,
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(device, memory_allocator, scheduler) {
+      frame_dump(device, memory_allocator, scheduler), whiteout(memory_allocator, scheduler) {
+    VideoCommon::OotWhiteout::Start(Settings::GetCurrentProgramID());
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -463,6 +466,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::OotWhiteout::enabled.store(false, std::memory_order_relaxed);
     teardown_clock.Start();
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
@@ -835,6 +839,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 
     const auto report_failure = [&](std::string_view reason) {
+        VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
         TraceDrawFailure(reason);
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
@@ -1142,6 +1147,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         draw_func();
+    }
+    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Draw);
+    if (VideoCommon::OotWhiteout::Enabled() && render_trace_frame % 15 == 0) {
+        const bool tonemap =
+            std::ranges::any_of(pipeline->ShaderHashes(), VideoCommon::OotNetwork::IsTonemapShader);
+        const auto target = texture_cache.GetRenderTargets().color_buffer_ids[0];
+        if (target)
+            whiteout.Capture(texture_cache.GetImageView(target), pipeline->ShaderHashes()[5],
+                             render_trace_frame, tonemap);
+    }
+    if (VideoCommon::OotWhiteout::Enabled()) {
+        WhiteoutBindings(false, pipeline->ShaderHashes()[1]);
     }
     submitted = true;
     buffer_cache.NoteWorkRecorded(false);
@@ -1489,6 +1506,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 // With a task program the distribution pass wrote the vertex count.
                 scheduler.Record([this, indirect = mesh_emulation_indirect](vk::CommandBuffer cmdbuf) {
                     if (scheduler.GraphicsPipelineMissing()) {
+                        VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                         return;
                     }
                     cmdbuf.DrawIndirect(indirect.buffer,
@@ -1500,6 +1518,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             scheduler.Record([this, vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                     return;
                 }
                 cmdbuf.Draw(vertices, 1, 0, 0);
@@ -1509,6 +1528,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         if (mesh_draw) {
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                     return;
                 }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -1517,6 +1537,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
         scheduler.Record([this, draw_params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
+                VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                 return;
             }
             scheduler.TraceGpuWork(
@@ -1581,6 +1602,7 @@ void RasterizerVulkan::DrawIndirect() {
             scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                     return;
                 }
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
@@ -1596,6 +1618,7 @@ void RasterizerVulkan::DrawIndirect() {
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                     return;
                 }
                 if (params.is_indexed) {
@@ -1613,6 +1636,7 @@ void RasterizerVulkan::DrawIndirect() {
         scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params,
                           hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
+                VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Failed);
                 return;
             }
             scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
@@ -2196,6 +2220,7 @@ void RasterizerVulkan::DispatchCompute() {
     u64 native_key{};
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
     if (!pipeline) {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 1);
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
@@ -2224,10 +2249,26 @@ void RasterizerVulkan::DispatchCompute() {
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
                              can_replace || marking_effects ? &deferred_bind : nullptr)) {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 2);
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Dispatch);
+    if (indirect_address)
+        VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Indirect);
+    if (list_slot)
+        VideoCommon::OotWhiteout::Count(VideoCommon::OotWhiteout::Event::Slot);
+    if (VideoCommon::OotWhiteout::Enabled()) {
+        WhiteoutBindings(true, pipeline->ShaderHash());
+    }
     SCOPE_EXIT {
+        if (VideoCommon::OotWhiteout::Enabled()) {
+            for (const auto id : pipeline->WrittenImages()) {
+                if (id)
+                    whiteout.Capture(texture_cache.GetImageView(id), pipeline->ShaderHash(),
+                                     render_trace_frame, false);
+            }
+        }
         if (!frame_dump.Capturing()) {
             return;
         }
@@ -2293,6 +2334,8 @@ void RasterizerVulkan::DispatchCompute() {
                           indirect_offset = args_offset](vk::CommandBuffer cmdbuf) {
             RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
+                VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 3,
+                                              pipeline->ShaderHash());
                 return;
             }
             if (byte_addressed_shadow) {
@@ -2319,6 +2362,12 @@ void RasterizerVulkan::DispatchCompute() {
         // DispatchIndirect
         const auto [buffer, offset] =
             VideoCommon::ObtainIndirectBuffer(buffer_cache, *indirect_address);
+        if (VideoCommon::OotWhiteout::Enabled()) {
+            VideoCommon::OotWhiteout::Add(
+                VideoCommon::OotWhiteout::Event::ArgumentRead, *indirect_address,
+                buffer->CpuAddr() + offset, 12,
+                buffer_cache.IsRegionGpuModified(buffer->CpuAddr() + offset, 12));
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
@@ -2326,6 +2375,8 @@ void RasterizerVulkan::DispatchCompute() {
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
+                VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 3,
+                                              pipeline->ShaderHash());
                 return;
             }
             scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
@@ -2380,6 +2431,8 @@ void RasterizerVulkan::DispatchCompute() {
             bind(cmdbuf);
         }
         if (!pipeline->IsBound()) {
+            VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Failed, 3,
+                                          pipeline->ShaderHash());
             return;
         }
         if (byte_addressed_shadow) {
@@ -2542,6 +2595,7 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Flush, addr, size);
     if (addr == 0 || size == 0) {
         return;
     }
@@ -2568,6 +2622,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
+    VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Flush, addr, size, 1);
     if (addr == 0 || size == 0) {
         return;
     }
@@ -3391,6 +3446,34 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     }
 }
 
+void RasterizerVulkan::WhiteoutBindings(bool compute, u64 shader) {
+    namespace Trace = VideoCommon::OotWhiteout;
+    if (!Trace::Enabled() || render_trace_frame % 15 != 0)
+        return;
+    constexpr std::array watched{0x1cb017e305246cfdULL, 0x59b8addcebe48535ULL,
+                                 0x8969d3717e623a1dULL, 0x9d23f31deebf8293ULL,
+                                 0x4b87009a7e08f26eULL};
+    const auto found = std::ranges::find(watched, shader);
+    if (found == watched.end())
+        return;
+    const size_t index = static_cast<size_t>(found - watched.begin());
+    if (whiteout_binding_frames[index] == render_trace_frame + 1)
+        return;
+    whiteout_binding_frames[index] = render_trace_frame + 1;
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 binding_index,
+                                                 bool written, const auto &binding, u32 size,
+                                                 const auto *host, u32 offset) {
+        if (!storage)
+            return;
+        Trace::Add(Trace::Event::Binding, shader, binding.device_addr,
+                   host ? reinterpret_cast<uintptr_t>(host->Handle()) : 0,
+                   (u64{offset} << 32) | size);
+        Trace::Add(
+            Trace::Event::Binding, shader, binding.gpu_addr, (u64{stage} << 32) | binding_index,
+            (u64{written} << 1) | buffer_cache.IsRegionGpuModified(binding.device_addr, size));
+    });
+}
+
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
     static constexpr u32 BUFFER_CAP = 4U << 20;
     std::vector<FrameDump::BoundBuffer> buffers;
@@ -3465,6 +3548,8 @@ void RasterizerVulkan::TickFrame() {
         ReportFastDraws();
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Frame);
     }
+    whiteout.Collect(render_trace_frame);
+    VideoCommon::OotWhiteout::Tick(render_trace_frame + 1);
     frame_dump.TickFrame();
     ++render_trace_frame;
     render_trace_draws = 0;
