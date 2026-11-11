@@ -28,11 +28,12 @@
 #include "shader_recompiler/exception.h"
 
 #include <atomic>
+#include "video_core/fsr.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
-#include "video_core/fsr.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/stream_stats.h"
 #include "video_core/texture_cache/host_mip_limits.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -950,6 +951,8 @@ struct RangedBarrierRange {
 void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage image,
                        VkImageAspectFlags aspect_mask, bool is_initialized,
                        std::span<const VkBufferImageCopy> copies) {
+    const VideoCommon::StreamStats::Scope transfer_scope{
+        VideoCommon::StreamStats::Counter::TransferWorkerNs};
     static constexpr VkAccessFlags WRITE_ACCESS_FLAGS =
                                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -990,12 +993,18 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
             .subresourceRange = subresource_range,
     };
 
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                           read_barrier);
+    {
+        const VideoCommon::StreamStats::Scope barrier_scope{
+            VideoCommon::StreamStats::Counter::TransferBarrierNs};
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, read_barrier);
+    }
     cmdbuf.CopyBufferToImage(src_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
     // TODO: Move this to another API
+    const VideoCommon::StreamStats::Scope barrier_scope{
+        VideoCommon::StreamStats::Counter::TransferBarrierNs};
     cmdbuf.PipelineBarrier(
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
@@ -1342,6 +1351,8 @@ void TextureCacheRuntime::Finish() {
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
+    const VideoCommon::StreamStats::Scope staging_scope{
+        VideoCommon::StreamStats::Counter::StagingNs};
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
 }
 
@@ -2851,6 +2862,12 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
 
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
     return device.GetDeviceMemoryUsage();
+}
+
+void TextureCacheRuntime::ReclaimOptionalSnapshots() {
+    if (astc_decoder_pass) {
+        astc_decoder_pass->ReclaimSnapshots();
+    }
 }
 
 u64 TextureCacheRuntime::CurrentTick() const noexcept {
@@ -5266,6 +5283,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
             .wait = true,
             .levels = levels,
+            .source_address = image.gpu_addr,
+            .storage_format = DecodeFormat,
         },
         map, swizzles);
 

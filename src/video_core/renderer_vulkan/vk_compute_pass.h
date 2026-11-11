@@ -7,6 +7,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -134,6 +135,8 @@ private:
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
 
+struct AstcStreamState;
+
 class ASTCDecoderPass final : public ComputePass {
 public:
     explicit ASTCDecoderPass(const Device& device_, Scheduler& scheduler_,
@@ -142,6 +145,9 @@ public:
                              ComputePassDescriptorQueue& compute_pass_descriptor_queue_,
                              MemoryAllocator& memory_allocator_);
     ~ASTCDecoderPass();
+
+    /// Release completed optional snapshots before the texture cache collects live images.
+    void ReclaimSnapshots();
 
     void Assemble(Image& image, const StagingBufferRef& map,
                   std::span<const VideoCommon::SwizzleParameters> swizzles);
@@ -157,12 +163,15 @@ public:
         VkImageAspectFlags aspect_mask;
         bool initialized;
         std::function<VkImageView(s32 host_level)> level_view;
-        bool wait; ///< Wait for the GPU afterwards (the decoded image itself is sampled).
+        bool wait; ///< Submit afterwards; EDEN_NX2_ASTC_FLUSH=0 also waits for completion.
         /// When set, the input holds only these layers (in order), each decoded into
         /// layer_view(host level, layer).
         std::span<const u32> layers{};
         std::function<VkImageView(s32 host_level, u32 layer)> layer_view{};
         u32 levels{~u32{0}};
+        GPUVAddr source_address{};
+        VkFormat storage_format{VK_FORMAT_A8B8G8R8_UNORM_PACK32};
+        bool cacheable{};
     };
 
     /// Decodes `info`'s ASTC data in `map` into `target`. `skip` leading levels are absent on the
@@ -176,6 +185,7 @@ private:
     StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
     MemoryAllocator& memory_allocator;
+    std::unique_ptr<AstcStreamState> stream_state;
 };
 
 /// Compresses an RGBA8 image level to BC1 or BC3 blocks in a buffer (bc_encoder.comp).

@@ -113,6 +113,11 @@ namespace Vulkan {
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
         vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
+        /// Optional resources: one budget-respecting attempt, no pressure/failure signals or
+        /// mandatory-resource fallbacks. Only allocation OOM returns null; other errors propagate.
+        vk::Image CreateOptionalImage(const VkImageCreateInfo& ci) const;
+        vk::Buffer CreateOptionalDownloadBuffer(const VkBufferCreateInfo& ci) const;
+
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
         /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).
@@ -174,8 +179,8 @@ namespace Vulkan {
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                               vk::Image &image) const;
+        VkResult AllocateImage(const VkImageCreateInfo& ci, bool dedicated, bool may_fail,
+                               vk::Image& image, bool optional_budget = false) const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.

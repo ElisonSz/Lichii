@@ -38,6 +38,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/oot_whiteout_trace.h"
 #include "video_core/render_trace.h"
+#include "video_core/stream_stats.h"
 #include "video_core/texture_cache/collection_budget.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -73,6 +74,10 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
                   Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
 
+    if (StreamStats::Enabled()) {
+        StreamStats::Reset();
+        StreamStats::frames = {};
+    }
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -231,6 +236,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         collection_budget.Deleted();
         UnregisterImage(image_id);
+        StreamStats::Add(StreamStats::Counter::Collected);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
@@ -411,6 +417,10 @@ void TextureCache<P>::LogThresholds() const {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    if (StreamStats::Enabled()) {
+        StreamStats::frames.FinishFrame();
+        StreamStats::Report();
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -657,6 +667,18 @@ void TextureCache<P>::TickFrame() {
         const u32 failed = runtime.FailedImages();
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
+    }
+    if constexpr (requires { runtime.ReclaimOptionalSnapshots(); }) {
+        if (StreamStats::cache_enabled && (out_of_memory || total_used_memory > minimum_memory)) {
+            runtime.ReclaimOptionalSnapshots();
+            if (runtime.CanReportMemoryUsage()) {
+                total_used_memory = runtime.GetDeviceMemoryUsage();
+                for (const u64 bytes : sentenced_image_bytes) {
+                    total_used_memory -= (std::min)(total_used_memory, bytes);
+                }
+                total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+            }
+        }
     }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
@@ -1401,12 +1423,14 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         if (mem_trace_enabled) {
             ++trace_tic_changes;
         }
+        StreamStats::Add(StreamStats::Counter::TicChanges);
         if (IsValidEntry(*gpu_memory, descriptor)) {
             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
             if (is_new_tc) {
                 if (mem_trace_enabled) {
                     ++trace_tic_misses;
                 }
+                StreamStats::Add(StreamStats::Counter::ViewCreates);
                 const auto failed_images = [&]() -> u32 {
                     if constexpr (requires { runtime.FailedImages(); }) {
                         return runtime.FailedImages();
@@ -1470,6 +1494,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+        StreamStats::Add(StreamStats::Counter::CpuWrites);
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1610,6 +1635,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, id);
         }
         UnregisterImage(id);
+        StreamStats::Add(StreamStats::Counter::CpuUnmaps);
         DeleteImage(id);
     }
     ClearStale(cpu_addr, size);
@@ -1625,6 +1651,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        StreamStats::Add(StreamStats::Counter::GpuUnmaps);
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
             if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -2449,6 +2476,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncUnswizzle(image, image_id);
         return;
     }
+    if (StreamStats::Enabled()) {
+        StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                            IsPixelFormatBCn(image.info.format), image.guest_size_bytes);
+    }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
@@ -2588,6 +2619,10 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         runtime.InsertUploadMemoryBarrier();
         ++images_uploaded;
         uploaded_bytes += bytes;
+        if (StreamStats::Enabled()) {
+            StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                                IsPixelFormatBCn(image.info.format), bytes);
+        }
     }
 }
 
@@ -2712,6 +2747,11 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             image.UploadMemory(staging, copies);
             ++images_uploaded;
             uploaded_bytes += u64{image.info.layer_stride} * layers.size();
+            if (StreamStats::Enabled()) {
+                StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                                    IsPixelFormatBCn(image.info.format),
+                                    u64{image.info.layer_stride} * layers.size());
+            }
             ++layer_uploads;
             return;
         }
@@ -2720,11 +2760,14 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
         auto staging = runtime.UploadStagingBuffer(tail * layers.size());
-        for (size_t i = 0; i < layers.size(); ++i) {
-            gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
-                                      level_offset,
-                                  staging.mapped_span.data() + i * tail, tail,
-                                  VideoCommon::CacheType::NoTextureCache);
+        {
+            const StreamStats::Scope read_scope{StreamStats::Counter::GuestReadNs};
+            for (size_t i = 0; i < layers.size(); ++i) {
+                gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
+                                          level_offset,
+                                      staging.mapped_span.data() + i * tail, tail,
+                                      VideoCommon::CacheType::NoTextureCache);
+            }
         }
         uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
         for (auto& upload : uploads) {
@@ -2733,6 +2776,10 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         runtime.AccelerateImageUploadLayers(image, staging, uploads, layers);
         ++images_uploaded;
         uploaded_bytes += tail * layers.size();
+        if (StreamStats::Enabled()) {
+            StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                                IsPixelFormatBCn(image.info.format), tail * layers.size());
+        }
         ++layer_uploads;
     }
 }
@@ -2749,10 +2796,13 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         auto uploads = FullUploadSwizzles(image.info);
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
-        for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
-            gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
-                                  mapped_span.data() + layer * tail, tail,
-                                  VideoCommon::CacheType::NoTextureCache);
+        {
+            const StreamStats::Scope read_scope{StreamStats::Counter::GuestReadNs};
+            for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
+                gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
+                                      mapped_span.data() + layer * tail, tail,
+                                      VideoCommon::CacheType::NoTextureCache);
+            }
         }
         uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
         for (auto& upload : uploads) {
@@ -2762,8 +2812,11 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
-        gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
-                              VideoCommon::CacheType::NoTextureCache);
+        {
+            const StreamStats::Scope read_scope{StreamStats::Counter::GuestReadNs};
+            gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
+                                  VideoCommon::CacheType::NoTextureCache);
+        }
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
@@ -2775,7 +2828,10 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                     unswizzle_data_buffer, &unswizzle_worker);
-        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        {
+            const StreamStats::Scope conversion_scope{StreamStats::Counter::ConvertNs};
+            ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        }
         image.UploadMemory(staging, copies);
     } else {
         const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
@@ -2845,7 +2901,9 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
 template <class P>
 ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                            RelaxedOptions options) {
+    StreamStats::Add(StreamStats::Counter::Lookups);
     if (const ImageId image_id = FindImage(info, gpu_addr, options); image_id) {
+        StreamStats::Add(StreamStats::Counter::Reused);
         return image_id;
     }
     return InsertImage(info, gpu_addr, options);
@@ -3104,7 +3162,10 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
                  async_decode = decode_ptr]() mutable {
         async_decode->decoded_data.resize_destructive(out_size);
         std::span copies_span{copies.data(), copies.size()};
-        ConvertImage(input, info, async_decode->decoded_data, copies_span);
+        {
+            const StreamStats::Scope conversion_scope{StreamStats::Counter::ConvertNs};
+            ConvertImage(input, info, async_decode->decoded_data, copies_span);
+        }
 
         // TODO: Do we need this lock?
         std::unique_lock lock{async_decode->mutex};
@@ -3159,6 +3220,10 @@ void TextureCache<P>::TickAsyncDecode() {
         std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                     async_decode->decoded_data.size());
         image.UploadMemory(staging, async_decode->copies);
+        if (StreamStats::Enabled()) {
+            StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                                IsPixelFormatBCn(image.info.format), image.guest_size_bytes);
+        }
         image.flags &= ~ImageFlagBits::IsDecoding;
         has_uploads = true;
         i = async_decodes.erase(i);
@@ -3227,6 +3292,11 @@ void TextureCache<P>::TickAsyncUnswizzle() {
         if (z_count > 0) {
             const auto uploads = FullUploadSwizzles(task.info);
             runtime.AccelerateImageUpload(image, task.staging_buffer, uploads, z_start, z_count);
+            if (StreamStats::Enabled()) {
+                StreamStats::Upload(IsPixelFormatASTC(image.info.format),
+                                    IsPixelFormatBCn(image.info.format),
+                                    static_cast<u64>(z_count) * task.bytes_per_slice);
+            }
             task.last_submitted_offset += (static_cast<size_t>(z_count) * task.bytes_per_slice);
         }
     }
@@ -3435,7 +3505,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    const ImageId new_image_id = [&] {
+        const StreamStats::Scope create_scope{StreamStats::Counter::CreateNs};
+        return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    }();
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
@@ -3462,6 +3535,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                           static_cast<u32>(new_info.format));
             }
             return ImageId{};
+        }
+    }
+    if (StreamStats::Enabled()) {
+        StreamStats::Add(StreamStats::Counter::Created);
+        if (IsPixelFormatASTC(new_info.format)) {
+            StreamStats::Add(StreamStats::Counter::CreatedAstc);
         }
     }
     Image& new_image = slot_images[new_image_id];
@@ -4402,6 +4481,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++images_deleted;
     if (mem_trace_enabled) {
         ++trace_deleted;
+    }
+    if (StreamStats::Enabled()) {
+        StreamStats::Add(StreamStats::Counter::Destroyed);
+        if (IsPixelFormatASTC(image.info.format)) {
+            StreamStats::Add(StreamStats::Counter::DestroyedAstc);
+        }
     }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while

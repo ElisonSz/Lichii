@@ -20,9 +20,9 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/stream_stats.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -246,6 +247,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
+    VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Finishes);
+    const VideoCommon::StreamStats::Scope stream_finish{
+        VideoCommon::StreamStats::Counter::FinishNs};
     // When finishing, we need to wait for the submission to have executed on the device.
     const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
@@ -336,6 +340,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (VideoCommon::StreamStats::Enabled()) {
+        VideoCommon::StreamStats::frames.Graphics(CurrentTick());
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -833,6 +840,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     EndPendingOperations();
     InvalidateState();
 
+    VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Submissions);
     const u64 signal_value = master_semaphore->NextTick();
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
@@ -865,8 +873,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const VkResult result = [&] {
+            const VideoCommon::StreamStats::Scope stream_submit{
+                VideoCommon::StreamStats::Counter::QueueSubmitNs};
+            return master_semaphore->SubmitQueue(cmdbuf, upload_cmdbuf, signal_semaphore,
+                                                 wait_semaphore, signal_value);
+        }();
+        switch (result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&

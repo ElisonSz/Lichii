@@ -10,6 +10,7 @@
 #include "common/settings.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/stream_stats.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -84,6 +85,9 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::GpuWaits);
+        const VideoCommon::StreamStats::Scope stream_wait{
+            VideoCommon::StreamStats::Counter::GpuWaitNs};
         const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
@@ -106,6 +110,8 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::GpuWaits);
+    const VideoCommon::StreamStats::Scope stream_wait{VideoCommon::StreamStats::Counter::GpuWaitNs};
     const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
     try {
         while (!semaphore.Wait(tick)) {

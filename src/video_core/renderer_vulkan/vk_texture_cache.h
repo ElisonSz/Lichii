@@ -101,6 +101,8 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    void ReclaimOptionalSnapshots();
+
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
 

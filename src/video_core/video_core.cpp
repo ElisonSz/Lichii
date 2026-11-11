@@ -29,6 +29,7 @@
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_null/renderer_null.h"
+#include "video_core/stream_stats.h"
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
@@ -67,6 +68,7 @@ void WaitForAsyncTeardown() {
 /// @brief Creates an emulated GPU instance using the given system context.
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
+    VideoCommon::StreamStats::ReadSwitch();
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::ReadQmdViewSwitch();
     VideoCommon::Nx2AcquireStats::ReadSwitch();

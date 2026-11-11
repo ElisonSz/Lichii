@@ -4,13 +4,21 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <utility>
+#include <vector>
+
+#include "common/cityhash.h"
+#include "common/memory_detect.h"
+#include "video_core/renderer_vulkan/astc_content_cache.h"
+#include "video_core/stream_stats.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 
@@ -615,6 +623,173 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
     }
 }
 
+namespace {
+using StreamCounter = VideoCommon::StreamStats::Counter;
+
+u64 AstcCacheCapacity() {
+    // Separate from the texture cache: 128 MiB including keys and Vulkan allocation sizes.
+    return VideoCommon::StreamStats::cache_enabled ? u64{128} << 20 : u64{0};
+}
+
+struct AstcContent {
+    std::vector<u64> layout;
+    std::vector<u8> bytes;
+    u64 hash{};
+};
+
+std::optional<AstcContent> ReadAstcContent(const VideoCommon::ImageInfo& info, u32 skip,
+                                           const ASTCDecoderPass::Target& target,
+                                           const StagingBufferRef& map,
+                                           std::span<const VideoCommon::SwizzleParameters> swizzles,
+                                           u32 input_stride) {
+    const VideoCommon::StreamStats::Scope scope{StreamCounter::HashNs};
+    if (info.type != VideoCommon::ImageType::e2D || info.size.depth != 1 ||
+        !target.layers.empty() || target.levels == 0 || skip >= 32 || target.levels > 32 - skip ||
+        info.resources.layers <= 0) {
+        return std::nullopt;
+    }
+    AstcContent content;
+    content.layout = {static_cast<u64>(info.format),
+                      static_cast<u64>(target.storage_format),
+                      info.size.width,
+                      info.size.height,
+                      static_cast<u64>(info.resources.layers),
+                      skip,
+                      target.levels};
+    const u32 block_width = VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_height = VideoCore::Surface::DefaultBlockHeight(info.format);
+    u32 levels_seen{};
+    for (const auto& swizzle : swizzles) {
+        if (swizzle.level < static_cast<s32>(skip) ||
+            static_cast<u32>(swizzle.level) - skip >= target.levels) {
+            continue;
+        }
+        // Cache only a complete, ordered chain; duplicate/missing levels are not equivalent.
+        if (static_cast<u32>(swizzle.level) != skip + levels_seen || swizzle.block.depth != 0) {
+            return std::nullopt;
+        }
+        ++levels_seen;
+        const u32 level = static_cast<u32>(swizzle.level);
+        const u32 blocks_x = Common::DivCeil((std::max)(info.size.width >> level, 1U), block_width);
+        const u32 blocks_y =
+            Common::DivCeil((std::max)(info.size.height >> level, 1U), block_height);
+        if (swizzle.num_tiles.width < blocks_x || swizzle.num_tiles.height < blocks_y) {
+            return std::nullopt;
+        }
+        const auto params = VideoCommon::Accelerated::MakeBlockLinearSwizzle2DParams(swizzle, info);
+        if (!AppendAstcBlocks(content.bytes, map.mapped_span,
+                              {
+                                  .offset = swizzle.buffer_offset,
+                                  .layers = static_cast<u32>(info.resources.layers),
+                                  .layer_stride = input_stride,
+                                  .width = blocks_x,
+                                  .height = blocks_y,
+                                  .block_size = params.block_size,
+                                  .x_shift = params.x_shift,
+                                  .block_height = params.block_height,
+                                  .block_height_mask = params.block_height_mask,
+                                  .native_tiling = params.native_tiling != 0,
+                              })) {
+            return std::nullopt;
+        }
+    }
+    if (levels_seen != target.levels || content.bytes.empty()) {
+        return std::nullopt;
+    }
+    content.hash = Common::CityHash64(reinterpret_cast<const char*>(content.bytes.data()),
+                                      content.bytes.size());
+    return content;
+}
+
+// Copies raw RGBA8 bits, preserving the sRGB sampling view and every host mip/layer.
+void CopyAstcSnapshot(Scheduler& scheduler, VkImage source, VkImage destination,
+                      const VideoCommon::ImageInfo& info, u32 skip, u32 levels,
+                      bool source_initialized, bool destination_initialized) {
+    std::vector<VkImageCopy> copies;
+    for (u32 level = 0; level < levels; ++level) {
+        const u32 guest_level = level + skip;
+        copies.push_back({
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0,
+                               static_cast<u32>(info.resources.layers)},
+            .srcOffset = {},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0,
+                               static_cast<u32>(info.resources.layers)},
+            .dstOffset = {},
+            .extent = {(std::max)(info.size.width >> guest_level, 1U),
+                       (std::max)(info.size.height >> guest_level, 1U), 1},
+        });
+    }
+    scheduler.Record([source, destination, source_initialized, destination_initialized,
+                      copies = std::move(copies)](vk::CommandBuffer cmdbuf) {
+        const VideoCommon::StreamStats::Scope transfer_scope{StreamCounter::TransferWorkerNs};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS,
+                                            0, VK_REMAINING_ARRAY_LAYERS};
+        const std::array before{
+            VkImageMemoryBarrier{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                 .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                                 .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                                 .oldLayout = source_initialized ? VK_IMAGE_LAYOUT_GENERAL
+                                                                 : VK_IMAGE_LAYOUT_UNDEFINED,
+                                 .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .image = source,
+                                 .subresourceRange = range},
+            VkImageMemoryBarrier{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                 .srcAccessMask = destination_initialized
+                                                      ? VkAccessFlags{VK_ACCESS_MEMORY_READ_BIT |
+                                                                      VK_ACCESS_MEMORY_WRITE_BIT}
+                                                      : VkAccessFlags{0},
+                                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 .oldLayout = destination_initialized ? VK_IMAGE_LAYOUT_GENERAL
+                                                                      : VK_IMAGE_LAYOUT_UNDEFINED,
+                                 .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .image = destination,
+                                 .subresourceRange = range},
+        };
+        {
+            const VideoCommon::StreamStats::Scope barrier_scope{StreamCounter::TransferBarrierNs};
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+        }
+        cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL,
+                         copies);
+        auto after = before;
+        after[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        after[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        after[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        after[0].oldLayout = after[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        const VideoCommon::StreamStats::Scope barrier_scope{StreamCounter::TransferBarrierNs};
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, {}, {}, after);
+    });
+}
+} // namespace
+
+struct AstcStreamState {
+    struct Snapshot {
+        vk::Image image;
+        u64 tick{};
+    };
+    AstcContentCache<Snapshot> cache{AstcCacheCapacity()};
+    struct Seen {
+        GPUVAddr address;
+        u64 layout_hash;
+    };
+    // First 65,536 unique hashes retained for the session, then new uniques are dropped.
+    // Hash collisions affect diagnostics only. No decoded data is held by these observations.
+    AstcSeenContents<std::pair<u64, u64>, Seen, 65536> seen;
+    vk::QueryPool queries;
+    static constexpr u32 QuerySlots = 256;
+    std::array<u64, QuerySlots> query_ticks{};
+    u32 next_query{};
+    u32 timestamp_bits{};
+    float timestamp_period{};
+};
+
 ASTCDecoderPass::ASTCDecoderPass(const Device& device_, Scheduler& scheduler_,
                                  DescriptorPool& descriptor_pool_,
                                  StagingBufferPool& staging_buffer_pool_,
@@ -624,10 +799,51 @@ ASTCDecoderPass::ASTCDecoderPass(const Device& device_, Scheduler& scheduler_,
                   ASTC_PASS_DESCRIPTOR_UPDATE_TEMPLATE_ENTRY, ASTC_BANK_INFO,
                   COMPUTE_PUSH_CONSTANT_RANGE<sizeof(AstcPushConstants)>, ASTC_DECODER_COMP_SPV),
       scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
-      compute_pass_descriptor_queue{compute_pass_descriptor_queue_}, memory_allocator{
-                                                                         memory_allocator_} {}
+      compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
+      memory_allocator{memory_allocator_} {
+    if (VideoCommon::StreamStats::Enabled() || AstcCacheCapacity() != 0) {
+        stream_state = std::make_unique<AstcStreamState>();
+    }
+    if (VideoCommon::StreamStats::Enabled()) {
+        const auto physical = device.GetPhysical();
+        stream_state->timestamp_bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        stream_state->timestamp_period = physical.GetProperties().limits.timestampPeriod;
+        if (stream_state->timestamp_bits != 0 && stream_state->timestamp_bits <= 64 &&
+            stream_state->timestamp_period > 0) {
+            try {
+                stream_state->queries = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = AstcStreamState::QuerySlots * 4,
+                });
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "Stream GPU timestamps unavailable: {}", error.what());
+            }
+        }
+    }
+    if (VideoCommon::StreamStats::cache_enabled) {
+        LOG_DEBUG(Render_Vulkan, "ASTC content cache capacity: {} bytes", AstcCacheCapacity());
+    }
+}
 
 ASTCDecoderPass::~ASTCDecoderPass() = default;
+
+void ASTCDecoderPass::ReclaimSnapshots() {
+    if (!VideoCommon::StreamStats::cache_enabled) {
+        return;
+    }
+    const auto before = stream_state->cache.Size();
+    stream_state->cache.MakeRoom(
+        AstcCacheCapacity(),
+        [&](const AstcStreamState::Snapshot& snapshot) { return scheduler.IsFree(snapshot.tick); });
+    VideoCommon::StreamStats::Add(StreamCounter::CacheEvictions,
+                                  before - stream_state->cache.Size());
+    if (VideoCommon::StreamStats::Enabled()) {
+        VideoCommon::StreamStats::counters[static_cast<size_t>(StreamCounter::CacheBytes)].store(
+            stream_state->cache.Resident(), std::memory_order_relaxed);
+    }
+}
 
 void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
                                std::span<const VideoCommon::SwizzleParameters> swizzles) {
@@ -638,6 +854,17 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
         .level_view = [&image](s32 host_level) { return image.StorageImageView(host_level); },
         .wait = true,
         .levels = image.HostMipLevels(),
+        .source_address = image.gpu_addr,
+        .cacheable =
+            VideoCommon::StreamStats::cache_enabled && image.info.num_samples == 1 &&
+            (image.UsageFlags() &
+             (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) ==
+                (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+            True(image.flags & VideoCommon::ImageFlagBits::AcceleratedUpload) &&
+            False(image.flags &
+                  (VideoCommon::ImageFlagBits::Unbacked | VideoCommon::ImageFlagBits::SparseLayers |
+                   VideoCommon::ImageFlagBits::SparseTiles | VideoCommon::ImageFlagBits::Sparse |
+                   VideoCommon::ImageFlagBits::Rescaled)),
     };
     AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
                  swizzles);
@@ -658,6 +885,7 @@ void ASTCDecoderPass::AssembleLayers(Image& image, const StagingBufferRef& map,
                 return image.StorageImageLayerView(host_level, layer);
             },
         .levels = image.HostMipLevels(),
+        .source_address = image.gpu_addr,
     };
     AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
                  swizzles);
@@ -668,69 +896,239 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                                    const StagingBufferRef& map,
                                    std::span<const VideoCommon::SwizzleParameters> swizzles) {
     using namespace VideoCommon::Accelerated;
+    const VideoCommon::StreamStats::Scope back_scope{StreamCounter::DecodeBackNs};
+    const auto layer_stride = [&] {
+        return skip != 0
+                   ? info.layer_stride -
+                         static_cast<u32>(VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset)
+                   : info.layer_stride;
+    };
+    std::optional<AstcContent> content;
+    bool cache_hit = false;
+    VkImage verify_snapshot{};
+    if (stream_state && (VideoCommon::StreamStats::Enabled() || target.cacheable)) {
+        content = ReadAstcContent(info, skip, target, map, swizzles, layer_stride());
+        if (VideoCommon::StreamStats::Enabled() && !content) {
+            VideoCommon::StreamStats::Add(StreamCounter::HashSkipped);
+        }
+        if (VideoCommon::StreamStats::Enabled() && content) {
+            const VideoCommon::StreamStats::Scope hash_scope{StreamCounter::HashNs};
+            // Hash only canonical blocks. Staging allocation padding is not texture content.
+            const auto& bytes = content->bytes;
+            const auto hash =
+                Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            const u64 layout_hash =
+                Common::CityHash64(reinterpret_cast<const char*>(content->layout.data()),
+                                   content->layout.size() * sizeof(u64));
+            const auto key = std::pair{hash[0], hash[1]};
+            if (const auto* seen = stream_state->seen.Find(key)) {
+                VideoCommon::StreamStats::Add(StreamCounter::Repeats);
+                if (seen->address != target.source_address) {
+                    VideoCommon::StreamStats::Add(StreamCounter::RepeatsOtherAddress);
+                }
+                if (seen->layout_hash != layout_hash) {
+                    VideoCommon::StreamStats::Add(StreamCounter::LayoutChanges);
+                }
+            } else if (!stream_state->seen.Insert(
+                           key, AstcStreamState::Seen{target.source_address, layout_hash})) {
+                VideoCommon::StreamStats::Add(StreamCounter::HistoryDropped);
+            }
+        }
+    }
+    if (VideoCommon::StreamStats::Enabled()) {
+        if (scheduler.IsRenderPassActive()) {
+            VideoCommon::StreamStats::Add(StreamCounter::RenderPassBreaks);
+        }
+    }
     const std::array<u32, 2> block_dims{
         VideoCore::Surface::DefaultBlockWidth(info.format),
         VideoCore::Surface::DefaultBlockHeight(info.format),
     };
     scheduler.RequestOutsideRenderPassOperationContext();
-    const VkPipeline vk_pipeline = *pipeline;
-    const VkImageAspectFlags aspect_mask = target.aspect_mask;
-    const VkImage vk_image = target.image;
-    const bool is_initialized = target.initialized;
-    scheduler.Record([vk_pipeline, vk_image, aspect_mask,
-                      is_initialized](vk::CommandBuffer cmdbuf) {
-        const VkImageMemoryBarrier image_barrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = static_cast<VkAccessFlags>(is_initialized ? VK_ACCESS_SHADER_WRITE_BIT
-                                                                       : VK_ACCESS_NONE),
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            .oldLayout = is_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vk_image,
-            .subresourceRange{
-                .aspectMask = aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        };
-        cmdbuf.PipelineBarrier(is_initialized ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
-                              : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
-    });
-    // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
-    // (see TextureCache::UploadImageContents), so its layer stride is that tail's size.
-    const u32 input_layer_stride =
-        skip != 0 ? info.layer_stride -
-                        static_cast<u32>(VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset)
-                  : info.layer_stride;
-    const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
-                                        : guest_size_bytes;
-    // Only some layers: one dispatch per layer and level, into that layer's own view.
-    for (size_t i = 0; i < target.layers.size(); ++i) {
-        for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+    if (content && target.cacheable && AstcCacheCapacity() != 0) {
+        if (auto* found =
+                stream_state->cache.Find(content->hash, content->layout, content->bytes)) {
+            if (!VideoCommon::StreamStats::verify_enabled) {
+                CopyAstcSnapshot(scheduler, *found->payload.image, target.image, info, skip,
+                                 target.levels, true, target.initialized);
+            }
+            found->payload.tick = scheduler.CurrentTick();
+            VideoCommon::StreamStats::Add(StreamCounter::CacheHits);
+            cache_hit = true;
+            if (VideoCommon::StreamStats::verify_enabled) {
+                // Re-decode independently into the live image, then compare every mip/layer
+                // against a real cache-hit copy. Only this diagnostic waits for readback.
+                verify_snapshot = *found->payload.image;
+                cache_hit = false;
+            }
+        } else {
+            VideoCommon::StreamStats::Add(StreamCounter::CacheMisses);
+        }
+    }
+    if (!cache_hit && VideoCommon::StreamStats::Enabled()) {
+        VideoCommon::StreamStats::frames.Decode(scheduler.CurrentTick());
+    }
+    // Four timestamps per decode: before/after its entry barrier, then before/after exit.
+    VkQueryPool stream_queries{};
+    u32 stream_query{};
+    if (!cache_hit && stream_state && stream_state->queries) {
+        const u32 slot = stream_state->next_query;
+        const u64 tick = stream_state->query_ticks[slot];
+        bool reusable = tick == 0;
+        if (tick != 0 && scheduler.IsFree(tick)) {
+            struct Result {
+                u64 timestamp;
+                u64 available;
+            };
+            std::array<Result, 4> results{};
+            if (device.GetLogical().GetQueryResults(
+                    *stream_state->queries, slot * 4, 4, sizeof(results), results.data(),
+                    sizeof(Result),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS &&
+                std::ranges::all_of(results,
+                                    [](const Result& result) { return result.available != 0; })) {
+                const auto ns = [&](u32 first, u32 last) {
+                    const u64 delta = Common::DkbFrameTrace::TimestampDelta(
+                        results[first].timestamp, results[last].timestamp,
+                        stream_state->timestamp_bits);
+                    return static_cast<u64>(static_cast<double>(delta) *
+                                            stream_state->timestamp_period);
+                };
+                VideoCommon::StreamStats::Add(StreamCounter::GpuSamples);
+                VideoCommon::StreamStats::Add(StreamCounter::GpuDecodeNs, ns(1, 2));
+                VideoCommon::StreamStats::Add(StreamCounter::GpuBarrierNs, ns(0, 1) + ns(2, 3));
+                reusable = true;
+            }
+        }
+        if (reusable) {
+            stream_queries = *stream_state->queries;
+            stream_query = slot * 4;
+            stream_state->query_ticks[slot] = scheduler.CurrentTick();
+            stream_state->next_query = (slot + 1) % AstcStreamState::QuerySlots;
+            scheduler.Record([stream_queries, stream_query](vk::CommandBuffer cmdbuf) {
+                cmdbuf.ResetQueryPool(stream_queries, stream_query, 4);
+                cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream_queries,
+                                      stream_query);
+            });
+        } else {
+            VideoCommon::StreamStats::Add(StreamCounter::GpuSkipped);
+        }
+    }
+    if (!cache_hit) {
+        VideoCommon::StreamStats::Add(StreamCounter::Decodes);
+        const VkPipeline vk_pipeline = *pipeline;
+        const VkImageAspectFlags aspect_mask = target.aspect_mask;
+        const VkImage vk_image = target.image;
+        const bool is_initialized = target.initialized;
+        scheduler.Record([vk_pipeline, vk_image, aspect_mask, is_initialized, stream_queries,
+                          stream_query](vk::CommandBuffer cmdbuf) {
+            const VideoCommon::StreamStats::Scope barrier_scope{StreamCounter::DecodeBarrierNs};
+            const VkImageMemoryBarrier image_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = static_cast<VkAccessFlags>(
+                    is_initialized ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_NONE),
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                .oldLayout = is_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = vk_image,
+                .subresourceRange{
+                    .aspectMask = aspect_mask,
+                    .baseMipLevel = 0,
+                    .levelCount = VK_REMAINING_MIP_LEVELS,
+                    .baseArrayLayer = 0,
+                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                },
+            };
+            cmdbuf.PipelineBarrier(is_initialized
+                                       ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                                       : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
+            if (stream_queries) {
+                cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream_queries,
+                                      stream_query + 1);
+            }
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        });
+        // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
+        // (see TextureCache::UploadImageContents), so its layer stride is that tail's size.
+        const u32 input_layer_stride = layer_stride();
+        const size_t input_size =
+            skip != 0 ? size_t{input_layer_stride} * info.resources.layers : guest_size_bytes;
+        // Only some layers: one dispatch per layer and level, into that layer's own view.
+        for (size_t i = 0; i < target.layers.size(); ++i) {
+            for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+                if (swizzle.level < static_cast<s32>(skip) ||
+                    static_cast<u32>(swizzle.level - static_cast<s32>(skip)) >= target.levels)
+                    continue;
+                const size_t layer_offset = i * input_layer_stride;
+                compute_pass_descriptor_queue.Acquire(scheduler, 2);
+                compute_pass_descriptor_queue.AddBuffer(
+                    map.buffer, map.offset + layer_offset + swizzle.buffer_offset,
+                    input_layer_stride - swizzle.buffer_offset);
+                compute_pass_descriptor_queue.AddImage(
+                    target.layer_view(swizzle.level - static_cast<s32>(skip), target.layers[i]));
+                const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+                auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+                params.layer_stride = input_layer_stride;
+                const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
+                const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
+                VideoCommon::StreamStats::Add(StreamCounter::Dispatches);
+                scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
+                                  descriptor_data](vk::CommandBuffer cmdbuf) {
+                    const VideoCommon::StreamStats::Scope worker_scope{
+                        StreamCounter::DecodeWorkerNs};
+                    const AstcPushConstants uniforms{
+                        .blocks_dims = block_dims,
+                        .layer_stride = params.layer_stride,
+                        .block_size = params.block_size,
+                        .x_shift = params.x_shift,
+                        .block_height = params.block_height,
+                        .block_height_mask = params.block_height_mask,
+                        .native_tiling = params.native_tiling,
+                    };
+                    const VkDescriptorSet set = descriptor_allocator.Commit();
+                    {
+                        const VideoCommon::StreamStats::Scope descriptor_scope{
+                            StreamCounter::DescriptorNs};
+                        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template,
+                                                                descriptor_data);
+                    }
+                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+                    cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
+                    cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, 1);
+                });
+            }
+        }
+        for (const VideoCommon::SwizzleParameters& swizzle :
+             target.layers.empty() ? swizzles : std::span<const VideoCommon::SwizzleParameters>{}) {
             if (swizzle.level < static_cast<s32>(skip) ||
                 static_cast<u32>(swizzle.level - static_cast<s32>(skip)) >= target.levels)
                 continue;
-            const size_t layer_offset = i * input_layer_stride;
-            compute_pass_descriptor_queue.Acquire(scheduler, 2);
-            compute_pass_descriptor_queue.AddBuffer(map.buffer,
-                                                    map.offset + layer_offset + swizzle.buffer_offset,
-                                                    input_layer_stride - swizzle.buffer_offset);
-            compute_pass_descriptor_queue.AddImage(
-                target.layer_view(swizzle.level - static_cast<s32>(skip), target.layers[i]));
-            const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
-            auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
-            params.layer_stride = input_layer_stride;
+            const size_t input_offset = swizzle.buffer_offset + map.offset;
             const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
             const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
-            scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
-                              descriptor_data](vk::CommandBuffer cmdbuf) {
+            const u32 num_dispatches_z = info.resources.layers;
+
+            compute_pass_descriptor_queue.Acquire(scheduler, 2);
+            compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
+                                                    input_size - swizzle.buffer_offset);
+            compute_pass_descriptor_queue.AddImage(
+                target.level_view(swizzle.level - static_cast<s32>(skip)));
+            const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+
+            // To unswizzle the ASTC data
+            auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+            params.layer_stride = input_layer_stride;
+            ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
+            ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
+            ASSERT(params.bytes_per_block_log2 == 4);
+            VideoCommon::StreamStats::Add(StreamCounter::Dispatches);
+            scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z,
+                              block_dims, params, descriptor_data](vk::CommandBuffer cmdbuf) {
+                const VideoCommon::StreamStats::Scope worker_scope{StreamCounter::DecodeWorkerNs};
                 const AstcPushConstants uniforms{
                     .blocks_dims = block_dims,
                     .layer_stride = params.layer_stride,
@@ -741,77 +1139,190 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     .native_tiling = params.native_tiling,
                 };
                 const VkDescriptorSet set = descriptor_allocator.Commit();
-                device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+                {
+                    const VideoCommon::StreamStats::Scope descriptor_scope{
+                        StreamCounter::DescriptorNs};
+                    device.GetLogical().UpdateDescriptorSet(set, *descriptor_template,
+                                                            descriptor_data);
+                }
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
                 cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
-                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, 1);
+                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
             });
         }
-    }
-    for (const VideoCommon::SwizzleParameters& swizzle : target.layers.empty() ? swizzles
-                                                        : std::span<const VideoCommon::SwizzleParameters>{}) {
-        if (swizzle.level < static_cast<s32>(skip) ||
-            static_cast<u32>(swizzle.level - static_cast<s32>(skip)) >= target.levels)
-            continue;
-        const size_t input_offset = swizzle.buffer_offset + map.offset;
-        const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
-        const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
-        const u32 num_dispatches_z = info.resources.layers;
-
-        compute_pass_descriptor_queue.Acquire(scheduler, 2);
-        compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
-                                                input_size - swizzle.buffer_offset);
-        compute_pass_descriptor_queue.AddImage(
-            target.level_view(swizzle.level - static_cast<s32>(skip)));
-        const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
-
-        // To unswizzle the ASTC data
-        auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
-        params.layer_stride = input_layer_stride;
-        ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
-        ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
-        ASSERT(params.bytes_per_block_log2 == 4);
-        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
-                          params, descriptor_data](vk::CommandBuffer cmdbuf) {
-            const AstcPushConstants uniforms{
-                .blocks_dims = block_dims,
-                .layer_stride = params.layer_stride,
-                .block_size = params.block_size,
-                .x_shift = params.x_shift,
-                .block_height = params.block_height,
-                .block_height_mask = params.block_height_mask,
-                .native_tiling = params.native_tiling,
+        scheduler.Record(
+            [vk_image, aspect_mask, stream_queries, stream_query](vk::CommandBuffer cmdbuf) {
+                const VideoCommon::StreamStats::Scope barrier_scope{StreamCounter::DecodeBarrierNs};
+                if (stream_queries) {
+                    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream_queries,
+                                          stream_query + 2);
+                }
+                const VkImageMemoryBarrier image_barrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = vk_image,
+                    .subresourceRange{
+                        .aspectMask = aspect_mask,
+                        .baseMipLevel = 0,
+                        .levelCount = VK_REMAINING_MIP_LEVELS,
+                        .baseArrayLayer = 0,
+                        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                    },
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
+                if (stream_queries) {
+                    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream_queries,
+                                          stream_query + 3);
+                }
+            });
+        if (verify_snapshot) {
+            std::vector<VkBufferImageCopy> copies;
+            u64 bytes{};
+            for (u32 level = 0; level < target.levels; ++level) {
+                const u32 width = (std::max)(info.size.width >> (level + skip), 1U);
+                const u32 height = (std::max)(info.size.height >> (level + skip), 1U);
+                copies.push_back({.bufferOffset = bytes,
+                                  .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0,
+                                                       static_cast<u32>(info.resources.layers)},
+                                  .imageExtent = {width, height, 1}});
+                bytes += u64{width} * height * 4 * static_cast<u32>(info.resources.layers);
+            }
+            const VkBufferCreateInfo download_info{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = bytes,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             };
-            const VkDescriptorSet set = descriptor_allocator.Commit();
-            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
-            cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
-        });
-    }
-    scheduler.Record([vk_image, aspect_mask](vk::CommandBuffer cmdbuf) {
-        const VkImageMemoryBarrier image_barrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = vk_image,
-            .subresourceRange{
-                .aspectMask = aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
-    });
-    // Each decode ends with a submit to the host GPU. Measured here
+            const bool verified = WithAstcVerificationBuffers(
+                bytes, [&] { return memory_allocator.CreateOptionalDownloadBuffer(download_info); },
+                [&](auto& reference, auto& cached) {
+                    const auto download = [&](VkBuffer buffer) {
+                        scheduler.Record([buffer, vk_image, copies](vk::CommandBuffer cmdbuf) {
+                            const VkMemoryBarrier before{
+                                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+                            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
+                            cmdbuf.CopyImageToBuffer(vk_image, VK_IMAGE_LAYOUT_GENERAL, buffer,
+                                                     copies);
+                            const VkMemoryBarrier after{
+                                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .srcAccessMask =
+                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                                 VK_ACCESS_MEMORY_WRITE_BIT |
+                                                 VK_ACCESS_HOST_READ_BIT};
+                            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                                       VK_PIPELINE_STAGE_HOST_BIT,
+                                                   0, after);
+                        });
+                    };
+                    download(*reference);
+                    CopyAstcSnapshot(scheduler, verify_snapshot, vk_image, info, skip,
+                                     target.levels, true, true);
+                    download(*cached);
+                    scheduler.Finish();
+                    reference.Invalidate();
+                    cached.Invalidate();
+                    u64 differing{};
+                    for (size_t index = 0; index < bytes; ++index) {
+                        differing += reference.Mapped()[index] != cached.Mapped()[index] ? 1U : 0U;
+                    }
+                    VideoCommon::StreamStats::Add(StreamCounter::VerifyHits);
+                    VideoCommon::StreamStats::Add(StreamCounter::VerifyBadBytes, differing);
+                    if (differing != 0) {
+                        LOG_ERROR(Render_Vulkan,
+                                  "Stream cache verify: address={:#x} differing_bytes={}",
+                                  target.source_address, differing);
+                    }
+                });
+            if (!verified) {
+                VideoCommon::StreamStats::Add(StreamCounter::VerifySkipped);
+                LOG_INFO(Render_Vulkan, "Stream cache verify skipped: address={:#x} bytes={}",
+                         target.source_address, bytes);
+            }
+        }
+        if (content && target.cacheable && AstcCacheCapacity() != 0 && !verify_snapshot) {
+            const auto before_entries = stream_state->cache.Size();
+            size_t inserted_entries{};
+            u64 texel_bytes{};
+            for (u32 level = skip; level < skip + target.levels; ++level) {
+                texel_bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                               (std::max)(info.size.height >> level, 1U) * 4 *
+                               static_cast<u32>(info.resources.layers);
+            }
+            const u64 key_bytes =
+                content->bytes.capacity() + content->layout.capacity() * sizeof(u64);
+            const auto is_free = [&](const AstcStreamState::Snapshot& snapshot) {
+                return scheduler.IsFree(snapshot.tick);
+            };
+            const u64 budget = device.GetDeviceMemoryBudget();
+            const u64 usage = device.GetDeviceMemoryUsage();
+            // Do not add a snapshot close to the driver's budget. Never wait to evict one.
+            const auto commit_room = Common::GetSystemCommitRoom();
+            const bool host_room = !commit_room || *commit_room > texel_bytes + (u64{2} << 30);
+            if (host_room && budget > usage && budget - usage > texel_bytes + (u64{256} << 20) &&
+                stream_state->cache.MakeRoom(texel_bytes + key_bytes, is_free)) {
+                vk::Image snapshot = memory_allocator.CreateOptionalImage({
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                    .imageType = VK_IMAGE_TYPE_2D,
+                    .format = target.storage_format,
+                    .extent = {(std::max)(info.size.width >> skip, 1U),
+                               (std::max)(info.size.height >> skip, 1U), 1},
+                    .mipLevels = target.levels,
+                    .arrayLayers = static_cast<u32>(info.resources.layers),
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                });
+                if (snapshot) {
+                    const u64 charge =
+                        device.GetLogical().GetImageMemoryRequirements(*snapshot).size + key_bytes;
+                    if (stream_state->cache.MakeRoom(charge, is_free)) {
+                        CopyAstcSnapshot(scheduler, target.image, *snapshot, info, skip,
+                                         target.levels, true, false);
+                        stream_state->cache.Insert(
+                            content->hash, std::move(content->layout), std::move(content->bytes),
+                            charge,
+                            AstcStreamState::Snapshot{std::move(snapshot),
+                                                      scheduler.CurrentTick()});
+                        inserted_entries = 1;
+                    } else {
+                        VideoCommon::StreamStats::Add(StreamCounter::CacheRejected);
+                    }
+                } else {
+                    VideoCommon::StreamStats::Add(StreamCounter::CacheRejected);
+                }
+            } else {
+                if (!host_room || budget <= usage ||
+                    budget - usage <= texel_bytes + (u64{256} << 20)) {
+                    stream_state->cache.MakeRoom(AstcCacheCapacity(), is_free);
+                }
+                VideoCommon::StreamStats::Add(StreamCounter::CacheRejected);
+            }
+            const auto after_entries = stream_state->cache.Size();
+            if (after_entries < before_entries + inserted_entries) {
+                VideoCommon::StreamStats::Add(StreamCounter::CacheEvictions,
+                                              before_entries + inserted_entries - after_entries);
+            }
+            if (VideoCommon::StreamStats::Enabled()) {
+                VideoCommon::StreamStats::counters[static_cast<size_t>(StreamCounter::CacheBytes)]
+                    .store(stream_state->cache.Resident(), std::memory_order_relaxed);
+            }
+        }
+    } // !cache_hit
+    // Each decode request (including a cache hit) ends with a submit to the host GPU. Measured here
     // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=0 waits for the host GPU to go idle instead.
     static const bool flush_only = [] {
         const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
@@ -821,6 +1332,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         return;
     }
     const auto start = std::chrono::steady_clock::now();
+    const VideoCommon::StreamStats::Scope submit_scope{StreamCounter::SubmitNs};
     if (flush_only) {
         scheduler.Flush();
     } else {
@@ -833,7 +1345,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     ++decodes;
     waited += end - start;
     if (end - window_start >= std::chrono::seconds{5}) {
-        LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,
+        LOG_INFO(Render_Vulkan, "ASTC GPU upload requests: {} in {} ms, {} ms submitting ({})",
+                 decodes,
                  std::chrono::duration_cast<std::chrono::milliseconds>(end - window_start).count(),
                  std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
                  flush_only ? "flush" : "finish");

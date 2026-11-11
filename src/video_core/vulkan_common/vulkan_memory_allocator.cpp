@@ -235,8 +235,48 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
     return image;
 }
 
-VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                                        vk::Image &image) const {
+vk::Image MemoryAllocator::CreateOptionalImage(const VkImageCreateInfo& ci) const {
+    vk::Image image;
+    const VkResult result = AllocateImage(ci, true, true, image, true);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return image;
+}
+
+vk::Buffer MemoryAllocator::CreateOptionalDownloadBuffer(const VkBufferCreateInfo& ci) const {
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags =
+            VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(MemoryUsage::Download),
+        .usage = MemoryUsageVma(MemoryUsage::Download),
+        .preferredFlags = MemoryUsagePreferredVmaFlags(MemoryUsage::Download),
+        .memoryTypeBits = valid_memory_types,
+    };
+    VkBuffer handle{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo alloc_info{};
+    const VkResult result =
+        vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        return {};
+    }
+    vk::Check(result);
+    VkMemoryPropertyFlags property_flags{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+    u8* data = static_cast<u8*>(alloc_info.pMappedData);
+    const std::span<u8> mapped = data ? std::span<u8>{data, ci.size} : std::span<u8>{};
+    const vk::MemoryLocation location{
+        .memory = alloc_info.deviceMemory,
+        .offset = alloc_info.offset,
+        .memory_type = alloc_info.memoryType,
+    };
+    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped,
+                      (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0, location,
+                      device.GetDispatchLoader());
+}
+
+VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo& ci, bool dedicated, bool may_fail,
+                                        vk::Image& image, bool optional_budget) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -260,6 +300,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (optional_budget && result != VK_SUCCESS) {
+        return result;
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
