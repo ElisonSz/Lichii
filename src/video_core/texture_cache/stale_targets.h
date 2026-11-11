@@ -34,7 +34,6 @@ inline void ReadSwitch() {
 enum class Kept : size_t {
     Origin,     ///< Not made as a render target.
     History,    ///< Has held guest data or been a copy destination.
-    Undefined,  ///< Its host contents were never defined by a whole clear.
     Flags,      ///< CPU-modified, sparse, rescaled, remapped, multisampled or not GPU-written.
     Marker,     ///< Doesn't cover whole pages, so its stale marker would be incomplete.
     Referenced, ///< Aliased, bound, or named by pending work.

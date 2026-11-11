@@ -121,9 +121,12 @@ struct TextureCacheOperations {
     }
 
     // Condition 1: history is monotonic; a later clear cannot erase a guest-data origin.
+    // Whether the target's own contents were ever defined by a whole clear doesn't matter for
+    // dropping it: a colour target bound while only depth is cleared is made at that clear and
+    // then only drawn, and most stale targets are of that kind.
     static bool GpuOnlyRenderTarget(const ImageBase& image) {
         return image.stale_target.render_target_origin && !image.stale_target.forbidden_history &&
-               image.stale_target.contents_defined && image.info.num_samples == 1 &&
+               image.info.num_samples == 1 &&
                !image.info.is_sparse && !image.HasScaled() &&
                True(image.flags & ImageFlagBits::GpuModified) &&
                False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
@@ -291,8 +294,6 @@ struct TextureCacheOperations {
                     kept = Kept::Origin;
                 } else if (old.stale_target.forbidden_history) {
                     kept = Kept::History;
-                } else if (!old.stale_target.contents_defined) {
-                    kept = Kept::Undefined;
                 } else if (!GpuOnlyRenderTarget(old) ||
                            old.address_space != writer.address_space) {
                     kept = Kept::Flags;

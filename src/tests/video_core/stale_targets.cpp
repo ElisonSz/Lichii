@@ -639,7 +639,7 @@ TEST_CASE("Each disqualifying history retains the stale target", "[video_core][s
             image.stale_target.Forbid();
             break; // Prior upload/CPU/copy, even after flags clear.
         case 2:
-            image.stale_target.contents_defined = false;
+            image.flags &= ~ImageFlagBits::GpuModified; // Never written by the GPU.
             break;
         case 3:
             image.info.num_samples = 4;
@@ -749,6 +749,17 @@ TEST_CASE("A target the stale marker cannot cover stays", "[video_core][stale_ta
     // The same overwrite of a whole, aligned page drops the old image.
     CacheFixture cache;
     cache.Add(MakeInfo(16, 64, 0), 0x31);
+    const auto writer = cache.Add(MakeInfo(8, 128, 0, PixelFormat::R16G16B16A16_FLOAT), 0xA7);
+    TextureCacheOperations::NotifyFullClear(cache, cache.View(writer));
+    CHECK(cache.trace_stale_drops == 1);
+}
+
+TEST_CASE("A target that was only drawn is dropped once overwritten", "[video_core][stale_targets]") {
+    Nx2State state;
+    // A colour target made while only depth was cleared never gets a whole clear of its own.
+    CacheFixture cache;
+    const auto old = cache.Add(MakeInfo(16, 64, 0), 0x31);
+    cache.slot_images[old].stale_target.contents_defined = false;
     const auto writer = cache.Add(MakeInfo(8, 128, 0, PixelFormat::R16G16B16A16_FLOAT), 0xA7);
     TextureCacheOperations::NotifyFullClear(cache, cache.View(writer));
     CHECK(cache.trace_stale_drops == 1);

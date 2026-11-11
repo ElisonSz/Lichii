@@ -936,15 +936,15 @@ void TextureCache<P>::TraceMemory() {
         "Memory trace: stale targets audit {} disposal {} pool false; layout {} overlap-visits {} "
         "footprint-verified {} failures {} drops {} drop-bytes {} clears {} clear-ns {} zeroes {} "
         "zero-bytes {} zero-ns {} creations {} create-ns {} verified-drops {} reference-scans {} "
-        "conditional-clears {}; kept: origin {} history {} undefined {} flags {} marker {} "
-        "referenced {} layout {} partial {}",
+        "conditional-clears {}; kept: origin {} history {} flags {} marker {} referenced {} "
+        "layout {} partial {}",
         StaleTargets::enabled && StaleTargets::verify, StaleTargets::enabled, trace_stale_layout,
         trace_stale_contents, trace_stale_footprints, trace_stale_failures, trace_stale_drops,
         trace_stale_drop_bytes, trace_stale_clears, trace_stale_clear_ns, trace_stale_zeroes,
         trace_stale_zero_bytes, trace_stale_zero_ns, trace_stale_creations, trace_stale_create_ns,
         trace_stale_verified, trace_stale_reference_scans, trace_stale_unconfirmed,
         trace_stale_kept[0], trace_stale_kept[1], trace_stale_kept[2], trace_stale_kept[3],
-        trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6], trace_stale_kept[7]);
+        trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6]);
     trace_stale_creations = trace_stale_create_ns = trace_stale_verified = 0;
     trace_stale_reference_scans = trace_stale_unconfirmed = 0;
     trace_stale_kept = {};
