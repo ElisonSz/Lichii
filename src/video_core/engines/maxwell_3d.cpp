@@ -65,6 +65,9 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
         execution_mask[i] = IsMethodExecutable(u32(i));
     fast_maxwell3d = !record_write_history &&
                      !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+    if (reuse_vertex_id) {
+        LOG_INFO(HW_GPU, "TEST: a changed vertex_id_base doesn't end fast draw reuse");
+    }
 }
 
 Maxwell3D::~Maxwell3D() = default;

@@ -605,8 +605,12 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Report preparation costs without GPU_PROFILE selecting the slower Maxwell method path.
+    static const bool draw_cost_stats = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_COST_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify && !draw_cost_stats) {
         stats = FastDrawStats{.window_start = now};
         return;
     }

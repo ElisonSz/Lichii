@@ -3291,6 +3291,12 @@ public:
 private:
     void InitializeRegisterDefaults();
 
+    /// TEST: EDEN_NX2_REUSE_VERTEX_ID=1, read per engine (after nx2_switches.txt is loaded).
+    const bool reuse_vertex_id = [] {
+        const char* const value = std::getenv("EDEN_NX2_REUSE_VERTEX_ID");
+        return value != nullptr && value[0] == '1';
+    }();
+
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
     /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
@@ -3317,8 +3323,11 @@ private:
             draw_manager.DrawDeferred(*this, true);
         }
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
+        // TEST (EDEN_NX2_REUSE_VERTEX_ID=1): vertex_id_base has no reader in the renderers (the
+        // host's vertex index already includes the base vertex), so its change doesn't end reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method)) {
+            !IsFastDrawParameter(method) &&
+            !(reuse_vertex_id && method == MAXWELL3D_REG_INDEX(vertex_id_base))) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         regs.reg_array[method] = argument;
