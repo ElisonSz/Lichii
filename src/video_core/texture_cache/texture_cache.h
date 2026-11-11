@@ -360,30 +360,11 @@ void TextureCache<P>::CollectStaleReferences() {
         bound_view(view_id);
     }
     bound_view(render_targets.depth_buffer_id);
-    for (const size_t channel_index : active_channel_ids) {
-        auto& channel_info = channel_storage[channel_index];
-        const auto table_refs = [&](auto& table) {
-            if (table.invalidated) {
-                return;
-            }
-            const auto ids = table.LiveBoundIds();
-            for (size_t word_index = 0;
-                 word_index < table.read_descriptors.size() && word_index * 64 < ids.size();
-                 ++word_index) {
-                u64 bits = table.read_descriptors[word_index];
-                while (bits != 0) {
-                    const size_t descriptor_index =
-                        word_index * 64 + static_cast<size_t>(std::countr_zero(bits));
-                    if (descriptor_index < ids.size()) {
-                        bound_view(ids[descriptor_index]);
-                    }
-                    bits &= bits - 1;
-                }
-            }
-        };
-        table_refs(channel_info.graphics_image_table);
-        table_refs(channel_info.compute_image_table);
-    }
+    // The descriptor tables are not walked: they keep the view of every descriptor read since
+    // the last deletion, whether a draw used it this frame or hundreds of frames ago, so they
+    // don't say what is in use. What a draw samples goes through PrepareImage, which resets the
+    // proof, and deleting an image invalidates the tables and ends a delta draw chain, as it
+    // does when the collector deletes one.
 }
 
 template <class P>
@@ -955,14 +936,18 @@ void TextureCache<P>::TraceMemory() {
         "Memory trace: stale targets audit {} disposal {} pool false; layout {} overlap-visits {} "
         "footprint-verified {} failures {} drops {} drop-bytes {} clears {} clear-ns {} zeroes {} "
         "zero-bytes {} zero-ns {} creations {} create-ns {} verified-drops {} reference-scans {} "
-        "conditional-clears {}",
+        "conditional-clears {}; kept: origin {} history {} undefined {} flags {} marker {} "
+        "referenced {} layout {} partial {}",
         StaleTargets::enabled && StaleTargets::verify, StaleTargets::enabled, trace_stale_layout,
         trace_stale_contents, trace_stale_footprints, trace_stale_failures, trace_stale_drops,
         trace_stale_drop_bytes, trace_stale_clears, trace_stale_clear_ns, trace_stale_zeroes,
         trace_stale_zero_bytes, trace_stale_zero_ns, trace_stale_creations, trace_stale_create_ns,
-        trace_stale_verified, trace_stale_reference_scans, trace_stale_unconfirmed);
+        trace_stale_verified, trace_stale_reference_scans, trace_stale_unconfirmed,
+        trace_stale_kept[0], trace_stale_kept[1], trace_stale_kept[2], trace_stale_kept[3],
+        trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6], trace_stale_kept[7]);
     trace_stale_creations = trace_stale_create_ns = trace_stale_verified = 0;
     trace_stale_reference_scans = trace_stale_unconfirmed = 0;
+    trace_stale_kept = {};
     trace_stale_layout = trace_stale_contents = trace_stale_footprints = trace_stale_failures = 0;
     trace_stale_drops = trace_stale_drop_bytes = trace_stale_clears = trace_stale_clear_ns = 0;
     trace_stale_zeroes = trace_stale_zero_bytes = trace_stale_zero_ns = 0;

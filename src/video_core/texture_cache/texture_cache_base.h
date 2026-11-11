@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -238,6 +239,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 trace_stale_clears{};
     u64 trace_stale_clear_ns{};
     u64 trace_stale_reference_scans{};
+    std::array<u64, StaleTargets::NumKept> trace_stale_kept{};
     u64 trace_stale_unconfirmed{};
     u64 trace_stale_zeroes{};
     u64 trace_stale_zero_bytes{};

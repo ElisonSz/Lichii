@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -28,6 +29,20 @@ inline void ReadSwitch() {
     const char* const check = std::getenv("EDEN_NX2_STALE_TARGET_VERIFY");
     verify = check != nullptr && check[0] == '1';
 }
+
+/// Why an older target a whole clear overlapped stays, for the memory trace.
+enum class Kept : size_t {
+    Origin,     ///< Not made as a render target.
+    History,    ///< Has held guest data or been a copy destination.
+    Undefined,  ///< Its host contents were never defined by a whole clear.
+    Flags,      ///< CPU-modified, sparse, rescaled, remapped, multisampled or not GPU-written.
+    Marker,     ///< Doesn't cover whole pages, so its stale marker would be incomplete.
+    Referenced, ///< Aliased, bound, or named by pending work.
+    Layout,     ///< A layout the byte proof doesn't handle.
+    Partial,    ///< Not every live byte overwritten yet.
+    Count,
+};
+inline constexpr size_t NumKept = static_cast<size_t>(Kept::Count);
 
 struct Run {
     u64 begin;

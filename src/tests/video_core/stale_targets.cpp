@@ -221,6 +221,7 @@ struct CacheFixture {
     u64 trace_stale_clears{};
     u64 trace_stale_clear_ns{};
     u64 trace_stale_reference_scans{};
+    std::array<u64, StaleTargets::NumKept> trace_stale_kept{};
     u64 trace_stale_drops{};
     u64 trace_stale_drop_bytes{};
     u64 stale_birth{};
@@ -680,7 +681,9 @@ TEST_CASE("Aliases bindings and pending work protect a target", "[video_core][st
         case 4: {
             const auto saved_info = image.info;
             const auto subresource = cache.Add(saved_info, 0x5A);
+            // The cache records an overlap on both images.
             cache.slot_images[old].overlapping_images.push_back(subresource);
+            cache.slot_images[subresource].overlapping_images.push_back(old);
             break;
         }
         default:
@@ -749,6 +752,29 @@ TEST_CASE("A target the stale marker cannot cover stays", "[video_core][stale_ta
     const auto writer = cache.Add(MakeInfo(8, 128, 0, PixelFormat::R16G16B16A16_FLOAT), 0xA7);
     TextureCacheOperations::NotifyFullClear(cache, cache.View(writer));
     CHECK(cache.trace_stale_drops == 1);
+}
+
+TEST_CASE("A whole clear of an older image counts as an overwrite", "[video_core][stale_targets]") {
+    Nx2State state;
+    // The writer was made before the stale target and is cleared again after it: the target's
+    // bytes are overwritten just the same. A use of the target in between keeps it.
+    for (const bool used : {false, true}) {
+        CacheFixture cache;
+        const auto writer = cache.Add(MakeInfo(8, 128, 0, PixelFormat::R16G16B16A16_FLOAT), 0xA7);
+        const auto old = cache.Add(MakeInfo(16, 64, 0), 0x31);
+        TextureCacheOperations::NotifyFullClear(cache, cache.View(old));
+        REQUIRE(cache.trace_stale_drops == 0);
+        TextureCacheOperations::NotifyFullClear(cache, cache.View(writer));
+        REQUIRE(cache.trace_stale_drops == 1);
+        // Made again at the same place, it is the newer image now and the same writer drops it
+        // again only while nothing uses it.
+        const auto again = cache.Add(MakeInfo(16, 64, 0), 0x31);
+        if (used) {
+            cache.stale_references.insert(again);
+        }
+        TextureCacheOperations::NotifyFullClear(cache, cache.View(writer));
+        CHECK(cache.trace_stale_drops == (used ? 1U : 2U));
+    }
 }
 
 TEST_CASE("Independent drop verification rejects forged coverage", "[video_core][stale_targets]") {

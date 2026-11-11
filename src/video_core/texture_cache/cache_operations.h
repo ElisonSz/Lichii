@@ -268,10 +268,14 @@ struct TextureCacheOperations {
             return;
         }
         ++cache.trace_stale_footprints;
+        // A whole clear rewrites every byte of the writer, however long ago the writer was made.
+        // What an older target needs is that the clear came after its own last use, and the use
+        // epoch tracks that. Stamping the writer keeps the evidence in the order of the clears.
+        writer.stale_target.birth = ++cache.stale_birth;
         const StaleTargets::Evidence source{writer.info, writer.guest_size_bytes, writer.cpu_addr,
                                             writer.stale_target.birth};
-        // Scanning what is bound walks every live descriptor: do it only for a clear that
-        // overlaps an older target the cheap conditions admit, not for every clear.
+        // Gather what pending work and the bound targets refer to only for a clear that overlaps
+        // an older target the cheap conditions admit, not for every clear.
         bool references_collected = false;
         // Delete after the region iterator has released Picked/map references.
         boost::container::small_vector<ImageId, 32> drops;
@@ -281,17 +285,33 @@ struct TextureCacheOperations {
                     return;
                 }
                 ++cache.trace_stale_contents;
-                if (!GpuOnlyRenderTarget(old) || old.stale_target.birth >= source.birth ||
-                    old.address_space != writer.address_space || !StaleMarkerCovers(old)) {
-                    old.stale_target.Use();
-                    return;
+                using StaleTargets::Kept;
+                std::optional<Kept> kept;
+                if (!old.stale_target.render_target_origin) {
+                    kept = Kept::Origin;
+                } else if (old.stale_target.forbidden_history) {
+                    kept = Kept::History;
+                } else if (!old.stale_target.contents_defined) {
+                    kept = Kept::Undefined;
+                } else if (!GpuOnlyRenderTarget(old) ||
+                           old.address_space != writer.address_space) {
+                    kept = Kept::Flags;
+                } else if (!StaleMarkerCovers(old)) {
+                    kept = Kept::Marker;
+                } else {
+                    if (!references_collected) {
+                        cache.CollectStaleReferences();
+                        references_collected = true;
+                        ++cache.trace_stale_reference_scans;
+                    }
+                    if (!NoReferences(cache, id, old)) {
+                        kept = Kept::Referenced;
+                    } else if (!VerifiedLayout(old)) {
+                        kept = Kept::Layout;
+                    }
                 }
-                if (!references_collected) {
-                    cache.CollectStaleReferences();
-                    references_collected = true;
-                    ++cache.trace_stale_reference_scans;
-                }
-                if (!NoReferences(cache, id, old) || !VerifiedLayout(old)) {
+                if (kept) {
+                    ++cache.trace_stale_kept[static_cast<size_t>(*kept)];
                     old.stale_target.Use();
                     return;
                 }
@@ -300,6 +320,7 @@ struct TextureCacheOperations {
                 // Conditions 2 and 3 are separate named checks of the accumulated proof.
                 if (!old.stale_target.NoUseSinceOverwrite() ||
                     !old.stale_target.EveryLiveByteOverwritten()) {
+                    ++cache.trace_stale_kept[static_cast<size_t>(Kept::Partial)];
                     return;
                 }
                 if (StaleTargets::verify) {
