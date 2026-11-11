@@ -21,7 +21,8 @@ namespace Vulkan {
 /// and the fixed-capacity descriptor arrays in Shader::Info do not belong to a live pipeline.
 struct GraphicsStageProperties {
     explicit GraphicsStageProperties(const Shader::Info& info)
-        : loads{info.loads}, constant_buffer_mask{info.constant_buffer_mask},
+        : handle_shader_hash{info.handle_shader_hash}, loads{info.loads},
+          constant_buffer_mask{info.constant_buffer_mask},
           constant_buffer_used_sizes{info.constant_buffer_used_sizes},
           stores_frag_color{info.stores_frag_color}, frag_color_components{info.frag_color_components},
           stores_global_memory{info.stores_global_memory}, is_task{info.is_task}, is_mesh{info.is_mesh},
@@ -33,6 +34,7 @@ struct GraphicsStageProperties {
 
     bool operator==(const GraphicsStageProperties&) const = default;
 
+    u64 handle_shader_hash{};
     Shader::VaryingState loads;
     u32 constant_buffer_mask{};
     std::array<u32, Shader::Info::MAX_CBUFS> constant_buffer_used_sizes{};

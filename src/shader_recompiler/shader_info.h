@@ -399,6 +399,8 @@ struct Info {
     /// Texture handles the shader reads from storage buffers, as programs over constant buffer
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
+    /// Only populated for strict-mode diagnostics; never used to select a resource.
+    u64 handle_shader_hash{};
     ImageDescriptors image_descriptors;
 
     bool operator==(const Info&) const = default;
@@ -437,26 +439,36 @@ enum class HandleOp : u32 {
 template <typename ReadCbuf, typename ReadStorage>
 std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
                                          ReadStorage&& read_storage, u32 element = 0) {
-    std::array<u32, 64> stack{};
-    std::array<u32, 256> slots{};
+    struct Entry {
+        u32 value{};
+        bool failed{};
+    };
+    std::array<Entry, 64> stack{};
+    std::array<Entry, 256> slots{};
     std::array<bool, 256> initialized{};
     size_t size = 0;
     bool valid = true;
-    const auto pop = [&]() -> u32 {
+    const auto pop = [&]() -> Entry {
         if (size == 0) {
             valid = false;
-            return 0;
+            return {};
         }
         return stack[--size];
     };
+    bool failed = false;
     const auto push = [&](u32 value) {
         if (size == stack.size()) {
             valid = false;
             return;
         }
-        stack[size++] = value;
+        stack[size++] = {value, failed};
+    };
+    const auto push_read = [&](std::optional<u32> result) {
+        failed |= !result.has_value();
+        push(result.value_or(0U));
     };
     for (size_t pc = 0; valid && pc < code.size();) {
+        failed = false;
         const HandleOp op = static_cast<HandleOp>(code[pc++]);
         const auto operand = [&]() -> u32 {
             if (pc == code.size()) {
@@ -474,27 +486,33 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
             const u32 offset = operand();
             if (!valid)
                 return std::nullopt;
-            push(read_cbuf(index, offset));
+            push_read(failed ? std::optional<u32>{} : read_cbuf(index, offset));
             continue;
         }
         if (op == HandleOp::CbufDynamic) {
             const u32 index = operand();
-            const u32 offset = pop();
+            const Entry address = pop();
+            const u32 offset = address.value;
+            failed = address.failed;
             if (!valid)
                 return std::nullopt;
-            push(read_cbuf(index, offset));
+            push_read(failed ? std::optional<u32>{} : read_cbuf(index, offset));
             continue;
         }
         if (op == HandleOp::Storage) {
             const u32 binding = operand();
-            const u32 offset = pop();
+            const Entry address = pop();
+            const u32 offset = address.value;
+            failed = address.failed;
             if (!valid)
                 return std::nullopt;
-            push(read_storage(binding, offset));
+            push_read(failed ? std::optional<u32>{} : read_storage(binding, offset));
             continue;
         }
         if (op == HandleOp::Neg || op == HandleOp::Not || op == HandleOp::LNot) {
-            const u32 a = pop();
+            const Entry input = pop();
+            const u32 a = input.value;
+            failed = input.failed;
             push(op == HandleOp::Neg ? 0U - a : op == HandleOp::Not ? ~a : (a == 0 ? 1U : 0U));
             continue;
         }
@@ -510,7 +528,8 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
             const u32 slot = operand();
             if (!valid || slot >= slots.size() || !initialized[slot])
                 return std::nullopt;
-            push(slots[slot]);
+            failed = slots[slot].failed;
+            push(slots[slot].value);
             continue;
         }
         if (op == HandleOp::Index) {
@@ -518,11 +537,20 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
             continue;
         }
         if (op == HandleOp::Select) {
-            const u32 false_value = pop(), true_value = pop(), condition = pop();
-            push(condition != 0 ? true_value : false_value);
+            const Entry false_value = pop(), true_value = pop(), condition = pop();
+            const Entry chosen = condition.value != 0 ? true_value : false_value;
+            failed = condition.failed || chosen.failed;
+            push(chosen.value);
             continue;
         }
-        const u32 b = pop(), a = pop();
+        const Entry rhs = pop(), lhs = pop();
+        const u32 b = rhs.value, a = lhs.value;
+        failed = lhs.failed || rhs.failed;
+        if (op == HandleOp::LAnd && a == 0) {
+            failed = lhs.failed;
+        } else if (op == HandleOp::LOr && a != 0) {
+            failed = lhs.failed;
+        }
         const s32 sa = static_cast<s32>(a), sb = static_cast<s32>(b);
         switch (op) {
         case HandleOp::Add: push(a + b); break;
@@ -556,7 +584,7 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
     }
     if (!valid || size != 1)
         return std::nullopt;
-    return stack[0];
+    return stack[0].failed ? std::nullopt : std::optional<u32>{stack[0].value};
 }
 
 } // namespace Shader

@@ -29,6 +29,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/shader_info.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -503,17 +504,20 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // floating-point 2D texture, the instruction's own type deciding the rest (see the TexturePass
 // ImageQueryDimensions case, which has none).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
-    if (cbuf.bind_null || cbuf.handle_program != ~0U) return TextureType::Color2D;
+    if (cbuf.bind_null || (cbuf.handle_program != ~0U && !cbuf.has_handle_metadata))
+        return TextureType::Color2D;
     return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
-    if (cbuf.bind_null || cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
+    if (cbuf.bind_null || (cbuf.handle_program != ~0U && !cbuf.has_handle_metadata))
+        return TexturePixelFormat::A8B8G8R8_UNORM;
     return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
-    if (cbuf.bind_null || cbuf.handle_program != ~0U) return false;
+    if (cbuf.bind_null || (cbuf.handle_program != ~0U && !cbuf.has_handle_metadata))
+        return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
 
@@ -555,7 +559,28 @@ bool IsFloatValue(const IR::Inst& inst) {
     return (inst.Type() & floats) != IR::Type::Void;
 }
 
+thread_local bool g_legacy_handle_search{};
+
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
+    if (StrictHandles && !g_legacy_handle_search) {
+        // Match the whole expression. An operand of arithmetic, a select, or a load address is
+        // not the handle; expressions beyond the cbuf descriptor representation need a program.
+        const IR::Value start{ResolveConditionalPhi(value, block)};
+        if (start.IsImmediate()) {
+            return std::nullopt;
+        }
+        // Bound recursive matching too: loop-carried values and excessively deep expressions are
+        // handled by the handle-program builder, which tracks cycles and its own budget.
+        static thread_local u32 depth{};
+        if (depth >= 64) {
+            return std::nullopt;
+        }
+        ++depth;
+        SCOPE_EXIT {
+            --depth;
+        };
+        return TryGetConstBuffer(start.InstRecursive(), env, host_info, block);
+    }
     // A value loaded from memory is not a constant buffer word, whatever its address is built
     // from: the search does not look into a load's operands (a handle read from a storage
     // buffer would otherwise be taken from the buffer's address in the constant buffer).
@@ -573,7 +598,10 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
         if (const std::optional result = TryGetConstBuffer(inst, env, host_info, block)) {
             return result;
         }
-        if (IsMemoryLoad(inst->GetOpcode())) {
+        if (IsMemoryLoad(inst->GetOpcode()) ||
+            (StrictHandles && !g_legacy_handle_search &&
+             (inst->GetOpcode() == IR::Opcode::BitwiseAnd32 ||
+              inst->GetOpcode() == IR::Opcode::ShiftLeftLogical32))) {
             continue;
         }
         // Nor into a texture instruction or floating-point math: no handle is made from them,
@@ -623,6 +651,34 @@ thread_local bool g_handle_index_allowed{};
 thread_local IR::Value g_handle_index{};
 thread_local int g_handle_load_depth{};
 thread_local int g_handle_scaled{};
+
+thread_local bool g_handle_loads_stable{};
+
+bool SameHandleExpression(IR::Value lhs, IR::Value rhs, u32 depth = 0) {
+    lhs = lhs.Resolve();
+    rhs = rhs.Resolve();
+    if (lhs == rhs)
+        return true;
+    if (depth >= 64 || lhs.IsImmediate() || rhs.IsImmediate() || lhs.IsEmpty() || rhs.IsEmpty())
+        return false;
+    const IR::Inst* const left = lhs.InstRecursive();
+    const IR::Inst* const right = rhs.InstRecursive();
+    if (left->GetOpcode() != right->GetOpcode() || left->Flags<u32>() != right->Flags<u32>() ||
+        left->NumArgs() != right->NumArgs() || left->GetOpcode() == IR::Opcode::Phi ||
+        left->MayHaveSideEffects())
+        return false;
+    if (IsMemoryLoad(left->GetOpcode())) {
+        const auto name = IR::NameOf(left->GetOpcode());
+        if (!g_handle_loads_stable ||
+            (!name.starts_with("LoadStorage") && !name.starts_with("LoadGlobal")))
+            return false;
+    }
+    for (size_t arg = 0; arg < left->NumArgs(); ++arg) {
+        if (!SameHandleExpression(left->Arg(arg), right->Arg(arg), depth + 1))
+            return false;
+    }
+    return true;
+}
 
 bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget,
                      const IR::Block* block);
@@ -798,6 +854,28 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
         return load_word(inst->Arg(0).InstRecursive(), element.U32() * 4);
     }
     case IR::Opcode::Phi: {
+        if (StrictHandles) {
+            // A branch proven by the sampling block can select an input. Otherwise every defined
+            // input must be the same value: choosing a computable or shuffled input guesses which
+            // edge ran, even when the other edge holds a different valid texture.
+            const IR::Value resolved{ResolveConditionalPhi(value, block)};
+            if (resolved.IsImmediate() || resolved.InstRecursive() != inst) {
+                return BuildHandleProgram(resolved, code, budget, block);
+            }
+            std::optional<IR::Value> common;
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                const IR::Value incoming{inst->Arg(arg).Resolve()};
+                if (!incoming.IsImmediate() && IsUndefined(incoming.InstRecursive()->GetOpcode())) {
+                    continue;
+                }
+                if (common && !SameHandleExpression(*common, incoming)) {
+                    g_handle_failure = IR::Opcode::Phi;
+                    return false;
+                }
+                common = incoming;
+            }
+            return common && BuildHandleProgram(*common, code, budget, block);
+        }
         // Keep the incoming value that is defined; of two, the one made uniform (the
         // register-to-uniform move a conditional block makes for the handle).
         const IR::Value resolved{ResolveConditionalPhi(value, block)};
@@ -908,6 +986,10 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
         return build(0);
     case IR::Opcode::UndefU1:
     case IR::Opcode::UndefU32:
+        if (StrictHandles) {
+            g_handle_failure = inst->GetOpcode();
+            return false;
+        }
         // Read before any write on some path: no value to compute, take zero.
         emit(Op::Immediate);
         code.push_back(0);
@@ -1185,12 +1267,18 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
         if (shift.U32() >= 32)
             return std::nullopt;
-        if (lhs) {
+        if (StrictHandles && !g_legacy_handle_search) {
+            if (!lhs || lhs->has_secondary || lhs->shift_left >= 32 - shift.U32())
+                return std::nullopt;
+            lhs->shift_left += shift.U32();
+        } else if (lhs) {
             lhs->shift_left = shift.U32();
         }
         return lhs;
     }
     case IR::Opcode::BitwiseAnd32: {
+        if (StrictHandles && !g_legacy_handle_search)
+            return std::nullopt;
         IR::Value op1{inst->Arg(0)};
         IR::Value op2{inst->Arg(1)};
         if (op1.IsImmediate()) {
@@ -1276,10 +1364,69 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     };
 }
 
+std::optional<ConstBufferAddr> LegacyHandleMetadata(IR::Value value, Environment& env,
+                                                    const HostTranslateInfo& host_info,
+                                                    const IR::Block* block) {
+    env.track_cache.clear();
+    g_legacy_handle_search = true;
+    SCOPE_EXIT {
+        g_legacy_handle_search = false;
+        env.track_cache.clear();
+    };
+    return Track(value, env, host_info, block);
+}
+
+std::optional<ConstBufferAddr> UniqueLegacyImageHandle(IR::Value value, Environment& env,
+                                                       const HostTranslateInfo& host_info,
+                                                       const IR::Block* block) {
+    std::optional<ConstBufferAddr> candidate;
+    bool ambiguous{};
+    const auto stop = [&](IR::Value operand) {
+        operand = ResolveConditionalPhi(operand, block);
+        if (!operand.IsImmediate() && !operand.IsEmpty()) {
+            const IR::Inst* const source = operand.InstRecursive();
+            const IR::Opcode opcode = source->GetOpcode();
+            // A cbuf used as a predicate, load address or unsupported transformed descriptor
+            // cannot supply the raw image handle. Keep these boundaries in the legacy search.
+            if (source->Type() == IR::Type::U1 || IsMemoryLoad(opcode) ||
+                IsTextureInstruction(*source) || IsFloatValue(*source) ||
+                opcode == IR::Opcode::BitwiseAnd32 || opcode == IR::Opcode::ShiftLeftLogical32 ||
+                (opcode == IR::Opcode::GetCbufU32 &&
+                 !TryGetConstBuffer(source, env, host_info, block))) {
+                return IR::Value{0U};
+            }
+        }
+        return operand;
+    };
+    IR::BreadthFirstSearch(
+        value,
+        [&](const IR::Inst* source) -> std::optional<ConstBufferAddr> {
+            // Only raw handle words: an address, predicate, or failed transformed descriptor is not
+            // one.
+            if (source->GetOpcode() != IR::Opcode::GetCbufU32)
+                return std::nullopt;
+            if (const auto found = TryGetConstBuffer(source, env, host_info, block)) {
+                if (candidate &&
+                    (candidate->index != found->index || candidate->offset != found->offset ||
+                     candidate->dynamic_offset != found->dynamic_offset))
+                    ambiguous = true;
+                candidate = found;
+            }
+            return std::nullopt;
+        },
+        stop);
+    return ambiguous ? std::nullopt : candidate;
+}
+
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
-        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        if (StrictHandles && track_addr && !track_addr->has_secondary &&
+            track_addr->shift_left != 0) {
+            // Single-word descriptors are read without a shift by the renderers.
+            track_addr.reset();
+        }
 
         if (track_addr) {
             addr = *track_addr;
@@ -1307,24 +1454,57 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 index = built ? g_handle_index : IR::Value{};
                 g_handle_index = IR::Value{};
             }
+            const auto legacy_metadata =
+                StrictHandles ? LegacyHandleMetadata(inst.Arg(0), env, host_info, block)
+                              : std::optional<ConstBufferAddr>{};
+            if (StrictHandles && !sampled && legacy_metadata &&
+                inst.Flags<IR::TextureInstInfo>().image_byte_address != 0) {
+                return TextureInst{.cbuf = *legacy_metadata, .inst = &inst, .block = block};
+            }
             if (!built) {
                 // A dependency of an unresolved handle is not itself a texture handle.
                 // Preserve the legacy search only for buffers and storage images.
-                const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
-                    [&env, &host_info, block](const IR::Inst* candidate) {
-                        return TryGetConstBuffer(candidate, env, host_info, block);
-                    }, [&](IR::Value operand) { return ResolveConditionalPhi(operand, block); })};
+                const std::optional<ConstBufferAddr> legacy{
+                    StrictHandles
+                        ? std::nullopt
+                        : IR::BreadthFirstSearch(
+                              inst.Arg(0),
+                              [&env, &host_info, block](const IR::Inst* candidate) {
+                                  return TryGetConstBuffer(candidate, env, host_info, block);
+                              },
+                              [&](IR::Value operand) {
+                                  return ResolveConditionalPhi(operand, block);
+                              })};
                 if (!sampled) {
-                    if (!legacy) {
-                        throw NotImplementedException(
-                            "Failed to track bindless image constant buffer (stopped at {}, budget {})",
-                            g_handle_failure, budget);
+                    auto usable = StrictHandles
+                                      ? UniqueLegacyImageHandle(inst.Arg(0), env, host_info, block)
+                                      : legacy;
+                    // A per-invocation Select cannot be evaluated on the CPU. Preserve the old
+                    // writable descriptor for this supported path instead of skipping the draw.
+                    const IR::Value root = inst.Arg(0).Resolve();
+                    if (StrictHandles && !usable && legacy_metadata && !root.IsImmediate() &&
+                        root.InstRecursive()->GetOpcode() == IR::Opcode::SelectU32 &&
+                        LegacyHandleMetadata(root.InstRecursive()->Arg(1), env, host_info, block) &&
+                        LegacyHandleMetadata(root.InstRecursive()->Arg(2), env, host_info, block)) {
+                        usable = legacy_metadata;
+                        env.WarnStrictHandles("writable Select retains its legacy descriptor");
                     }
-                    return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
+                    if (!usable) {
+                        if (StrictHandles)
+                            env.WarnStrictHandles("unresolved writable image or texel buffer");
+                        throw NotImplementedException("Failed to track bindless image constant "
+                                                      "buffer (stopped at {}, budget {})",
+                                                      g_handle_failure, budget);
+                    }
+                    return TextureInst{.cbuf = *usable, .inst = &inst, .block = block};
+                }
+                if (StrictHandles) {
+                    env.WarnStrictHandles("sampled handle unresolved; binding a null texture");
                 }
                 static std::atomic<int> warnings{};
-                if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
-                    LOG_WARNING(Shader, "Bindless {} handle not computable per draw (stopped at {}): "
+                if (!StrictHandles && warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Shader,
+                                "Bindless {} handle not computable per draw (stopped at {}): "
                                 "binding a null texture",
                                 inst.GetOpcode(), g_handle_failure);
                 }
@@ -1358,6 +1538,9 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                     }
                     if (g_dominance->Dominates(index.InstRecursive(), &inst)) {
                         count = HandleTableSize();
+                    } else if (StrictHandles) {
+                        env.WarnStrictHandles(
+                            "array index does not dominate; retaining element zero");
                     }
                 }
                 addr = ConstBufferAddr{
@@ -1372,6 +1555,16 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                     .has_secondary = false,
                     .handle_program = static_cast<u32>(it - programs.begin()),
                 };
+                if (legacy_metadata) {
+                    addr.index = legacy_metadata->index;
+                    addr.offset = legacy_metadata->offset;
+                    addr.shift_left = legacy_metadata->shift_left;
+                    addr.secondary_index = legacy_metadata->secondary_index;
+                    addr.secondary_offset = legacy_metadata->secondary_offset;
+                    addr.secondary_shift_left = legacy_metadata->secondary_shift_left;
+                    addr.has_secondary = legacy_metadata->has_secondary;
+                    addr.has_handle_metadata = true;
+                }
             }
         }
     } else {
@@ -1603,6 +1796,8 @@ TextureType ResolvedTextureType(Environment& env, const TextureInst& texture_ins
         if (cbuf.bind_null) {
             return type;
         }
+        if (cbuf.has_handle_metadata)
+            return ReadTextureTypeCached(env, cbuf);
         if (const auto it{handle_program_types.find(cbuf.handle_program)};
             it != handle_program_types.end()) {
             return it->second;
@@ -1630,7 +1825,20 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     env.handle_cache.clear();
     env.track_cache.clear();
     TextureInstVector to_replace;
+    if (StrictHandles)
+        program.info.handle_shader_hash = env.ShaderHash();
     g_handle_programs = &program.info.handle_programs;
+    g_handle_loads_stable = true;
+    if (StrictHandles) {
+        for (const IR::Block* const scan_block : program.blocks) {
+            for (const IR::Inst& scan_inst : scan_block->Instructions()) {
+                const auto name = IR::NameOf(scan_inst.GetOpcode());
+                if (name.starts_with("WriteStorage") || name.starts_with("WriteGlobal") ||
+                    name.starts_with("StorageAtomic") || name.starts_with("GlobalAtomic"))
+                    g_handle_loads_stable = false;
+            }
+        }
+    }
     g_program = &program;
     g_dominance.reset();
     SCOPE_EXIT {

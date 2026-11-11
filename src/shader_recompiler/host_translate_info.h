@@ -9,6 +9,7 @@
 #include <initializer_list>
 
 #include "common/common_types.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace Shader {
 
@@ -64,7 +65,7 @@ struct HostTranslateInfo {
              {support_float64, support_float16, support_int64, support_conditional_barrier,
               needs_demote_reorder, support_geometry_shader_passthrough, support_viewport_mask,
               single_lane_geometry_subgroups, support_snorm_render_buffer,
-              support_handle_table_arrays}) {
+              support_handle_table_arrays, StrictHandles}) {
             properties |= property ? bit : 0U;
             bit <<= 1;
         }

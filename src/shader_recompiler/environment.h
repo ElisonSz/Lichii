@@ -12,10 +12,11 @@
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
-#include "shader_recompiler/frontend/ir/value.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace Shader::IR {
 class Inst;
@@ -68,7 +69,8 @@ struct ConstBufferAddr {
     IR::U32 dynamic_offset;
     u32 count;
     bool has_secondary;
-    bool bind_null{}; ///< handle could not be resolved; bind the null sampled image
+    bool has_handle_metadata{}; ///< computed handle retains the previous metadata source
+    bool bind_null{};           ///< handle could not be resolved; bind the null sampled image
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
 };
 
@@ -131,6 +133,14 @@ public:
                                                                                u32 offset) = 0;
 
     virtual void Dump(u64 pipeline_hash, u64 shader_hash) = 0;
+
+    [[nodiscard]] virtual u64 ShaderHash() const {
+        return 0;
+    }
+    void WarnStrictHandles(const char* reason) {
+        if (StrictHandles)
+            Shader::WarnStrictHandles(ShaderHash(), reason);
+    }
 
     [[nodiscard]] const ProgramHeader& SPH() const noexcept {
         return sph;

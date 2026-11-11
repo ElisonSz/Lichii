@@ -10,6 +10,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -189,7 +190,8 @@ TEST_CASE("Unrelated predicates do not justify pruning a pointer phi",
           "[shader][storage_buffer_control_flow]") {
     for (const bool packed : {false, true}) {
         ConditionalPointer fixture;
-        CHECK(fixture.Run(false, false, packed) == std::vector<u32>{0x160});
+        CHECK(fixture.Run(false, false, packed) ==
+              (Shader::StrictHandles ? std::vector<u32>{} : std::vector<u32>{0x160}));
     }
 }
 
@@ -324,7 +326,8 @@ TEST_CASE("A current loop predicate cannot select the preceding iteration's poin
         CHECK(Offsets(program, true) == std::vector<u32>{0x160, 0x168});
         CHECK(program.info.native_global_bounds);
     } else {
-        CHECK(Offsets(program) == std::vector<u32>{0x160});
+        CHECK(Offsets(program) ==
+              (Shader::StrictHandles ? std::vector<u32>{} : std::vector<u32>{0x160}));
     }
 }
 

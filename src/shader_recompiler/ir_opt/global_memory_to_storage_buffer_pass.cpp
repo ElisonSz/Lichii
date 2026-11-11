@@ -27,6 +27,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/storage_write_extent.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -445,7 +446,20 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
         }
         return operand;
     };
-    return BreadthFirstSearch(value, pred, stop_at_memory);
+    if (!StrictHandles)
+        return BreadthFirstSearch(value, pred, stop_at_memory);
+    StorageBufferSet candidates;
+    // Visit the entire search domain: first-match BFS cannot establish uniqueness.
+    BreadthFirstSearch(
+        value,
+        [&](const IR::Inst* candidate) -> std::optional<StorageBufferAddr> {
+            if (const auto found = pred(candidate))
+                candidates.insert(*found);
+            return std::nullopt;
+        },
+        stop_at_memory);
+    return candidates.size() == 1 ? std::optional<StorageBufferAddr>{*candidates.begin()}
+                                  : std::nullopt;
 }
 
 /// Finds the one constant buffer word added directly into the low address, which is the base
@@ -1026,7 +1040,8 @@ StorageBufferSet CollectAtomicPointers(IR::Program& program) {
 std::optional<StorageBufferAddr> TrackPointerAddend(const LowAddrInfo& addr,
                                                     const StorageBufferSet& iterator_words,
                                                     const TrackingConditions& conditions,
-                                                    bool legacy_nearest = false) {
+                                                    bool legacy_nearest = false,
+                                                    bool* ambiguous = nullptr) {
     StorageBufferSet high_words;
     ForEachSummedWord(
         addr.high, [&](StorageBufferAddr word, u32) { high_words.insert(word); }, &conditions);
@@ -1051,7 +1066,10 @@ std::optional<StorageBufferAddr> TrackPointerAddend(const LowAddrInfo& addr,
             }
         },
         &conditions);
-    return tied || (!legacy_nearest && candidates.size() != 1) ? std::nullopt : result;
+    if (ambiguous != nullptr)
+        *ambiguous = candidates.size() > 1;
+    return tied || ((!legacy_nearest || StrictHandles) && candidates.size() != 1) ? std::nullopt
+                                                                                  : result;
 }
 
 /// The first slot and stride of a pointer array read at a dynamic constant buffer offset:
@@ -1343,8 +1361,9 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     }
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
-    const std::optional<StorageBufferAddr> paired_pointer{
-        TrackPointerAddend(*low_addr_info, info.iterator_words, conditions)};
+    bool paired_ambiguous{};
+    const std::optional<StorageBufferAddr> paired_pointer{TrackPointerAddend(
+        *low_addr_info, info.iterator_words, conditions, false, &paired_ambiguous)};
     std::optional<StorageBufferAddr> storage_buffer{paired_pointer};
     const bool native = env.IsNativeProgram();
     if (native && storage_buffer &&
@@ -1439,6 +1458,10 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
         storage_buffer = paired_pointer;
     }
+    if (StrictHandles && paired_ambiguous && !storage_buffer) {
+        env.WarnStrictHandles("ambiguous storage buffer base; keeping global memory access");
+        return false;
+    }
     const auto cached_track = [&](const Bias* bias, auto& cache) {
         if (low_addr.IsImmediate()) {
             return Track(low_addr, bias);
@@ -1465,7 +1488,13 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         storage_buffer = cached_track(nullptr, info.unbiased_tracks);
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
-            LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
+            if (StrictHandles) {
+                env.WarnStrictHandles(
+                    "storage buffer base not unique; keeping global memory access");
+            } else {
+                LOG_WARNING(Shader,
+                            "Storage buffer failed to track, using global memory fallbacks");
+            }
             return false;
         }
         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",

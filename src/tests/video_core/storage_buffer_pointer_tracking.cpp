@@ -15,6 +15,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/strict_handles.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -626,4 +627,27 @@ TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding 
     auto reversed = descriptors;
     std::ranges::reverse(reversed);
     CHECK(selected(reversed) == std::vector<u32>{0x400, 0x340});
+}
+
+TEST_CASE("Unique unpaired storage searches retain their historical descriptor",
+          "[shader][storage_buffer]") {
+    for (const u32 offset : {0x310U, 0x78U}) {
+        KernelProgram fixture;
+        IR::IREmitter ir{fixture.entry};
+        // The high half is unavailable, but the historical low-word search has one answer.
+        const auto low = ir.IAdd(Word(ir, offset), ir.LocalInvocationIdX());
+        static_cast<void>(ir.LoadGlobal32(Address(ir, low, ir.Imm32(1U))));
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{offset});
+    }
+}
+
+TEST_CASE("Strict storage tracking rejects competing paired bases only when enabled",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const auto low = ir.IAdd(Word(ir, 0x310), ir.IAdd(Word(ir, 0x320), ir.LocalInvocationIdX()));
+    const auto high = ir.IAdd(Word(ir, 0x314), Word(ir, 0x324));
+    static_cast<void>(ir.LoadGlobal32(Address(ir, low, high)));
+    CHECK(fixture.TrackedOffsets() ==
+          (Shader::StrictHandles ? std::vector<u32>{} : std::vector<u32>{0x310}));
 }

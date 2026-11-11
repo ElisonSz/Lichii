@@ -314,15 +314,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw (for an
                 // array, for each element).
-                return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       },
-                                       storage_buffer_alignment, index),
-                                   via_header_index);
+                return VideoCommon::TexturePairOrNull(VideoCommon::EvaluateTextureHandle(
+                                                          info, desc.handle_program, *gpu_memory,
+                                                          [&](u32 cbuf) -> GPUVAddr {
+                                                              return cbuf < cbufs.size() &&
+                                                                             cbufs[cbuf].enabled
+                                                                         ? cbufs[cbuf].address
+                                                                         : GPUVAddr{};
+                                                          },
+                                                          storage_buffer_alignment, index),
+                                                      via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};

@@ -107,6 +107,7 @@ public:
     }
 
     [[nodiscard]] u64 CalculateHash() const;
+    [[nodiscard]] u64 ShaderHash() const override;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
@@ -303,6 +304,8 @@ public:
         return cbuf_replacements.size() != 0;
     }
     bool HasNativeInstructions() const override;
+
+    [[nodiscard]] u64 ShaderHash() const override;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
