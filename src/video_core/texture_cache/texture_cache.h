@@ -383,8 +383,9 @@ void TextureCache<P>::RetireStaleTargets() {
     // one room), and the collector then also deleted textures that were out of view for a
     // second. This pass makes the same deletion without waiting for memory to run short.
     constexpr size_t MaxPerFrame = 512;
+    const u64 cutoff = frame_tick - age;
     boost::container::small_vector<ImageId, 64> aged;
-    lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+    lru_cache.ForEachItemBelow(cutoff, [&](ImageId image_id) {
         const Image& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::BadOverlap) &&
             TextureCacheOperations::GpuWrittenRenderTarget(image) &&
@@ -397,12 +398,39 @@ void TextureCache<P>::RetireStaleTargets() {
         return;
     }
     CollectStaleReferences();
-    for (const ImageId image_id : aged) {
-        Image& image = slot_images[image_id];
-        if (!TextureCacheOperations::NoReferences(*this, image_id, image)) {
-            ++trace_stale_aged_kept;
-            continue;
+    const auto unused = [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        return image.lru_index != SIZE_MAX && lru_cache.GetTick(image.lru_index) <= cutoff;
+    };
+    // An alias or a subresource relation protects an image only while the other image is in
+    // use. The room resizes its large shadow map as the camera moves, and each size is a depth
+    // target plus the texture that samples it, aliases of each other: 14 MiB each, and hundreds
+    // of pairs stayed when any alias kept a target.
+    enum class Kept { No, Pending, Alias, Subresource };
+    const auto kept = [&](ImageId image_id, const Image& image) {
+        if (True(image.flags & ImageFlagBits::IsDecoding) || StaleTargetReferenced(image_id)) {
+            return Kept::Pending;
         }
+        for (const AliasedImage& alias : image.aliased_images) {
+            if (!unused(alias.id)) {
+                return Kept::Alias;
+            }
+        }
+        constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        for (const ImageId other_id : image.overlapping_images) {
+            if (unused(other_id)) {
+                continue;
+            }
+            const Image& other = slot_images[other_id];
+            if (IsSubresource(image.info, other, image.gpu_addr, options, false, true) ||
+                IsSubresource(other.info, image, other.gpu_addr, options, false, true)) {
+                return Kept::Subresource;
+            }
+        }
+        return Kept::No;
+    };
+    const auto retire = [&](ImageId image_id) {
+        Image& image = slot_images[image_id];
         ++trace_stale_aged;
         trace_stale_aged_bytes += image.guest_size_bytes;
         MarkStale(image); // before UntrackImage (see MarkStale)
@@ -411,6 +439,33 @@ void TextureCache<P>::RetireStaleTargets() {
         }
         UnregisterImage(image_id);
         DeleteImage(image_id);
+    };
+    boost::container::small_vector<ImageId, 8> partners;
+    for (const ImageId image_id : aged) {
+        const Image& image = slot_images[image_id];
+        const Kept reason = kept(image_id, image);
+        if (reason != Kept::No) {
+            ++trace_stale_aged_kept[static_cast<size_t>(reason) - 1];
+            continue;
+        }
+        // The textures that sampled the target go with it when they are as old and their
+        // memory has been reused as well: nothing can fill them again.
+        partners.clear();
+        for (const AliasedImage& alias : image.aliased_images) {
+            const Image& partner = slot_images[alias.id];
+            if (True(partner.flags & ImageFlagBits::BadOverlap) &&
+                False(partner.flags & ImageFlagBits::CpuModified) &&
+                !TextureCacheOperations::GpuWrittenRenderTarget(partner) &&
+                TextureCacheOperations::StaleMarkerCovers(partner) &&
+                partner.aliased_images.size() == 1 && kept(alias.id, partner) == Kept::No) {
+                partners.push_back(alias.id);
+            }
+        }
+        retire(image_id);
+        for (const ImageId partner_id : partners) {
+            ++trace_stale_aged_partners;
+            retire(partner_id);
+        }
     }
 }
 
@@ -985,7 +1040,8 @@ void TextureCache<P>::TraceMemory() {
         "footprint-verified {} failures {} drops {} drop-bytes {} clears {} clear-ns {} zeroes {} "
         "zero-bytes {} zero-ns {} creations {} create-ns {} verified-drops {} reference-scans {} "
         "conditional-clears {}; kept: origin {} history {} flags {} marker {} referenced {} "
-        "layout {} partial {}; aged {} aged-bytes {} aged-referenced {}",
+        "layout {} partial {}; aged {} aged-bytes {} of them sampling textures {}; aged kept: "
+        "pending {} alias {} subresource {}",
         StaleTargets::enabled && StaleTargets::verify, StaleTargets::enabled, trace_stale_layout,
         trace_stale_contents, trace_stale_footprints, trace_stale_failures, trace_stale_drops,
         trace_stale_drop_bytes, trace_stale_clears, trace_stale_clear_ns, trace_stale_zeroes,
@@ -993,8 +1049,10 @@ void TextureCache<P>::TraceMemory() {
         trace_stale_verified, trace_stale_reference_scans, trace_stale_unconfirmed,
         trace_stale_kept[0], trace_stale_kept[1], trace_stale_kept[2], trace_stale_kept[3],
         trace_stale_kept[4], trace_stale_kept[5], trace_stale_kept[6], trace_stale_aged,
-        trace_stale_aged_bytes, trace_stale_aged_kept);
-    trace_stale_aged = trace_stale_aged_bytes = trace_stale_aged_kept = 0;
+        trace_stale_aged_bytes, trace_stale_aged_partners, trace_stale_aged_kept[0],
+        trace_stale_aged_kept[1], trace_stale_aged_kept[2]);
+    trace_stale_aged = trace_stale_aged_bytes = trace_stale_aged_partners = 0;
+    trace_stale_aged_kept = {};
     trace_stale_creations = trace_stale_create_ns = trace_stale_verified = 0;
     trace_stale_reference_scans = trace_stale_unconfirmed = 0;
     trace_stale_kept = {};

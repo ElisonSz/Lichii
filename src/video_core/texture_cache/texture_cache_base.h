@@ -243,7 +243,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 trace_stale_unconfirmed{};
     u64 trace_stale_aged{};
     u64 trace_stale_aged_bytes{};
-    u64 trace_stale_aged_kept{};
+    u64 trace_stale_aged_partners{};
+    std::array<u64, 3> trace_stale_aged_kept{}; // Pending work, a live alias, a live subresource.
     u64 trace_stale_zeroes{};
     u64 trace_stale_zero_bytes{};
     u64 trace_stale_zero_ns{};
