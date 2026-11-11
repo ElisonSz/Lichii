@@ -639,10 +639,13 @@ struct AstcContent {
 
 std::optional<AstcContent> ReadAstcContent(const VideoCommon::ImageInfo& info, u32 skip,
                                            const ASTCDecoderPass::Target& target,
-                                           const StagingBufferRef& map,
+                                           std::span<const u8> cached_bytes,
                                            std::span<const VideoCommon::SwizzleParameters> swizzles,
                                            u32 input_stride) {
-    const VideoCommon::StreamStats::Scope scope{StreamCounter::HashNs};
+    if (cached_bytes.empty()) {
+        return std::nullopt;
+    }
+    const VideoCommon::StreamStats::Scope scope{StreamCounter::KeyReadNs};
     if (info.type != VideoCommon::ImageType::e2D || info.size.depth != 1 ||
         !target.layers.empty() || target.levels == 0 || skip >= 32 || target.levels > 32 - skip ||
         info.resources.layers <= 0) {
@@ -677,7 +680,7 @@ std::optional<AstcContent> ReadAstcContent(const VideoCommon::ImageInfo& info, u
             return std::nullopt;
         }
         const auto params = VideoCommon::Accelerated::MakeBlockLinearSwizzle2DParams(swizzle, info);
-        if (!AppendAstcBlocks(content.bytes, map.mapped_span,
+        if (!AppendAstcBlocks(content.bytes, cached_bytes,
                               {
                                   .offset = swizzle.buffer_offset,
                                   .layers = static_cast<u32>(info.resources.layers),
@@ -696,8 +699,6 @@ std::optional<AstcContent> ReadAstcContent(const VideoCommon::ImageInfo& info, u
     if (levels_seen != target.levels || content.bytes.empty()) {
         return std::nullopt;
     }
-    content.hash = Common::CityHash64(reinterpret_cast<const char*>(content.bytes.data()),
-                                      content.bytes.size());
     return content;
 }
 
@@ -905,23 +906,33 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     };
     std::optional<AstcContent> content;
     bool cache_hit = false;
+    bool repeated_content = false;
     VkImage verify_snapshot{};
     if (stream_state && (VideoCommon::StreamStats::Enabled() || target.cacheable)) {
-        content = ReadAstcContent(info, skip, target, map, swizzles, layer_stride());
+        content = ReadAstcContent(info, skip, target, map.cached_span, swizzles, layer_stride());
         if (VideoCommon::StreamStats::Enabled() && !content) {
             VideoCommon::StreamStats::Add(StreamCounter::HashSkipped);
         }
-        if (VideoCommon::StreamStats::Enabled() && content) {
+        if (content && target.cacheable) {
             const VideoCommon::StreamStats::Scope hash_scope{StreamCounter::HashNs};
+            content->hash = Common::CityHash64(
+                reinterpret_cast<const char*>(content->bytes.data()), content->bytes.size());
+        }
+        if (VideoCommon::StreamStats::Enabled() && content) {
             // Hash only canonical blocks. Staging allocation padding is not texture content.
             const auto& bytes = content->bytes;
-            const auto hash =
-                Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-            const u64 layout_hash =
-                Common::CityHash64(reinterpret_cast<const char*>(content->layout.data()),
-                                   content->layout.size() * sizeof(u64));
+            u128 hash;
+            u64 layout_hash;
+            {
+                const VideoCommon::StreamStats::Scope hash_scope{StreamCounter::HashNs};
+                hash = Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                layout_hash = Common::CityHash64(
+                    reinterpret_cast<const char*>(content->layout.data()),
+                    content->layout.size() * sizeof(u64));
+            }
             const auto key = std::pair{hash[0], hash[1]};
             if (const auto* seen = stream_state->seen.Find(key)) {
+                repeated_content = true;
                 VideoCommon::StreamStats::Add(StreamCounter::Repeats);
                 if (seen->address != target.source_address) {
                     VideoCommon::StreamStats::Add(StreamCounter::RepeatsOtherAddress);
@@ -1016,6 +1027,25 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     }
     if (!cache_hit) {
         VideoCommon::StreamStats::Add(StreamCounter::Decodes);
+        if (VideoCommon::StreamStats::Enabled()) {
+            const u64 decoded_layers = target.layers.empty()
+                                           ? static_cast<u64>(info.resources.layers)
+                                           : static_cast<u64>(target.layers.size());
+            u64 decoded_bytes = 0;
+            for (const auto& swizzle : swizzles) {
+                if (swizzle.level < static_cast<s32>(skip) ||
+                    static_cast<u32>(swizzle.level) - skip >= target.levels) {
+                    continue;
+                }
+                const u32 level = static_cast<u32>(swizzle.level);
+                decoded_bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                                 (std::max)(info.size.height >> level, 1U) * decoded_layers * 4;
+            }
+            VideoCommon::StreamStats::Add(StreamCounter::DecodedBytes, decoded_bytes);
+            if (repeated_content) {
+                VideoCommon::StreamStats::Add(StreamCounter::RepeatBytes, decoded_bytes);
+            }
+        }
         const VkPipeline vk_pipeline = *pipeline;
         const VkImageAspectFlags aspect_mask = target.aspect_mask;
         const VkImage vk_image = target.image;

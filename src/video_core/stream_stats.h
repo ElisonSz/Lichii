@@ -48,8 +48,10 @@ enum class Counter : std::size_t {
     UploadOther,
     BytesOther,
     Decodes,
+    DecodedBytes,
     Dispatches,
     Repeats,
+    RepeatBytes,
     RepeatsOtherAddress,
     LayoutChanges,
     HashSkipped,
@@ -73,6 +75,7 @@ enum class Counter : std::size_t {
     CreateNs,
     StagingNs,
     GuestReadNs,
+    KeyReadNs,
     HashNs,
     ConvertNs,
     DecodeBackNs,
@@ -169,14 +172,14 @@ inline void Report() {
         "Stream stats: {:.3f}s lookups={} reused={} tic_changes={} view_creates={} images={}/{} "
         "astc_images={}/{} "
         "uploads_astc={}/{}B bcn={}/{}B other={}/{}B "
-        "decodes={} dispatches={} repeats={} other_address={} layout_changes={} hash_skipped={} "
-        "history_dropped={} "
+        "decodes={} decoded_bytes={} dispatches={} repeats={} repeat_bytes={} other_address={} "
+        "layout_changes={} hash_skipped={} history_dropped={} "
         "invalidations_write={} cpu_unmap={} gpu_unmap={} collected={} "
         "decode_frames={} mixed_frames={} mixed_submissions={} submissions={} pass_breaks={} "
         "finishes={} gpu_waits={} "
         "cache_hit={} miss={} evict={} reject={} resident={}B decode_barriers={} "
         "transfer_barriers={} descriptor_updates={} "
-        "cpu_ms create={:.3f} staging={:.3f} guest_read={:.3f} hash={:.3f} "
+        "cpu_ms create={:.3f} staging={:.3f} guest_read={:.3f} key_read={:.3f} hash={:.3f} "
         "convert={:.3f} decode_back={:.3f} decode_worker={:.3f} decode_barrier={:.3f} "
         "transfer_worker={:.3f} transfer_barrier={:.3f} descriptor={:.3f} submit={:.3f} "
         "finish={:.3f} queue_submit={:.3f} gpu_wait={:.3f} "
@@ -187,8 +190,9 @@ inline void Report() {
         count(Counter::Created), count(Counter::Destroyed), count(Counter::CreatedAstc),
         count(Counter::DestroyedAstc), count(Counter::UploadAstc), count(Counter::BytesAstc),
         count(Counter::UploadBcn), count(Counter::BytesBcn), count(Counter::UploadOther),
-        count(Counter::BytesOther), count(Counter::Decodes), count(Counter::Dispatches),
-        count(Counter::Repeats), count(Counter::RepeatsOtherAddress), count(Counter::LayoutChanges),
+        count(Counter::BytesOther), count(Counter::Decodes), count(Counter::DecodedBytes),
+        count(Counter::Dispatches), count(Counter::Repeats), count(Counter::RepeatBytes),
+        count(Counter::RepeatsOtherAddress), count(Counter::LayoutChanges),
         count(Counter::HashSkipped), count(Counter::HistoryDropped), count(Counter::CpuWrites),
         count(Counter::CpuUnmaps), count(Counter::GpuUnmaps), count(Counter::Collected),
         count(Counter::DecodeFrames), count(Counter::MixedFrames), count(Counter::MixedSubmissions),
@@ -197,7 +201,8 @@ inline void Report() {
         count(Counter::CacheEvictions), count(Counter::CacheRejected), count(Counter::CacheBytes),
         count(Counter::DecodeBarriers), count(Counter::TransferBarriers),
         count(Counter::DescriptorUpdates), ms(Counter::CreateNs), ms(Counter::StagingNs),
-        ms(Counter::GuestReadNs), ms(Counter::HashNs), ms(Counter::ConvertNs),
+        ms(Counter::GuestReadNs), ms(Counter::KeyReadNs), ms(Counter::HashNs),
+        ms(Counter::ConvertNs),
         ms(Counter::DecodeBackNs), ms(Counter::DecodeWorkerNs), ms(Counter::DecodeBarrierNs),
         ms(Counter::TransferWorkerNs), ms(Counter::TransferBarrierNs), ms(Counter::DescriptorNs),
         ms(Counter::SubmitNs), ms(Counter::FinishNs), ms(Counter::QueueSubmitNs),

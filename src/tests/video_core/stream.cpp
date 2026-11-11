@@ -11,8 +11,10 @@
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/cityhash.h"
 #include "video_core/renderer_vulkan/astc_content_cache.h"
 #include "video_core/stream_stats.h"
+#include "video_core/texture_cache/accelerated_upload.h"
 #include "video_core/textures/decoders.h"
 
 namespace {
@@ -346,4 +348,73 @@ TEST_CASE("Stream switches are read explicitly at session startup", "[video_core
     REQUIRE(Enabled() == expected("EDEN_NX2_STREAM_STATS"));
     REQUIRE(cache_enabled == expected("EDEN_NX2_ASTC_CACHE"));
     REQUIRE(verify_enabled == expected("EDEN_NX2_ASTC_CACHE_VERIFY"));
+}
+
+TEST_CASE("ASTC keys retain guest bytes across skipped mip tails", "[video_core][stream]") {
+    for (bool native : {false, true}) {
+        std::vector<Vulkan::AstcBlockLayout> levels;
+        u32 stride = 0;
+        for (u32 level = 0; level < 5; ++level) {
+            const u32 width = (std::max)(33U >> level, 1U);
+            const u32 height = (std::max)(17U >> level, 1U);
+            const u32 height_log = level < 2 ? 1U : 0U;
+            const u32 block_bytes = ((width + 3) / 4) * (512U << height_log);
+            levels.push_back({stride, 2, 0, width, height, block_bytes, 9 + height_log,
+                              height_log, (1U << height_log) - 1, native});
+            stride += ((height + (8U << height_log) - 1) >> (3 + height_log)) * block_bytes;
+        }
+        std::vector<u8> guest(size_t{stride} * 2);
+        for (size_t index = 0; index < guest.size(); ++index) {
+            guest[index] = static_cast<u8>((index * 13 + index / 17) & 255);
+        }
+        for (u32 skip : {0U, 2U}) {
+            const size_t offset = levels[skip].offset;
+            const u32 tail = stride - static_cast<u32>(offset);
+            std::vector<u8> staging(size_t{tail} * 2);
+            std::vector<u8> cached;
+            unsigned reads = 0;
+            const auto read = [&](std::span<u8> destination) {
+                ++reads;
+                for (size_t layer = 0; layer < 2; ++layer) {
+                    std::copy_n(guest.data() + layer * stride + offset, tail,
+                                destination.data() + layer * tail);
+                }
+            };
+            VideoCommon::ReadAcceleratedUpload(staging, cached, true, read);
+            REQUIRE(reads == 1U);
+            REQUIRE(cached == staging);
+            std::vector<u8> old_key;
+            std::vector<u8> new_key;
+            for (size_t level = skip; level < levels.size(); ++level) {
+                auto old_layout = levels[level];
+                old_layout.layer_stride = stride;
+                auto new_layout = old_layout;
+                new_layout.offset -= offset;
+                new_layout.layer_stride = tail;
+                REQUIRE(Vulkan::AppendAstcBlocks(old_key, guest, old_layout));
+                REQUIRE(Vulkan::AppendAstcBlocks(new_key, cached, new_layout));
+            }
+            REQUIRE(old_key == new_key);
+            const auto hash64 = [](const std::vector<u8>& bytes) {
+                return Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            };
+            const auto hash128 = [](const std::vector<u8>& bytes) {
+                return Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            };
+            REQUIRE(hash64(old_key) == hash64(new_key));
+            REQUIRE(hash128(old_key) == hash128(new_key));
+            std::fill(staging.begin(), staging.end(), 0);
+            REQUIRE(cached != staging);
+            std::vector<u8> disabled;
+            reads = 0;
+            VideoCommon::ReadAcceleratedUpload(staging, disabled, false,
+                [&](std::span<u8> destination) {
+                    REQUIRE(destination.data() == staging.data());
+                    read(destination);
+                });
+            REQUIRE(reads == 1U);
+            REQUIRE(disabled.empty());
+            REQUIRE(staging == cached);
+        }
+    }
 }

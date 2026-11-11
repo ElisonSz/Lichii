@@ -24,6 +24,8 @@ struct StagingBufferRef {
     VkDeviceAddress device_address;
     VkDeviceSize offset;
     std::span<u8> mapped_span;
+    // Borrowed ordinary memory, valid only for the synchronous accelerated-upload call.
+    std::span<const u8> cached_span{};
     MemoryUsage usage;
     u32 log2_level;
     u64 index;

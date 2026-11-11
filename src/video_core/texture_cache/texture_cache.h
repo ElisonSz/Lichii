@@ -39,6 +39,7 @@
 #include "video_core/oot_whiteout_trace.h"
 #include "video_core/render_trace.h"
 #include "video_core/stream_stats.h"
+#include "video_core/texture_cache/accelerated_upload.h"
 #include "video_core/texture_cache/collection_budget.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -2789,6 +2790,23 @@ template <typename StagingBuffer>
 void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
+    std::vector<u8> cached_upload;
+    bool keep_cached = false;
+    if constexpr (requires { staging.cached_span; }) {
+        keep_cached = (StreamStats::Enabled() || StreamStats::cache_enabled) &&
+                      True(image.flags & ImageFlagBits::AcceleratedUpload) &&
+                      IsPixelFormatASTC(image.info.format);
+    }
+    SCOPE_EXIT {
+        if constexpr (requires { staging.cached_span; }) {
+            staging.cached_span = {};
+        }
+    };
+    const auto expose_cached = [&] {
+        if constexpr (requires { staging.cached_span; }) {
+            staging.cached_span = cached_upload;
+        }
+    };
 
     if (True(image.flags & ImageFlagBits::AcceleratedUpload) && image.host_level_offset != 0) {
         // Only levels >= host_level_offset exist on the host: read each layer's tail of the mip
@@ -2796,14 +2814,15 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         auto uploads = FullUploadSwizzles(image.info);
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
-        {
+        ReadAcceleratedUpload(mapped_span, cached_upload, keep_cached, [&](std::span<u8> destination) {
             const StreamStats::Scope read_scope{StreamStats::Counter::GuestReadNs};
             for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
                 gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
-                                      mapped_span.data() + layer * tail, tail,
+                                      destination.data() + layer * tail, tail,
                                       VideoCommon::CacheType::NoTextureCache);
             }
-        }
+        });
+        expose_cached();
         uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
         for (auto& upload : uploads) {
             upload.buffer_offset -= level_offset;
@@ -2812,11 +2831,12 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
-        {
+        ReadAcceleratedUpload(mapped_span, cached_upload, keep_cached, [&](std::span<u8> destination) {
             const StreamStats::Scope read_scope{StreamStats::Counter::GuestReadNs};
-            gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
+            gpu_memory->ReadBlock(gpu_addr, destination.data(), destination.size_bytes(),
                                   VideoCommon::CacheType::NoTextureCache);
-        }
+        });
+        expose_cached();
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
