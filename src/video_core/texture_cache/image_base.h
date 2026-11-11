@@ -16,6 +16,7 @@
 #include "common/common_types.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_info.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCommon {
@@ -104,6 +105,8 @@ struct ImageBase {
     }
 
     ImageInfo info;
+
+    StaleTargets::Proof stale_target;
 
     u32 guest_size_bytes = 0;
     u32 unswizzled_size_bytes = 0;

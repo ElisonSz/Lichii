@@ -199,6 +199,8 @@ public:
 
     void TransitionImageLayout(Image& image);
 
+    bool ClearImage(Image& image);
+
     bool HasBrokenTextureViewFormats() const noexcept {
         // No known Vulkan driver has broken image views
         return false;

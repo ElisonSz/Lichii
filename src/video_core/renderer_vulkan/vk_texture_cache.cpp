@@ -5341,6 +5341,53 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     pending_transcodes.push_back(std::move(pending));
 }
 
+bool TextureCacheRuntime::ClearImage(Image& image) {
+    const VkImageAspectFlags aspect_mask = image.AspectMask();
+    const bool color = aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT;
+    const bool depth_stencil =
+        (aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    if ((!color && !depth_stencil) || image.info.num_samples != 1 ||
+        VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+        VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1 ||
+        True(image.flags & VideoCommon::ImageFlagBits::Converted)) {
+        return false;
+    }
+    FlushDeferredClear();
+    TransitionImageLayout(image);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    const VkImage handle = image.Handle();
+    scheduler.Record([handle, aspect_mask, color](vk::CommandBuffer cmdbuf) {
+        const VkImageSubresourceRange range{aspect_mask, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                            VK_REMAINING_ARRAY_LAYERS};
+        const VkImageMemoryBarrier before{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = handle,
+            .subresourceRange = range,
+        };
+        auto after = before;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, before);
+        if (color) {
+            cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, VkClearColorValue{}, range);
+        } else {
+            cmdbuf.ClearDepthStencilImage(handle, VK_IMAGE_LAYOUT_GENERAL,
+                                          VkClearDepthStencilValue{}, range);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, after);
+    });
+    return true;
+}
+
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
     if (!image.ExchangeInitialization()) {
         VkImageMemoryBarrier barrier{

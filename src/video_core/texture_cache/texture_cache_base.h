@@ -138,6 +138,7 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheOperations;
     /// Address shift for caching images into a hash table
     static constexpr u64 YUZU_PAGEBITS = 20;
 
@@ -228,6 +229,23 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 trace_lookup_remapped{};
     u64 trace_lookup_rejected{};
     u32 trace_rejection_lines{};
+    u64 trace_stale_layout{};
+    u64 trace_stale_contents{};
+    u64 trace_stale_footprints{};
+    u64 trace_stale_failures{};
+    u64 trace_stale_drops{};
+    u64 trace_stale_drop_bytes{};
+    u64 trace_stale_clears{};
+    u64 trace_stale_clear_ns{};
+    u64 trace_stale_reference_scans{};
+    u64 trace_stale_unconfirmed{};
+    u64 trace_stale_zeroes{};
+    u64 trace_stale_zero_bytes{};
+    u64 trace_stale_zero_ns{};
+    u64 stale_birth{};
+    u64 trace_stale_creations{};
+    u64 trace_stale_create_ns{};
+    u64 trace_stale_verified{};
 
     void TraceMemory();
     u64 ScaledImageMemoryBytes(const typename P::Image& image) const;
@@ -381,6 +399,19 @@ public:
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
     void UpdateRenderTargets(bool is_clear);
+
+    /// Record a confirmed whole clear and retire only fully proven stale targets.
+    void NotifyFullClear(ImageViewId view_id);
+
+    /// A clear under a render condition, which proves nothing about the memory it covers.
+    void NoteUnconfirmedClear() {
+        ++trace_stale_unconfirmed;
+    }
+
+    void CollectStaleReferences();
+    bool StaleTargetReferenced(ImageId id) const;
+    void MarkStaleTransfer(ImageBase& image);
+    ::Common::unordered_set<ImageId> stale_references;
 
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this

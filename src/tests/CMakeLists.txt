@@ -76,6 +76,7 @@ add_executable(tests
     video_core/unbacked_fallback.cpp
     video_core/host_memory_limit.cpp
     video_core/texture_memory.cpp
+    video_core/stale_targets.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp

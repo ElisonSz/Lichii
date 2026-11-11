@@ -36,6 +36,7 @@
 #endif
 #include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/video_core.h"
 
 namespace {
@@ -86,6 +87,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::GpuSplit::ReadTickSwitch();
     VideoCommon::ReadUniformStreamReuseSwitch();
     VideoCommon::Nx2FastDraw::ReadDrawCostStatsSwitch();
+    VideoCommon::StaleTargets::ReadSwitch();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;

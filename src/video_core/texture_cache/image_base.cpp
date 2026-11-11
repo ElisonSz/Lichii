@@ -15,7 +15,9 @@
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_view_info.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
 
@@ -259,5 +261,114 @@ bool AddImageAlias(ImageBase& lhs, ImageBase& rhs, ImageId lhs_id, ImageId rhs_i
     rhs.flags &= ~ImageFlagBits::IsRescalable;
     return true;
 }
+
+namespace StaleTargets {
+
+std::optional<Layout> ImageLayout(const ImageInfo& info, u64 guest_bytes) {
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1 || info.block.width != 0 ||
+        info.block.depth != 0 || info.block.height > 5 || info.tile_width_spacing != 0 ||
+        info.is_sparse || info.size.width == 0 || info.size.height == 0 ||
+        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1 ||
+        info.format == PixelFormat::X8_D24_UNORM ||
+        info.format == PixelFormat::R16G16B16X16_FLOAT ||
+        info.format == PixelFormat::D32_FLOAT_S8_UINT) {
+        return std::nullopt;
+    }
+    // Allocation sizes retain raw descriptor padding; swizzle uses adjusted blocks.
+    // Refuse the mismatch on both sides rather than crediting padding as live pixels.
+    const auto effective = MipBlockSize(info, 0);
+    if (effective != info.block || CalculateGuestSizeInBytes(info) != guest_bytes ||
+        (info.layer_stride != 0 && info.layer_stride != CalculateLayerStride(info))) {
+        return std::nullopt;
+    }
+    return Layout{u64{info.size.width} * VideoCore::Surface::BytesPerBlock(info.format),
+                  info.size.height, effective.height};
+}
+
+bool VerifyFootprint(const ImageInfo& info, u64 guest_bytes, std::span<const Run> runs) {
+    constexpr u64 MaxVerifyBytes = u64{32} << 20;
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1 || info.block.width != 0 ||
+        info.block.depth != 0 || info.block.height > 5 || info.tile_width_spacing != 0 ||
+        info.is_sparse || info.size.width == 0 || info.size.height == 0 ||
+        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1 ||
+        guest_bytes == 0 || guest_bytes > MaxVerifyBytes ||
+        CalculateGuestSizeInBytes(info) != guest_bytes) {
+        return false;
+    }
+    const u32 bpp = VideoCore::Surface::BytesPerBlock(info.format);
+    const u64 row_bytes = u64{info.size.width} * bpp;
+    if (row_bytes == 0 || row_bytes > MaxVerifyBytes ||
+        info.size.height > MaxVerifyBytes / row_bytes) {
+        return false;
+    }
+    const u64 linear_bytes = row_bytes * info.size.height;
+    std::vector<u8> linear(static_cast<size_t>(linear_bytes), 0xA5);
+    std::vector<u8> swizzled(static_cast<size_t>(guest_bytes));
+    const auto effective = MipBlockSize(info, 0);
+    Tegra::Texture::SwizzleTexture(swizzled, linear, bpp, info.size.width, info.size.height, 1,
+                                   effective.height, effective.depth, 1, info.native_tiling);
+    u64 previous_end{};
+    for (const Run run : runs) {
+        if (run.begin < previous_end || run.end < run.begin || run.end > guest_bytes) {
+            return false;
+        }
+        for (u64 offset = run.begin; offset < run.end; ++offset) {
+            if (swizzled[static_cast<size_t>(offset)] != 0xA5) {
+                return false;
+            }
+        }
+        previous_end = run.end;
+    }
+    return true;
+}
+
+bool VerifyDrop(const ImageInfo& info, u64 bytes, u64 address, const Proof& proof) {
+    if (!proof.NoUseSinceOverwrite() || proof.evidence.empty()) {
+        return false;
+    }
+    const auto mask = [](const ImageInfo& descriptor, u64 allocation) -> std::vector<u8> {
+        constexpr u64 MaxBytes = u64{32} << 20;
+        if (!ImageLayout(descriptor, allocation) || allocation > MaxBytes) {
+            return {};
+        }
+        const u32 bpp = VideoCore::Surface::BytesPerBlock(descriptor.format);
+        const u64 linear_bytes = u64{descriptor.size.width} * descriptor.size.height * bpp;
+        if (linear_bytes > MaxBytes) {
+            return {};
+        }
+        std::vector<u8> linear(static_cast<size_t>(linear_bytes), 1);
+        std::vector<u8> swizzled(static_cast<size_t>(allocation));
+        const auto block = MipBlockSize(descriptor, 0);
+        Tegra::Texture::SwizzleTexture(swizzled, linear, bpp, descriptor.size.width,
+                                       descriptor.size.height, 1, block.height, block.depth, 1,
+                                       descriptor.native_tiling);
+        return swizzled;
+    };
+    auto uncovered = mask(info, bytes);
+    if (uncovered.empty()) {
+        return false;
+    }
+    for (const auto& writer : proof.evidence) {
+        if (writer.birth <= proof.birth) {
+            return false;
+        }
+        const auto written = mask(writer.info, writer.bytes);
+        if (written.empty()) {
+            return false;
+        }
+        const u64 begin = (std::max)(address, writer.address);
+        const u64 end = (std::min)(address + bytes, writer.address + writer.bytes);
+        for (u64 guest = begin; guest < end; ++guest) {
+            if (written[static_cast<size_t>(guest - writer.address)] != 0) {
+                uncovered[static_cast<size_t>(guest - address)] = 0;
+            }
+        }
+    }
+    return std::ranges::all_of(uncovered, [](u8 value) { return value == 0; });
+}
+
+} // namespace StaleTargets
 
 } // namespace VideoCommon

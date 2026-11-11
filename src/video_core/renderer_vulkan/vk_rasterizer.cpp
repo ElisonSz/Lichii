@@ -75,6 +75,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/textures/texture.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -2369,6 +2370,50 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
+
+    // Prove overwrites only after both attachments have been recorded or deferred.
+    SCOPE_EXIT {
+        if (!VideoCommon::StaleTargets::enabled) {
+            return;
+        }
+        // Under a comparing render condition the console may have skipped this clear, and here
+        // a host predicate can still skip the recorded one: it is no evidence of an overwrite.
+        using RenderEnable = Maxwell::RenderEnable;
+        if (regs.render_enable_override == RenderEnable::Override::UseRenderEnable &&
+            regs.render_enable.mode != RenderEnable::Mode::True) {
+            texture_cache.NoteUnconfirmedClear();
+            return;
+        }
+        const VideoCommon::StaleTargets::ClearCoverage coverage{clear_rect.rect.offset.x,
+                                                                clear_rect.rect.offset.y,
+                                                                clear_rect.rect.extent.width,
+                                                                clear_rect.rect.extent.height,
+                                                                base_array_layer,
+                                                                clear_layers.count,
+                                                                true,
+                                                                texture_cache.IsRescaling()};
+        const auto notify = [&](VideoCommon::ImageViewId view_id) {
+            if (!VideoCommon::IsRenderTargetView(view_id)) {
+                return;
+            }
+            const auto size = texture_cache.GetImageView(view_id).size;
+            if (coverage.Whole(size.width, size.height)) {
+                texture_cache.NotifyFullClear(view_id);
+            }
+        };
+        const auto& targets = texture_cache.GetRenderTargets();
+        if (use_color && color_full_channels &&
+            framebuffer->HasAspectColorBit(regs.clear_surface.RT)) {
+            notify(targets.color_buffer_ids[regs.clear_surface.RT]);
+        }
+        if ((use_depth || use_stencil) &&
+            (framebuffer->HasAspectDepthBit() || framebuffer->HasAspectStencilBit()) &&
+            (!framebuffer->HasAspectDepthBit() || use_depth) &&
+            (!framebuffer->HasAspectStencilBit() ||
+             (use_stencil && regs.stencil_front_mask == 0xFF))) {
+            notify(targets.depth_buffer_id);
+        }
+    };
 
     const u32 color_attachment = regs.clear_surface.RT;
     if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
