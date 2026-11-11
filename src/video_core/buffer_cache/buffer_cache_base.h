@@ -812,9 +812,15 @@ private:
     }();
     /// TEST: EDEN_NX2_UBO_STATS=1 times the streamed uniform binds and logs them every 600
     /// frames, without EDEN_NX2_GPU_PROFILE (which selects the slower method path).
+    /// EDEN_NX2_UBO_STATS=2 also switches the compare in place on and off between windows, so
+    /// one run in one place measures both.
     const bool ubo_stats = [] {
         const char* const value = std::getenv("EDEN_NX2_UBO_STATS");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr && (value[0] == '1' || value[0] == '2');
+    }();
+    const bool ubo_stats_alternate = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_STATS");
+        return value != nullptr && value[0] == '2';
     }();
     struct UniformBindStats {
         u64 binds{};

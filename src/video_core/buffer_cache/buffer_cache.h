@@ -161,6 +161,9 @@ void BufferCache<P>::TickFrame() {
                          binds.bytes / binds.binds, keep.kept,
                          VideoCommon::g_uniform_compare_in_place ? "on" : "off");
             }
+            if (ubo_stats_alternate) {
+                VideoCommon::g_uniform_compare_in_place = !VideoCommon::g_uniform_compare_in_place;
+            }
             binds = UniformBindStats{.window_ns = now_ns, .window_ticks = now_ticks};
         }
         keep.kept = keep.streamed_binds = keep.verified = keep.mismatches = 0;
