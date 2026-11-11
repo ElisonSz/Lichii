@@ -1904,14 +1904,18 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
 
+    // This slot is enabled above even when its source is absent. Clear the preceding dispatch's
+    // binding and write extent before checking the source, so it cannot remain a write target.
+    channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
+    channel_state->compute_storage_write_marks[ssbo_index] = 0;
+    channel_state->native_compute_storage_buffers &= ~(u64{1} << ssbo_index);
     const auto& launch_desc = kepler_compute->launch_description;
-    if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
+    const auto& cbufs = launch_desc.const_buffer_config;
+    if (cbuf_index >= cbufs.size() ||
+        ((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
         LOG_WARNING(HW_GPU, "Skipped binding SSBO: cbuf index {} is not enabled", cbuf_index);
         return;
     }
-    ASSERT(((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) != 0);
-
-    const auto& cbufs = launch_desc.const_buffer_config;
     GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     GPUVAddr holder{};
     const bool table_pointer = indirect_offset != ~0U;

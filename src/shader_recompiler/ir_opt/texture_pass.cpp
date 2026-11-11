@@ -1183,6 +1183,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             return std::nullopt;
         }
         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
+        if (shift.U32() >= 32)
+            return std::nullopt;
         if (lhs) {
             lhs->shift_left = shift.U32();
         }

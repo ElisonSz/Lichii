@@ -270,6 +270,12 @@ struct BufferCacheTestAccess {
         cache.gpu_memory = &memory;
         return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute);
     }
+    static void ComputeStorage(Cache& cache, BufferCacheChannelInfo& channel, u32 cbuf_index) {
+        cache.channel_state = &channel;
+        cache.kepler_compute = &channel.kepler_compute;
+        cache.gpu_memory = &channel.gpu_memory;
+        cache.BindComputeStorageBuffer(0, cbuf_index, 0, true, ~0U, {});
+    }
     template <class C>
     static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
         const auto id = cache.slot_buffers.insert(cache.runtime, address, size, mapped);
@@ -578,6 +584,30 @@ private:
 };
 
 } // namespace
+
+TEST_CASE("A missing compute cbuf clears the preceding storage write target", "[buffer_ports]") {
+    Fixture fixture;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*fixture.memory;
+    state.payload.emplace(fixture.system, *fixture.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    channel.kepler_compute.launch_description.const_buffer_enable_mask.Assign(0);
+    for (const u32 cbuf_index : {0U, 8U, 32U}) {
+        channel.compute_storage_buffers[0] = {
+            .device_addr = 0x10000, .gpu_addr = 0x100000, .size = 0x1000};
+        channel.compute_storage_write_marks[0] = 0x1000;
+        channel.native_compute_storage_buffers = 1;
+        Access::ComputeStorage(*fixture.cache, channel, cbuf_index);
+        CHECK(channel.enabled_compute_storage_buffers == 1);
+        CHECK(channel.written_compute_storage_buffers == 1);
+        CHECK(channel.compute_storage_buffers[0].device_addr == 0);
+        CHECK(channel.compute_storage_buffers[0].gpu_addr == 0);
+        CHECK(channel.compute_storage_buffers[0].size == 0);
+        CHECK(channel.compute_storage_buffers[0].buffer_id == VideoCommon::NULL_BUFFER_ID);
+        CHECK(channel.compute_storage_write_marks[0] == 0);
+        CHECK(channel.native_compute_storage_buffers == 0);
+    }
+}
 
 TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies",
           "[buffer_ports]") {

@@ -439,31 +439,58 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
                                          ReadStorage&& read_storage, u32 element = 0) {
     std::array<u32, 64> stack{};
     std::array<u32, 256> slots{};
+    std::array<bool, 256> initialized{};
     size_t size = 0;
-    const auto pop = [&]() -> u32 { return size > 0 ? stack[--size] : 0; };
-    const auto push = [&](u32 value) {
-        if (size < stack.size()) stack[size++] = value;
+    bool valid = true;
+    const auto pop = [&]() -> u32 {
+        if (size == 0) {
+            valid = false;
+            return 0;
+        }
+        return stack[--size];
     };
-    for (size_t pc = 0; pc < code.size();) {
+    const auto push = [&](u32 value) {
+        if (size == stack.size()) {
+            valid = false;
+            return;
+        }
+        stack[size++] = value;
+    };
+    for (size_t pc = 0; valid && pc < code.size();) {
         const HandleOp op = static_cast<HandleOp>(code[pc++]);
-        const auto operand = [&]() -> u32 { return pc < code.size() ? code[pc++] : 0; };
+        const auto operand = [&]() -> u32 {
+            if (pc == code.size()) {
+                valid = false;
+                return 0;
+            }
+            return code[pc++];
+        };
         if (op == HandleOp::Immediate) {
             push(operand());
             continue;
         }
         if (op == HandleOp::Cbuf) {
             const u32 index = operand();
-            push(read_cbuf(index, operand()));
+            const u32 offset = operand();
+            if (!valid)
+                return std::nullopt;
+            push(read_cbuf(index, offset));
             continue;
         }
         if (op == HandleOp::CbufDynamic) {
             const u32 index = operand();
-            push(read_cbuf(index, pop()));
+            const u32 offset = pop();
+            if (!valid)
+                return std::nullopt;
+            push(read_cbuf(index, offset));
             continue;
         }
         if (op == HandleOp::Storage) {
             const u32 binding = operand();
-            push(read_storage(binding, pop()));
+            const u32 offset = pop();
+            if (!valid)
+                return std::nullopt;
+            push(read_storage(binding, offset));
             continue;
         }
         if (op == HandleOp::Neg || op == HandleOp::Not || op == HandleOp::LNot) {
@@ -473,12 +500,17 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
         }
         if (op == HandleOp::Tee) {
             const u32 slot = operand();
-            if (slot < slots.size() && size > 0) slots[slot] = stack[size - 1];
+            if (!valid || slot >= slots.size() || size == 0)
+                return std::nullopt;
+            slots[slot] = stack[size - 1];
+            initialized[slot] = true;
             continue;
         }
         if (op == HandleOp::Load) {
             const u32 slot = operand();
-            push(slot < slots.size() ? slots[slot] : 0U);
+            if (!valid || slot >= slots.size() || !initialized[slot])
+                return std::nullopt;
+            push(slots[slot]);
             continue;
         }
         if (op == HandleOp::Index) {
@@ -522,7 +554,8 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
         default: return std::nullopt;
         }
     }
-    if (size != 1) return std::nullopt;
+    if (!valid || size != 1)
+        return std::nullopt;
     return stack[0];
 }
 

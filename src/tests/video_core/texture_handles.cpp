@@ -14,6 +14,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/shader_handle_program.h"
+#include "video_core/textures/texture.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -23,7 +24,10 @@ using IR::Value;
 class HandleEnvironment final : public Shader::Environment {
 public:
     bool integer_texture{};
+    Shader::TextureType texture_type{Shader::TextureType::Color2D};
+    Shader::TexturePixelFormat pixel_format{Shader::TexturePixelFormat::A8B8G8R8_UNORM};
     u32 format_reads{};
+    u32 pixel_format_reads{};
     u32 expected_handle{0xabc};
     std::map<std::pair<u32, u32>, u32> cbuf_values{{{0, 0}, 0xabc}};
 
@@ -33,9 +37,12 @@ public:
         REQUIRE(it != cbuf_values.end());
         return it->second;
     }
-    Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
+    Shader::TextureType ReadTextureType(u32) override {
+        return texture_type;
+    }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
-        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+        ++pixel_format_reads;
+        return pixel_format;
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
         REQUIRE(handle == expected_handle);
@@ -589,14 +596,15 @@ TEST_CASE("A table index not defined where the texture is read takes the first e
     CHECK(sample.Arg(0).IsEmpty());
 }
 
-TEST_CASE("Hosts without handle table arrays keep the word the earlier search finds",
+TEST_CASE("Hosts without handle table arrays bind null for a per-invocation handle",
           "[video_core][texture_handles]") {
     for (const bool supported : {false, true}) {
         CAPTURE(supported);
         HandleProgram shader;
         shader.handle_table_arrays = supported;
         shader.env.cbuf_values = {{{0, 0x520}, 0xabc}};
-        // The table's address is a constant buffer word, the one the earlier search binds.
+        // The table's address is a constant buffer word, not the sampled texture
+        // handle.
         const Value list_offset{shader.Emit(Opcode::GetRegister, {Value{IR::Reg::R0}})};
         const Value light{shader.Emit(Opcode::LoadStorage32, {Value{0U}, list_offset})};
         const Value entry{shader.Emit(Opcode::IMul32, {light, Value{96U}})};
@@ -609,7 +617,23 @@ TEST_CASE("Hosts without handle table arrays keep the word the earlier search fi
         const auto& descriptor{shader.Descriptor(sample)};
         CHECK(descriptor.count == (supported ? 64U : 1U));
         CHECK((descriptor.handle_program != ~0U) == supported);
-        CHECK(descriptor.cbuf_offset == (supported ? 0U : 0x520U));
+        CHECK(descriptor.bind_null == !supported);
+        CHECK(VideoCommon::HandleMustBeNull(shader.program.info, descriptor, 0) == !supported);
+        if (supported) {
+            const auto result{Shader::EvaluateHandleProgram(
+                shader.program.info.handle_programs[descriptor.handle_program],
+                [](u32 cbuf_index, u32 offset) {
+                    REQUIRE(cbuf_index == 0);
+                    REQUIRE(offset == 0x520);
+                    return 0xabcU;
+                },
+                [](u32 binding, u32 offset) {
+                    REQUIRE(binding == 1);
+                    return offset;
+                },
+                0)};
+            CHECK(result == 0xabcU);
+        }
     }
 }
 
@@ -959,8 +983,7 @@ TEST_CASE("An unresolved sampled texture handle binds null",
     const Value cbuf_word{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x540U}})};
     const Value float_word{shader.Emit(Opcode::BitCastF32U32, {cbuf_word})};
     const Value is_nan{shader.Emit(Opcode::FPIsNan32, {float_word})};
-    const Value fallback{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x520U}})};
-    const Value handle{shader.Emit(Opcode::SelectU32, {is_nan, fallback, cbuf_word})};
+    const Value handle{shader.Emit(Opcode::LoadStorage32, {Value{0U}, is_nan})};
     auto& sample{shader.Sample(handle)};
     shader.Run();
 
@@ -991,4 +1014,143 @@ TEST_CASE("A texture handle word that holds a storage buffer address is not a ha
     desc.cbuf_index = 0;
     desc.handle_program = 0; // computed for each draw: a real handle
     CHECK_FALSE(VideoCommon::HandleMustBeNull(info, desc, 0));
+}
+
+TEST_CASE("Malformed handle programs cannot synthesize a texture handle",
+          "[video_core][texture_handles]") {
+    using Op = Shader::HandleOp;
+    const auto word = [](Op op) { return static_cast<u32>(op); };
+    std::vector<std::vector<u32>> malformed{
+        {},
+        {word(Op::Immediate)},
+        {word(Op::Cbuf), 0U},
+        {word(Op::CbufDynamic), 0U},
+        {word(Op::Storage), 0U},
+        {word(Op::Immediate), 7U, word(Op::Add)},
+        {word(Op::Neg)},
+        {word(Op::Select)},
+        {word(Op::Tee), 0U},
+        {word(Op::Load), 0U},
+        {word(Op::Load), 256U},
+        {word(Op::Immediate), 7U, word(Op::Tee), 256U},
+        {word(Op::Immediate), 7U, word(Op::Tee)},
+        {word(Op::Immediate), 7U, ~0U},
+    };
+    std::vector<u32> overflow;
+    for (u32 index = 0; index < 65; ++index) {
+        overflow.insert(overflow.end(), {word(Op::Immediate), index});
+    }
+    for (u32 index = 0; index < 64; ++index) {
+        overflow.push_back(word(Op::Add));
+    }
+    malformed.push_back(std::move(overflow));
+    for (const auto& code : malformed) {
+        CHECK_FALSE(Shader::EvaluateHandleProgram(
+            code, [](u32, u32) -> u32 { throw std::logic_error("Invalid cbuf read"); },
+            [](u32, u32) -> u32 { throw std::logic_error("Invalid storage read"); }));
+    }
+}
+
+TEST_CASE("Review19 masks and single shifts retain legacy descriptors by default",
+          "[video_core][texture_handles]") {
+    for (u32 shape = 0; shape < 6; ++shape) {
+        CAPTURE(shape);
+        HandleProgram shader;
+        shader.env.cbuf_values = {{{0, 0}, 5U}, {{0, 4}, 0x00300000U}};
+        shader.env.integer_texture = true;
+        shader.env.texture_type = Shader::TextureType::Color3D;
+        shader.env.pixel_format = Shader::TexturePixelFormat::R32_UINT;
+        const Value first = shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}});
+        const Value second = shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{4U}});
+        const Value low = shader.Emit(Opcode::BitwiseAnd32, {first, Value{0xfffffU}});
+        const Value high = shader.Emit(Opcode::BitwiseAnd32, {second, Value{0xfff00000U}});
+        Value handle = low;
+        if (shape == 0)
+            handle = shader.Emit(Opcode::BitwiseOr32, {low, second});
+        if (shape == 1)
+            handle = shader.Emit(Opcode::BitwiseOr32, {first, high});
+        if (shape == 3)
+            handle = shader.Emit(Opcode::BitwiseOr32, {low, high});
+        if (shape == 4)
+            handle = shader.Emit(Opcode::ShiftLeftLogical32, {first, Value{4U}});
+        if (shape == 5) {
+            const Value shifted = shader.Emit(Opcode::ShiftLeftLogical32, {second, Value{20U}});
+            handle = shader.Emit(Opcode::BitwiseOr32, {first, shifted});
+        }
+        shader.env.expected_handle = shape == 0 ? 0x00300005U : shape == 4 ? 85U : 5U;
+        IR::IREmitter ir{shader.block};
+        auto& query = *ir.ImageQueryDimension(handle, ir.Imm32(0U), ir.Imm1(false)).Inst();
+        shader.Run();
+        REQUIRE(shader.program.info.texture_descriptors.size() == 1);
+        const auto& desc = shader.program.info.texture_descriptors.front();
+        CHECK(desc.type == Shader::TextureType::Color3D);
+        CHECK(desc.is_integer);
+        CHECK(query.Flags<IR::TextureInstInfo>().is_integer == 1);
+        CHECK_FALSE(desc.bind_null);
+        CHECK(desc.handle_program == ~0U);
+        CHECK(desc.has_secondary == (shape == 0 || shape == 1 || shape == 3 || shape == 5));
+        CHECK(desc.cbuf_index == 0);
+        CHECK(desc.cbuf_offset == 0);
+        CHECK(desc.shift_left == (shape == 4 ? 4U : 0U));
+        if (desc.has_secondary) {
+            CHECK(desc.secondary_cbuf_offset == 4);
+            CHECK(desc.secondary_shift_left == (shape == 0 ? 0U : 20U));
+        }
+        // Same fields read by the renderers: preserve texture and sampler, not just metadata.
+        const u32 raw = desc.has_secondary
+                            ? (5U << desc.shift_left) | (0x00300000U << desc.secondary_shift_left)
+                            : 5U;
+        const u32 previous = shape == 0 ? 0x00300005U : 5U;
+        CHECK(Tegra::Texture::TexturePair(raw, false) ==
+              Tegra::Texture::TexturePair(previous, false));
+        // Memo and delta blockers inspect these same static/computed and secondary flags.
+        CHECK((desc.handle_program == ~0U && !desc.has_secondary && !desc.bind_null) ==
+              (shape == 2 || shape == 4));
+    }
+}
+
+TEST_CASE("Review19 single shifts preserve signed normalized texel metadata",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.texture_type = Shader::TextureType::Buffer;
+    shader.env.pixel_format = Shader::TexturePixelFormat::R16_SNORM;
+    const Value word = shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}});
+    const Value handle = shader.Emit(Opcode::ShiftLeftLogical32, {word, Value{4U}});
+    IR::TextureInstInfo flags{};
+    flags.type.Assign(Shader::TextureType::Buffer);
+    auto& fetch = *shader.Emit(Opcode::BindlessImageFetch, {handle, Value{0U}, {}, {}, {}}).Inst();
+    fetch.SetFlags(flags);
+    shader.Run();
+    REQUIRE(shader.program.info.texture_buffer_descriptors.size() == 1);
+    CHECK(shader.env.pixel_format_reads == 1);
+    CHECK(shader.program.info.texture_buffer_descriptors.front().handle_program == ~0U);
+    CHECK(std::ranges::any_of(shader.block.Instructions(), [](const IR::Inst& inst) {
+        return inst.GetOpcode() == Opcode::FPMul32;
+    }));
+}
+
+TEST_CASE("Review19 masked writable handles preserve descriptor mode",
+          "[video_core][texture_handles]") {
+    for (const bool byte_address : {false, true}) {
+        HandleProgram shader;
+        shader.env.cbuf_values = {{{0, 0x10}, 7U}};
+        shader.env.expected_handle = 7U;
+        shader.env.pixel_format = Shader::TexturePixelFormat::R32_UINT;
+        const Value word = shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x10U}});
+        const Value handle = shader.Emit(Opcode::BitwiseAnd32, {word, Value{0xfffffU}});
+        IR::TextureInstInfo flags{};
+        flags.type.Assign(Shader::TextureType::Color2D);
+        flags.image_format.Assign(Shader::ImageFormat::R32_UINT);
+        flags.image_byte_address.Assign(byte_address ? 1U : 0U);
+        IR::IREmitter ir{shader.block};
+        ir.ImageWrite(handle, ir.CompositeConstruct(ir.Imm32(0U), ir.Imm32(0U)),
+                      ir.CompositeConstruct(ir.Imm32(1U), ir.Imm32(1U), ir.Imm32(1U), ir.Imm32(1U)),
+                      flags);
+        REQUIRE_NOTHROW(shader.Run());
+        REQUIRE(shader.program.info.image_descriptors.size() == 1);
+        const auto& desc = shader.program.info.image_descriptors.front();
+        CHECK(desc.cbuf_index == 0);
+        CHECK(desc.cbuf_offset == 0x10);
+        CHECK((desc.handle_program != ~0U) == (false && !byte_address));
+    }
 }
