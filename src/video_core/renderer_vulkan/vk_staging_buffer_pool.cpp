@@ -296,6 +296,31 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
     return bytes;
 }
 
+void StagingBufferPool::LogMemoryTrace() {
+    LOG_INFO(Render_Vulkan, "Memory trace: staging stream {} MiB",
+             stream_buffer.AllocationSize() >> 20);
+    for (const auto usage :
+         {MemoryUsage::Upload, MemoryUsage::Download, MemoryUsage::DeviceLocal}) {
+        u64 allocated{};
+        u64 busy{};
+        u64 deferred_bytes{};
+        u64 count{};
+        for (const auto& level : GetCache(usage)) {
+            for (const auto& entry : level.entries) {
+                const u64 bytes = entry.buffer.AllocationSize();
+                allocated += bytes;
+                busy += !scheduler.IsFree(entry.tick) ? bytes : 0;
+                deferred_bytes += entry.deferred ? bytes : 0;
+                ++count;
+            }
+        }
+        LOG_INFO(
+            Render_Vulkan,
+            "Memory trace: staging kind {} count {} allocated {} MiB busy {} MiB deferred {} MiB",
+            static_cast<u32>(usage), count, allocated >> 20, busy >> 20, deferred_bytes >> 20);
+    }
+}
+
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
     ReleaseLevel(GetCache(usage), current_delete_level);
 }

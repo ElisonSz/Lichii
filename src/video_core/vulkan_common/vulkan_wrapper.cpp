@@ -541,10 +541,10 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
     VmaAllocationInfo2 info{};
     vmaGetAllocationInfo2(allocator, allocation, &info);
     if (info.dedicatedMemory) {
-        return {0, info.blockSize, info.allocationInfo.size};
+        return {0, info.blockSize, info.allocationInfo.size, info.allocationInfo.memoryType};
     }
     return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
-            info.allocationInfo.size};
+            info.allocationInfo.size, info.allocationInfo.memoryType};
 }
 
 void Buffer::Flush() const {
@@ -561,6 +561,15 @@ void Buffer::Invalidate() const {
 
 void Buffer::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_BUFFER, name);
+}
+
+u64 Buffer::AllocationSize() const noexcept {
+    if (!handle || !allocation) {
+        return 0;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.size;
 }
 
 void Buffer::Release() const noexcept {

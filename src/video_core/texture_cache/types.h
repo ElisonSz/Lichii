@@ -31,6 +31,11 @@ constexpr ImageViewId NULL_IMAGE_VIEW_ID{0};
 /// Sampler ID for bugged sampler ids
 constexpr SamplerId NULL_SAMPLER_ID{0};
 
+/// A null texture descriptor is a valid slot, but cannot be a framebuffer attachment.
+[[nodiscard]] constexpr bool IsRenderTargetView(ImageViewId id) noexcept {
+    return id && id != NULL_IMAGE_VIEW_ID;
+}
+
 enum class ImageType : u32 {
     e1D,
     e2D,

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -128,6 +129,30 @@ void BufferCache<P>::TickFrame() {
         if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds{2}) {
             last = now;
             LOG_INFO(HW_GPU, "Memory trace: buffer cache {} MiB", buffer_bytes >> 20);
+            if constexpr (requires(const Buffer& buffer) { buffer.AllocationSize(); }) {
+                u64 live_bytes{};
+                u64 retired_bytes{};
+                u64 retired_count{};
+                std::map<u32, u64> type_bytes;
+                for (const auto [buffer_id, buffer] : slot_buffers) {
+                    const u64 bytes = buffer->AllocationSize();
+                    live_bytes += bytes;
+                    type_bytes[buffer->Location().memory_type] += bytes;
+                }
+                delayed_destruction_ring.ForEach([&](const Buffer& buffer) {
+                    const u64 bytes = buffer.AllocationSize();
+                    retired_bytes += bytes;
+                    ++retired_count;
+                    type_bytes[buffer.Location().memory_type] += bytes;
+                });
+                LOG_INFO(HW_GPU,
+                         "Memory trace: buffer owners live {} MiB retired {} MiB {} buffers",
+                         live_bytes >> 20, retired_bytes >> 20, retired_count);
+                for (const auto& [memory_type, bytes] : type_bytes) {
+                    LOG_INFO(HW_GPU, "Memory trace: buffer owners type {} {} MiB", memory_type,
+                             bytes >> 20);
+                }
+            }
         }
     }
     if (const GeometryStats& stats = geometry_stats; frame_tick % 600 == 0 && stats.syncs != 0) {

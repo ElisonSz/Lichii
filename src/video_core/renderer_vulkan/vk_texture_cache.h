@@ -492,6 +492,8 @@ public:
 
     u32 HostMipLevels() const noexcept;
 
+    [[nodiscard]] u32 HostFormat() const noexcept;
+
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
         return !original_image && info.type != VideoCommon::ImageType::Buffer;
@@ -534,6 +536,22 @@ public:
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
         return original_image.GetMemoryBlock();
+    }
+
+    /// Actual VMA allocations, including the retained scaled image and compute upload buffer.
+    [[nodiscard]] std::array<u64, 3> AllocationBytes() const noexcept {
+        return {original_image.GetMemoryBlock().size + SparseBoundBytes(),
+                scaled_image.GetMemoryBlock().size, compute_unswizzle_buffer.AllocationSize()};
+    }
+
+    /// Non-sparse image allocations by VMA memory type. Sparse bindings are reported separately.
+    [[nodiscard]] std::array<std::pair<u32, u64>, 3> AllocationTypes() const noexcept {
+        const auto original = original_image.GetMemoryBlock();
+        const auto scaled = scaled_image.GetMemoryBlock();
+        return {{{original.memory_type, original.size},
+                 {scaled.memory_type, scaled.size},
+                 {compute_unswizzle_buffer.Location().memory_type,
+                  compute_unswizzle_buffer.AllocationSize()}}};
     }
 
     /// Returns true when the image is already initialized and mark it as initialized

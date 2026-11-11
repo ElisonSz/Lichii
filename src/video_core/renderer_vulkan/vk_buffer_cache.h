@@ -56,6 +56,10 @@ public:
         return buffer.Location();
     }
 
+    [[nodiscard]] u64 AllocationSize() const noexcept {
+        return buffer.AllocationSize();
+    }
+
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept {
         return tracker.IsUsed(offset, size);
     }

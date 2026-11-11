@@ -49,6 +49,8 @@ public:
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
 
+    void LogMemoryTrace();
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;

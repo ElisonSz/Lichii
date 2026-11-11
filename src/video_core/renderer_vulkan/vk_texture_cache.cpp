@@ -2896,6 +2896,45 @@ void TextureCacheRuntime::LogMemoryTrace() {
              staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
+    staging_buffer_pool.LogMemoryTrace();
+    u64 transcodes{};
+    u64 free_decode{};
+    u64 temporary{};
+    u64 msaa{};
+    u64 resolves{};
+    u64 byte_shadows{};
+    u64 history{};
+    for (const auto& entry : pending_transcodes) {
+        transcodes += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& entry : free_transcodes) {
+        free_decode += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& buffer : buffers) {
+        temporary += buffer.AllocationSize();
+    }
+    for (const auto& entry : msaa_scratch_images) {
+        msaa += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& [handle, entry] : resolve_shadows) {
+        resolves += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& [tick, entry] : pending_resolve_shadows) {
+        resolves += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& entry : pending_byte_addressed_shadows) {
+        byte_shadows += entry.image.GetMemoryBlock().size + entry.bridge.AllocationSize();
+    }
+    for (const auto& image : temporal_history.images) {
+        history += image.GetMemoryBlock().size;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Memory trace: texture runtime transcodes pending/free {}/{} MiB, temporary {} MiB, "
+             "MSAA {} MiB, resolve {} MiB, byte shadows {} MiB, history {} MiB; GPU tick {}",
+             transcodes >> 20, free_decode >> 20, temporary >> 20, msaa >> 20, resolves >> 20,
+             byte_shadows >> 20, history >> 20, scheduler.CurrentTick());
+    LOG_INFO(Render_Vulkan, "Memory trace: GPU completed tick {}",
+             scheduler.GetMasterSemaphore().KnownGpuTick());
     Vulkan::LogMemoryTrace(device);
 }
 
@@ -4161,6 +4200,15 @@ VkImageView Image::StorageImageLayerView(s32 level, u32 layer) {
     return *view;
 }
 
+u32 Image::HostFormat() const noexcept {
+    const auto format_override = AstcHostFormat(runtime->device, info);
+    return static_cast<u32>(
+        format_override
+            ? *format_override
+            : MaxwellToVK::SurfaceFormat(runtime->device, FormatType::Optimal, false, info.format)
+                  .format);
+}
+
 bool Image::IsRescaled() const noexcept {
     return True(flags & ImageFlagBits::Rescaled);
 }
@@ -4545,6 +4593,13 @@ VkImageView ImageView::ColorView() {
 
 VkImageView ImageView::StorageView(Shader::TextureType texture_type,
                                    Shader::ImageFormat image_format, bool is_byte_addressed) {
+    if (!image_handle) {
+        return VK_NULL_HANDLE;
+    }
+    if (null_image) {
+        // Devices without nullDescriptor own a fallback image for an absent guest texture.
+        return Handle(texture_type);
+    }
     if (is_byte_addressed &&
         (texture_type != Shader::TextureType::Color2D ||
          image_format != Shader::ImageFormat::R32_UINT ||
@@ -4577,7 +4632,8 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
 }
 
 bool ImageView::IsRescaled() const noexcept {
-    return (*slot_images)[image_id].IsRescaled();
+    const Image* const image = BackingImage();
+    return image && image->IsRescaled();
 }
 
 vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,

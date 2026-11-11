@@ -752,6 +752,7 @@ public:
         u64 block;
         u64 block_size;
         u64 size;
+        u32 memory_type{};
     };
     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
 
@@ -848,6 +849,8 @@ public:
     MemoryLocation Location() const noexcept {
         return location;
     }
+
+    [[nodiscard]] u64 AllocationSize() const noexcept;
 
 private:
     void Release() const noexcept;

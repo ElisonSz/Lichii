@@ -189,6 +189,48 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
     /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
     std::chrono::steady_clock::time_point mem_trace_time{};
+    bool mem_trace_enabled{};
+    bool actual_image_accounting{};
+    struct CollectionTrace {
+        u64 passes{};
+        u64 aggressive{};
+        u64 empty{};
+        u64 examined{};
+        u64 decoding{};
+        u64 costly{};
+        u64 download_protected{};
+        u64 deleted{};
+        u64 downloaded{};
+    } collection_trace;
+    u64 trace_created{};
+    u64 trace_deleted{};
+    u64 trace_frame{};
+    u32 trace_creation_lines{};
+    u32 trace_tic_lines{};
+    const char* trace_origin = "copy/dma";
+    u32 trace_descriptor{};
+    bool trace_oom_dumped{};
+    std::array<u64, 5>
+        trace_origins{}; // Copy/DMA, graphics TIC, compute TIC, target, clear target.
+    std::map<u64, u64> trace_tic_creations;
+    u64 trace_tic_changes{};
+    u64 trace_tic_misses{};
+    u64 trace_readbacks{};
+    u64 trace_readback_images{};
+    u64 trace_readback_bytes{};
+    u64 trace_joins{};
+    u64 trace_aliases{};
+    u64 trace_bad_overlaps{};
+    u64 trace_ignored{};
+    u64 trace_lookups{};
+    u64 trace_lookup_hits{};
+    u64 trace_lookup_candidates{};
+    u64 trace_lookup_remapped{};
+    u64 trace_lookup_rejected{};
+    u32 trace_rejection_lines{};
+
+    void TraceMemory();
+    u64 ScaledImageMemoryBytes(const typename P::Image& image) const;
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -603,7 +645,7 @@ private:
     void InvalidateScale(Image& image);
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
-    u64 GetScaledImageSizeBytes(const ImageBase& image);
+    static u64 GetScaledImageSizeBytes(const ImageBase& image);
 
     /// The device memory an image counts for in total_used_memory between two driver readings:
     /// none for an unbacked image (too large to back, or over unwritten sparse blocks), what is
