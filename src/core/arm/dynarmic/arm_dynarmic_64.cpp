@@ -42,9 +42,16 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
         unmapped = 0;
         static std::atomic<u32> logged{};
+        static const bool trace_registers = std::getenv("EDEN_NX2_BAD_READ_REGS") != nullptr;
         if (logged.fetch_add(1) < 32) {
             LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
                       m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
+            if (trace_registers) {
+                for (u32 register_index = 0; register_index < 31; ++register_index) {
+                    LOG_ERROR(Core_ARM, "Unmapped read register x{}={:#x}", register_index,
+                              m_parent.m_jit->GetRegister(register_index));
+                }
+            }
         }
     }
     return value;
