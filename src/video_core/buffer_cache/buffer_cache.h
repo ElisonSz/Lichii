@@ -144,6 +144,25 @@ void BufferCache<P>::TickFrame() {
                      "mismatches",
                      keep.kept, keep.streamed_binds, keep.verified, keep.mismatches);
         }
+        if (ubo_stats) {
+            // Ticks to nanoseconds by the wall clock over the window, as Nx2Profile's report does.
+            UniformBindStats& binds = uniform_bind_stats;
+            const u64 now_ns = Nx2Profile::Now();
+            const u64 now_ticks = Nx2Profile::Ticks();
+            const u64 span_ticks = now_ticks - binds.window_ticks;
+            if (binds.window_ns != 0 && binds.binds != 0 && span_ticks != 0) {
+                const double ns_per_tick =
+                    static_cast<double>(now_ns - binds.window_ns) / static_cast<double>(span_ticks);
+                const double total_ns = static_cast<double>(binds.ticks) * ns_per_tick;
+                LOG_INFO(HW_GPU,
+                         "Uniform binds in 600 frames: {} streamed in {:.1f} ms ({:.1f} ns each, "
+                         "{} bytes each), {} kept, compare in place {}",
+                         binds.binds, total_ns / 1e6, total_ns / static_cast<double>(binds.binds),
+                         binds.bytes / binds.binds, keep.kept,
+                         VideoCommon::g_uniform_compare_in_place ? "on" : "off");
+            }
+            binds = UniformBindStats{.window_ns = now_ns, .window_ticks = now_ticks};
+        }
         keep.kept = keep.streamed_binds = keep.verified = keep.mismatches = 0;
     }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
@@ -2591,8 +2610,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
             // EDEN_NX2_UBOREUSE=0 turns it off.
             if (VideoCommon::UniformStreamReuseEnabled()) {
+                const u64 bind_start = ubo_stats ? Nx2Profile::Ticks() : 0;
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size);
+                if (ubo_stats) {
+                    uniform_bind_stats.ticks += Nx2Profile::Ticks() - bind_start;
+                    uniform_bind_stats.bytes += size;
+                    ++uniform_bind_stats.binds;
+                }
                 if (streamed) {
                     uniform_keep.streamed[stage] |= 1u << index;
                     ++uniform_keep.streamed_binds;

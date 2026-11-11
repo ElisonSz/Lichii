@@ -41,10 +41,16 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 /// checked for its initialization on every call (MSVC reads a thread-local for it).
 inline bool g_uniform_stream_reuse = UniformStreamReuseSwitch();
 
+/// TEST: EDEN_NX2_UBO_COMPARE=0 gathers every buffer into scratch before the compare, as before
+/// the compare in place, so one build measures both (EDEN_NX2_UBO_STATS=1 times the binds).
+inline bool g_uniform_compare_in_place = true;
+
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadUniformStreamReuseSwitch() {
     g_uniform_stream_reuse = UniformStreamReuseSwitch();
+    const char* const compare = std::getenv("EDEN_NX2_UBO_COMPARE");
+    g_uniform_compare_in_place = compare == nullptr || compare[0] != '0';
 }
 
 [[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
@@ -113,7 +119,9 @@ template <class Runtime, class DeviceMemory>
     // compared where it is; other ranges are gathered into scratch first.
     const u8* guest = nullptr;
     if constexpr (requires { device_memory.GetSpan(device_addr, size_t{size}); }) {
-        guest = device_memory.GetSpan(device_addr, size_t{size});
+        if (g_uniform_compare_in_place) {
+            guest = device_memory.GetSpan(device_addr, size_t{size});
+        }
     }
     if (guest == nullptr) {
         device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);

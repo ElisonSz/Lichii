@@ -810,6 +810,19 @@ private:
         const char* const value = std::getenv("EDEN_NX2_UBO_KEEP_VERIFY");
         return value != nullptr && value[0] == '1';
     }();
+    /// TEST: EDEN_NX2_UBO_STATS=1 times the streamed uniform binds and logs them every 600
+    /// frames, without EDEN_NX2_GPU_PROFILE (which selects the slower method path).
+    const bool ubo_stats = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    struct UniformBindStats {
+        u64 binds{};
+        u64 bytes{};
+        u64 ticks{};
+        u64 window_ns{};    ///< Nx2Profile::Now() when the window began
+        u64 window_ticks{}; ///< Nx2Profile::Ticks() when the window began
+    } uniform_bind_stats;
     struct UniformKeep {
         std::array<u32, NUM_STAGES> candidates{}; ///< Streamed by the previous draw, not rebound
         std::array<u32, NUM_STAGES> streamed{};   ///< Streamed by this draw
