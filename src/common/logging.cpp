@@ -9,8 +9,11 @@
 #include <climits>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <regex>
+#include <string>
+#include <system_error>
 #include <thread>
 
 #if defined(__ANDROID__)
@@ -250,10 +253,30 @@ struct FileBackend final : public Backend {
         // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
         // if the log is still open elsewhere (e.g. in a Lichii process that hasn't exited yet).
         // A log that can't even be checked counts as a failure, so it is never truncated.
-        const auto rotate = [](const std::filesystem::path& path) {
+        // TEST: with an "archive" folder next to the log, every session's log is copied there
+        // (named by the time of this start) before it is rotated, so none is overwritten.
+        const auto archive = [](const std::filesystem::path& path) noexcept {
+            try {
+                std::error_code ec;
+                const auto folder = path.parent_path() / "archive";
+                if (!std::filesystem::is_directory(folder, ec)) {
+                    return;
+                }
+                const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+                const auto target =
+                    folder / (std::to_string(seconds) + "_" + path.filename().string());
+                std::filesystem::copy_file(path, target,
+                                           std::filesystem::copy_options::skip_existing, ec);
+            } catch (...) {
+            }
+        };
+        const auto rotate = [&archive](const std::filesystem::path& path) {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
                 return !ec;
+            archive(path);
             auto old_path = path;
             old_path += ".old.txt";
             std::filesystem::rename(path, old_path, ec);
