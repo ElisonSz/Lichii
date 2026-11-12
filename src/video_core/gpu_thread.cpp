@@ -25,6 +25,7 @@
 #include "video_core/front_qmd.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_acquire_stats.h"
@@ -89,6 +90,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             split.MaybeStart(system);
             if (VideoCommon::g_acquire_counting) {
                 split.ReportAcquire();
+            }
+            if (VideoCommon::SyncTrace::enabled) {
+                VideoCommon::SyncTrace::MaybeReport();
             }
             VideoCommon::Nx2DrainCheck::MaybeReport();
             VideoCommon::Nx2AcquireStats::MaybeReport();

@@ -5,6 +5,7 @@
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -21,6 +22,9 @@ InnerFence::~InnerFence() = default;
 
 void InnerFence::Queue() {
     if (is_stubbed) {
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::Attach(sync_trace_id, &scheduler, 0, true, false);
+        }
         return;
     }
     const VideoCommon::WaitStats::ReasonScope reason_scope{VideoCommon::WaitStats::Reason::Fence};
@@ -29,7 +33,11 @@ void InnerFence::Queue() {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
-    if (!scheduler.DeferFlush()) {
+    const bool deferred = scheduler.DeferFlush();
+    if (VideoCommon::SyncTrace::enabled) {
+        VideoCommon::SyncTrace::Attach(sync_trace_id, &scheduler, wait_tick, false, deferred);
+    }
+    if (!deferred) {
         scheduler.Flush();
     }
 }
@@ -51,8 +59,14 @@ void InnerFence::Wait() {
     // has stopped, nothing else uses the scheduler and Wait below submits it.
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::Mark(sync_trace_id, VideoCommon::SyncTrace::SubmissionReady);
+        }
         scheduler.GetMasterSemaphore().Wait(wait_tick);
         return;
+    }
+    if (VideoCommon::SyncTrace::enabled) {
+        VideoCommon::SyncTrace::Mark(sync_trace_id, VideoCommon::SyncTrace::SubmissionReady);
     }
     scheduler.Wait(wait_tick);
 }

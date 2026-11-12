@@ -30,6 +30,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/wait_stats.h"
 
@@ -38,6 +39,8 @@ namespace VideoCommon {
 class FenceBase {
 public:
     explicit FenceBase(bool is_stubbed_) : is_stubbed{is_stubbed_} {}
+
+    u64 sync_trace_id{}; // Diagnostic report identity, zero for ordinary fences.
 
     bool IsStubbed() const {
         return is_stubbed;
@@ -115,6 +118,9 @@ public:
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         TFence new_fence = CreateFence(!should_flush);
+        if (SyncTrace::enabled) {
+            new_fence->sync_trace_id = SyncTrace::current_report;
+        }
         if constexpr (can_async_check) {
             guard.lock();
         }
@@ -290,14 +296,23 @@ private:
                 }
                 take_front();
             }
+            if (SyncTrace::enabled) {
+                SyncTrace::Mark(batch.front().fence->sync_trace_id, SyncTrace::W0);
+            }
             if (!batch.front().fence->IsStubbed()) {
                 WaitFence(batch.front().fence);
+            }
+            if (SyncTrace::enabled) {
+                SyncTrace::Mark(batch.front().fence->sync_trace_id, SyncTrace::W1);
             }
             {
                 std::unique_lock lock(guard);
                 while (batch.size() < MaxBatch && !fences.empty() &&
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
+                    if (SyncTrace::enabled) {
+                        SyncTrace::BatchObserved(batch.back().fence->sync_trace_id);
+                    }
                 }
             }
             if (!batch.empty()) {

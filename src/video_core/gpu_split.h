@@ -21,6 +21,7 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2_sem_recorder.h"
+#include "video_core/nx2_sync_trace.h"
 
 namespace Core {
 class System;
@@ -698,6 +699,9 @@ private:
             NoteFirstUnpublished();
         }
         last_entry_start = write_position;
+        if (SyncTrace::enabled) {
+            SyncTrace::Commit(write_position);
+        }
         write_position += words;
         PublishIfDue();
     }

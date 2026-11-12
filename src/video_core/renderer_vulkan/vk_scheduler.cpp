@@ -26,6 +26,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -862,6 +863,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Submissions);
     const u64 signal_value = master_semaphore->NextTick();
+    if (VideoCommon::SyncTrace::enabled) {
+        VideoCommon::SyncTrace::Issued(this, signal_value);
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -896,6 +900,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         const VkResult result = [&] {
             const VideoCommon::StreamStats::Scope stream_submit{
                 VideoCommon::StreamStats::Counter::QueueSubmitNs};
+            if (VideoCommon::SyncTrace::enabled) {
+                VideoCommon::SyncTrace::Submitted(this, signal_value);
+            }
             return master_semaphore->SubmitQueue(cmdbuf, upload_cmdbuf, signal_semaphore,
                                                  wait_semaphore, signal_value);
         }();

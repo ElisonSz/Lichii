@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_trace.h"
 
 namespace Tegra::Control {
 
@@ -41,6 +42,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
         ASSERT(it != channels.end());
         channel_state = it->second;
     }
+    const VideoCommon::SyncTrace::FrontScope sync_scope{
+        VideoCommon::SyncTrace::enabled ? &channel_state->payload->dma_pusher.puller : nullptr};
     BindChannel(gpu, channel_state->bind_id);
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
@@ -76,6 +79,8 @@ bool Scheduler::ResumePending(GPU& gpu) {
             if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                 split.PublishSoon();
             }
+            const VideoCommon::SyncTrace::FrontScope sync_scope{
+                VideoCommon::SyncTrace::enabled ? &dma_pusher.puller : nullptr};
             BindChannel(gpu, state->bind_id);
             dma_pusher.DispatchCalls();
             progress = true;

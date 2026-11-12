@@ -19,6 +19,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "video_core/nx2_sem_recorder.h"
+#include "video_core/nx2_sync_trace.h"
 
 namespace Tegra {
 
@@ -537,6 +538,10 @@ public:
         free_slot->address = device_address;
         free_slot->value = value;
         free_slot->operation = operation;
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::RemoveWaiter(owner);
+            free_slot->sync_trace_id = 0;
+        }
         free_slot->latched.store(0, std::memory_order_relaxed);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
@@ -544,6 +549,9 @@ public:
     }
 
     void Remove(const void* owner) {
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::RemoveWaiter(owner);
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -563,7 +571,11 @@ public:
         for (const Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
-                return slot.latched.load(std::memory_order_acquire) != 0;
+                const bool met = slot.latched.load(std::memory_order_acquire) != 0;
+                if (VideoCommon::SyncTrace::enabled && met) {
+                    VideoCommon::SyncTrace::Observe(slot.sync_trace_id, owner);
+                }
+                return met;
             }
         }
         return false;
@@ -581,7 +593,8 @@ public:
     }
 
     /// A GPU write of value to the u32 at device_address.
-    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown) {
+    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown,
+                 u64 sync_trace_id = 0) {
         VideoCommon::SemRecorder::Record("waiter-write", device_address, value);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
@@ -593,6 +606,13 @@ public:
                 VideoCommon::SemRecorder::Record("waiter-latch", device_address, value, slot.value,
                                                  slot.operation);
                 const u8 previous = slot.latched.load(std::memory_order_relaxed);
+                if (VideoCommon::SyncTrace::enabled && previous == 0) {
+                    slot.sync_trace_id = sync_trace_id;
+                    if (sync_trace_id != 0) {
+                        VideoCommon::SyncTrace::Matched(
+                            sync_trace_id, slot.owner.load(std::memory_order_relaxed));
+                    }
+                }
                 // Keep the first source, and retain the release publication on every matching
                 // write: the acquire sees the engine's preceding writes as before.
                 slot.latched.store(previous != 0 ? previous
@@ -608,6 +628,7 @@ private:
         u64 address{};
         u32 value{};
         u32 operation{};
+        u64 sync_trace_id{}; // First latch writer; published by latched release/acquire.
         std::atomic<u8> latched{}; ///< Zero, or Source + 1 of the first matching write
     };
 

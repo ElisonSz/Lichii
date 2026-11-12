@@ -25,6 +25,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -238,6 +239,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
+    const u64 sync_trace_id = SyncTrace::enabled && is_fence ? SyncTrace::Begin() : 0;
     const bool mirrored = True(flags & QueryPropertiesFlags::Nx2Mirror);
     const auto requested_type = counter_type;
     static const GPUVAddr watch = [] {
@@ -274,6 +276,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                  static_cast<u32>(counter_type), static_cast<u32>(flags), payload, subreport);
     }
     if (!cpu_addr_opt) [[unlikely]] {
+        if (SyncTrace::enabled) {
+            SyncTrace::Finish(sync_trace_id, true);
+        }
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
@@ -313,7 +318,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
     std::function<void()> operation([this, streamer, query_base = query, query_location, pointer,
                                      pointer_timestamp, cpu_addr, addr, asid = gpu_memory->GetID(),
-                                     counter_type, mirrored, report_size, report_noted,
+                                     counter_type, mirrored, report_size, report_noted, sync_trace_id,
                                      split_completion = std::move(split_completion),
                                      split_entry = VideoCommon::GpuSplit::Get().BackEntry(),
                                      watched =
@@ -341,6 +346,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
             }
+            if (SyncTrace::enabled) {
+                SyncTrace::Finish(sync_trace_id, true);
+            }
             impl->pending_unregister.push_back(query_location);
             return;
         }
@@ -354,6 +362,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
+            if (SyncTrace::enabled) {
+                SyncTrace::Finish(sync_trace_id, true);
+            }
             impl->pending_unregister.push_back(query_location);
             return;
         }
@@ -410,7 +421,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
             cpu_addr, static_cast<u32>(query_base->value),
             counter_type == QueryType::Payload ? Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease
-                                               : Tegra::Nx2SemaphoreWaiters::Source::QueryResult);
+                                               : Tegra::Nx2SemaphoreWaiters::Source::QueryResult,
+            sync_trace_id);
+        if (SyncTrace::enabled) {
+            SyncTrace::Finish(sync_trace_id, false);
+        }
         if (watched) {
             u32 guest;
             std::memcpy(&guest, pointer, sizeof(guest));
@@ -433,7 +448,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     });
     if (is_fence) {
         VideoCore::g_signaling_query_report_fence = true;
+        if (SyncTrace::enabled) {
+            SyncTrace::current_report = sync_trace_id;
+        }
         impl->rasterizer.SignalFence(std::move(operation));
+        if (SyncTrace::enabled) {
+            SyncTrace::current_report = 0;
+            SyncTrace::Mark(sync_trace_id, SyncTrace::Q);
+        }
         VideoCore::g_signaling_query_report_fence = false;
     } else {
         if (immediate) {

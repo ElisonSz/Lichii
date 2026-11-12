@@ -27,6 +27,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_stats.h"
@@ -360,6 +361,9 @@ void GpuSplit::Publish() {
     }
     if (profile_publishes) {
         NoteLatePublish(); // TEST
+    }
+    if (SyncTrace::enabled) {
+        SyncTrace::Publish(published_local, write_position);
     }
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
@@ -904,6 +908,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
+            if (SyncTrace::enabled) {
+                SyncTrace::IdleBegin();
+            }
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front publishes what it holds after a few more words from now on.
             back_idle_at.store(read_position, std::memory_order_relaxed);
@@ -933,6 +940,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
+                        if (SyncTrace::enabled) {
+                            SyncTrace::IdleFlag(false);
+                        }
                         idle_hook(idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);
@@ -950,11 +960,17 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     !hook_requested.load(std::memory_order_seq_cst) &&
                     (tick_state.load(std::memory_order_seq_cst) & TickRequested) == 0) {
                     Count(g_acquire_stats.back_sleeps);
+                    if (SyncTrace::enabled) {
+                        SyncTrace::IdleFlag(true);
+                    }
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
             }
+        }
+        if (SyncTrace::enabled) {
+            SyncTrace::IdleEnd();
         }
         if (profile_publishes) {
             back_idle_since.store(0, std::memory_order_relaxed);
@@ -965,9 +981,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             back_entry_start = read_position;
+            if (SyncTrace::enabled) {
+                SyncTrace::BackEntry(read_position);
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
+            if (SyncTrace::enabled) {
+                SyncTrace::BackConsumed(read_position);
+            }
             // Keep registration open through Execute: an entry can send several reports, and
             // the first fence can finish before the back has even sent the last one.
             back_fenced_entry.reset();
@@ -992,6 +1014,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         SealFencedEntries(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
+    }
+    if (SyncTrace::enabled) {
+        SyncTrace::IdleEnd(true);
+        SyncTrace::StopSplit();
     }
     // Stop accepting ticks before leaving. A reader still has its normal queued GPU tick:
     // it runs on the front after a settings stop, or #1058 releases it at final shutdown.

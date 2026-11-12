@@ -22,6 +22,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_stats.h"
@@ -809,6 +810,9 @@ void Puller::ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher) {
         }
         ReleaseFences(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            if (VideoCommon::SyncTrace::enabled) {
+                VideoCommon::SyncTrace::Suspend(this);
+            }
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
@@ -947,6 +951,9 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     // Suspended: a release the back runs latches the waiter, and the polls see the others in
     // memory or in the view (PollWithoutDrain).
     VideoCommon::Count(stats.suspended);
+    if (VideoCommon::SyncTrace::enabled) {
+        VideoCommon::SyncTrace::Suspend(this);
+    }
     acquire.last_drain = std::chrono::steady_clock::now();
     MaybeReleaseFences(dma_pusher, acquire);
     pending_acquire = acquire;
