@@ -543,9 +543,16 @@ constexpr u64 RenderTargetPoolMinBytes = 4ULL << 20;
 /// TEST (EDEN_NX2_MEM_TRACE): counts one host object and the time it took to make.
 class HostObjectTimer {
 public:
-    explicit HostObjectTimer(u64& count_, u64& ns_)
-        : count{count_}, ns{ns_}, start{std::chrono::steady_clock::now()} {}
+    explicit HostObjectTimer(u64& count_, u64& ns_, bool enabled_)
+        : count{count_}, ns{ns_}, enabled{enabled_} {
+        if (enabled) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
     ~HostObjectTimer() {
+        if (!enabled) {
+            return;
+        }
         ++count;
         ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
@@ -557,7 +564,8 @@ public:
 private:
     u64& count;
     u64& ns;
-    std::chrono::steady_clock::time_point start;
+    bool enabled;
+    std::chrono::steady_clock::time_point start{};
 };
 
 /// `pool`: the runtime whose HostImagePool may supply the image, with `pool_key` set to what the
@@ -567,7 +575,8 @@ private:
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
                                   bool may_fail = false, TextureCacheRuntime* pool = nullptr,
-                                  std::optional<HostImagePool::Key>* pool_key = nullptr) {
+                                  std::optional<HostImagePool::Key>* pool_key = nullptr,
+                                  bool render_target_origin = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -617,23 +626,26 @@ private:
             .usage = image_ci.usage,
             .view_formats = view_formats.data(),
             .view_format_count = view_formats.size(),
+            .render_target_origin = render_target_origin,
         };
         if (vk::Image kept = pool->TakeHostImage(**pool_key)) {
             return kept;
         }
     }
-    // A large image with one level is a render target, and a game that sizes its shadow maps by
-    // the view makes a dozen a frame in sizes it never repeats: no kept image fits those, and
-    // over 8 MiB each would be a driver allocation of its own (16 MiB default blocks).
+    // Only render-target creations share the large blocks, to avoid pinning them with textures.
     const u64 texel_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
                             VideoCore::Surface::BytesPerBlock(info.format);
-    const bool render_target =
+    const bool target_pool_shape =
         pool != nullptr && may_fail && VideoCommon::StaleTargets::target_memory_pool &&
         image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 && image_ci.extent.depth == 1 &&
         image_ci.samples == VK_SAMPLE_COUNT_1_BIT &&
         VideoCore::Surface::DefaultBlockWidth(info.format) == 1 &&
         texel_bytes >= RenderTargetPoolMinBytes &&
         texel_bytes <= Device::RenderTargetPoolBlockSize / 2;
+    const bool render_target = target_pool_shape && render_target_origin;
+    if (target_pool_shape && !render_target_origin) {
+        ++pool->host_object_stats.target_refused_origin;
+    }
     const auto make = [&] {
         return may_fail ? allocator.TryCreateImage(image_ci, false, render_target)
                         : allocator.CreateImage(image_ci);
@@ -641,12 +653,24 @@ private:
     if (pool == nullptr) {
         return make();
     }
-    const auto start = std::chrono::steady_clock::now();
-    vk::Image image = make();
-    if (!image && pool->HostImagePoolBytes() != 0) {
-        // No memory left while the pool holds some: give it back and try once more.
-        pool->ReleaseHostImagePool();
+    const auto start = pool->host_memory_trace ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+    vk::Image image;
+    if (may_fail && pool->HostImagePoolBytes() != 0) {
+        image = allocator.TryCreateImageWithinBudget(image_ci, render_target);
+        if (!image) {
+            // Reclaim optional images before paging or taking host/unbacked fallbacks.
+            pool->ReleaseHostImagePool();
+            image = allocator.TryCreateImageWithinBudget(image_ci, render_target);
+        }
+        if (!image) {
+            image = make();
+        }
+    } else {
         image = make();
+    }
+    if (!pool->host_memory_trace) {
+        return image;
     }
     const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                         std::chrono::steady_clock::now() - start)
@@ -1407,6 +1431,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       render_pass_cache{render_pass_cache_}, descriptor_pool{descriptor_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
       resolution{Settings::values.resolution_info} {
+    host_memory_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    host_image_pool.SetTrace(host_memory_trace);
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -3117,7 +3143,7 @@ size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
           u64{key.width}, u64{key.height}, u64{key.depth}, u64{key.levels}, u64{key.layers},
           static_cast<u64>(key.samples), u64{key.usage},
           static_cast<u64>(reinterpret_cast<uintptr_t>(key.view_formats)),
-          static_cast<u64>(key.view_format_count)}) {
+          static_cast<u64>(key.view_format_count), u64{key.render_target_origin}}) {
         hash = (hash ^ part) * 0x100000001B3ULL;
     }
     return static_cast<size_t>(hash ^ (hash >> 32));
@@ -3156,7 +3182,8 @@ vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
     return image;
 }
 
-void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) {
+void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit,
+                          const Scheduler& scheduler, const Device& device) {
     ShapeStats* const shape = trace ? &shape_stats[key] : nullptr;
     const auto refuse = [&] {
         ++stats.refused;
@@ -3164,7 +3191,19 @@ void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) 
             ++shape->refused;
         }
     };
-    const u64 size = image.GetMemoryBlock().size;
+    // Every admitted entry is complete: eviction, expiry and pressure trim may destroy it.
+    if (!scheduler.IsFree(tick)) {
+        ++stats.refused_pending;
+        refuse();
+        return;
+    }
+    const auto memory_block = image.GetMemoryBlock();
+    if (!device.IsCountedDeviceLocalMemory(memory_block.memory_type)) {
+        ++stats.refused_nonlocal;
+        refuse();
+        return;
+    }
+    const u64 size = memory_block.size;
     if (size == 0 || size > limit / 4) {
         refuse();
         return;
@@ -3207,20 +3246,49 @@ void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) 
 }
 
 void HostImagePool::Tick() {
-    // Freeing much at once empties whole memory blocks, and the driver reports those late.
-    u64 budget = MaxExpiredBytes;
+    const u64 repayment = (std::min)(expiry_debt, MaxExpiredBytes);
+    expiry_debt -= repayment;
+    u64 budget = MaxExpiredBytes - repayment;
     for (auto list = images.begin(); list != images.end();) {
         std::erase_if(list->second, [&](Entry& entry) {
             if (++entry.unused_frames <= MaxUnusedFrames || budget == 0) {
                 return false;
             }
-            budget -= (std::min)(budget, entry.bytes);
+            if (entry.bytes > budget) {
+                expiry_debt += entry.bytes - budget;
+                budget = 0;
+            } else {
+                budget -= entry.bytes;
+            }
             bytes -= entry.bytes;
             --count;
             ++stats.expired;
+            stats.expired_bytes += entry.bytes;
             return true;
         });
         list = list->second.empty() ? images.erase(list) : std::next(list);
+    }
+}
+
+void HostImagePool::Trim(u64 requested_bytes) {
+    while (requested_bytes != 0 && !images.empty()) {
+        auto longest = images.begin();
+        for (auto candidate = std::next(images.begin()); candidate != images.end(); ++candidate) {
+            if (candidate->second.front().unused_frames > longest->second.front().unused_frames) {
+                longest = candidate;
+            }
+        }
+        std::vector<Entry>& entries = longest->second;
+        const u64 freed_bytes = entries.front().bytes;
+        requested_bytes -= (std::min)(requested_bytes, freed_bytes);
+        bytes -= freed_bytes;
+        --count;
+        ++stats.trimmed;
+        stats.trimmed_bytes += freed_bytes;
+        entries.erase(entries.begin());
+        if (entries.empty()) {
+            images.erase(longest);
+        }
     }
 }
 
@@ -3274,12 +3342,14 @@ void HostImagePool::ReportShapes() {
         ++(asked ? listed : unasked);
         LOG_INFO(Render_Vulkan,
                  "Memory trace: pool shape format {} {}x{}x{} levels {} layers {} samples {} "
-                 "usage {:#x} flags {:#x} views {}@{}: hits {} misses {} kept {} refused {}; "
+                 "usage {:#x} flags {:#x} views {}@{} target-origin {}: "
+                 "hits {} misses {} kept {} refused {}; "
                  "holds {} images {} MiB",
                  static_cast<u32>(row.key.format), row.key.width, row.key.height, row.key.depth,
                  row.key.levels, row.key.layers, static_cast<u32>(row.key.samples),
                  static_cast<u32>(row.key.usage), static_cast<u32>(row.key.flags),
-                 row.key.view_format_count, fmt::ptr(row.key.view_formats), row.shape.hits,
+                 row.key.view_format_count, fmt::ptr(row.key.view_formats),
+                 row.key.render_target_origin, row.shape.hits,
                  row.shape.misses, row.shape.kept, row.shape.refused, row.held,
                  row.held_bytes >> 20);
     }
@@ -3300,7 +3370,8 @@ void TextureCacheRuntime::KeepHostImage(const HostImagePool::Key& key, vk::Image
     // The pool hands the image out once the GPU ran the last commands recorded on it, whatever
     // order the next user's commands would run in. An image the cache did not retire may have
     // been used up to now.
-    host_image_pool.Keep(key, image, last_use.value_or(scheduler.CurrentTick()), limit);
+    host_image_pool.Keep(key, image, last_use.value_or(scheduler.CurrentTick()), limit,
+                         scheduler, device);
 }
 
 void TextureCacheRuntime::TickFrame() {
@@ -3346,10 +3417,11 @@ void TextureCacheRuntime::TickFrame() {
         return scheduler.IsFree(pending.first);
     });
     host_image_pool.Tick();
-    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
-    host_image_pool.SetTrace(mem_trace);
+    if (!host_memory_trace) {
+        return;
+    }
     if (const auto now = std::chrono::steady_clock::now();
-        mem_trace && now - host_object_report >= std::chrono::seconds{2}) {
+        now - host_object_report >= std::chrono::seconds{2}) {
         host_object_report = now;
         const HostObjectStats made = std::exchange(host_object_stats, HostObjectStats{});
         const HostImagePool::Stats pool = host_image_pool.TakeStats();
@@ -3364,12 +3436,19 @@ void TextureCacheRuntime::TickFrame() {
                  VideoCommon::StaleTargets::pool_images, pool.hits, pool.misses, pool.kept,
                  pool.refused, pool.evicted, pool.expired, pool.released, host_image_pool.Count(),
                  host_image_pool.Bytes() >> 20);
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: image pool pressure: pre-fallback releases {}, trimmed {} images "
+                 "{} bytes; refused non-local {}, pending {}; target pool refused origin {}; "
+                 "expired {} bytes, expiry debt {} bytes",
+                 made.pool_pressure_releases, pool.trimmed, pool.trimmed_bytes,
+                 pool.refused_nonlocal, pool.refused_pending, made.target_refused_origin,
+                 pool.expired_bytes, host_image_pool.ExpiryDebt());
         host_image_pool.ReportShapes();
     }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
-             VAddr cpu_addr_)
+             VAddr cpu_addr_, bool render_target_origin)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
@@ -3386,7 +3465,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true, &runtime_, &pool_key)),
+                               true, &runtime_, &pool_key, render_target_origin)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -4721,7 +4800,8 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
       device{&runtime.device}, image_handle{image.Handle()},
       samples(ConvertSampleCount(image.info.num_samples)) {
     using Shader::TextureType;
-    const HostObjectTimer timer{runtime.host_object_stats.views, runtime.host_object_stats.view_ns};
+    const HostObjectTimer timer{runtime.host_object_stats.views, runtime.host_object_stats.view_ns,
+                                runtime.host_memory_trace};
     if (image.host_level_offset == 0)
         range = HostRange(image, range);
 
@@ -5323,7 +5403,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     std::span<ImageView*, NUM_RT> color_buffers,
                                     ImageView* depth_buffer, bool is_rescaled_) {
     const HostObjectTimer timer{runtime.host_object_stats.framebuffers,
-                                runtime.host_object_stats.framebuffer_ns};
+                                runtime.host_object_stats.framebuffer_ns, runtime.host_memory_trace};
     boost::container::small_vector<VkImageView, NUM_RT * 2 + 2> attachments;
     RenderPassKey renderpass_key{};
     // A framebuffer can't have more layers than any of its attachments: one with more layers

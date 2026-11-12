@@ -8,14 +8,21 @@
 
 #include <algorithm>
 #include <bit>
+#include <compare>
+#include <cstddef>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <new>
 #include <numeric>
+#include <ranges>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "common/assert.h"
 #include "common/common_types.h"
-#include <ranges>
 
 namespace Common {
 
@@ -38,7 +45,7 @@ struct SlotId {
 template <class T>
 // TODO: More "stable" debian fixes... wohoo
 #if __GNUC__ > 12
-    requires std::is_nothrow_move_assignable_v<T> && std::is_nothrow_move_constructible_v<T>
+    requires std::is_nothrow_move_constructible_v<T>
 #endif
 class SlotVector {
 public:

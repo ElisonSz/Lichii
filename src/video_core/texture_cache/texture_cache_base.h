@@ -556,6 +556,9 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// Reclaim optional host images before collecting active cache contents.
+    void TrimHostImagePool(bool out_of_memory);
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 

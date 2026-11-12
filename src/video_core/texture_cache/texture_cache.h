@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -160,6 +161,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
+    TrimHostImagePool(out_of_memory || total_used_memory >= critical_memory);
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -325,6 +327,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     }
     Collect();
     if (out_of_memory || total_used_memory >= critical_memory) {
+        TrimHostImagePool(true);
         Configure(true);
         Collect();
     }
@@ -365,6 +368,24 @@ void TextureCache<P>::CollectStaleReferences() {
     // don't say what is in use. What a draw samples goes through PrepareImage, which resets the
     // proof, and deleting an image invalidates the tables and ends a delta draw chain, as it
     // does when the collector deletes one.
+}
+
+template <class P>
+void TextureCache<P>::TrimHostImagePool(bool out_of_memory) {
+    if constexpr (requires { runtime.TrimHostImagePool(u64{}); runtime.HostImagePoolBytes(); }) {
+        if (runtime.HostImagePoolBytes() == 0) {
+            return;
+        }
+        u64 undeducted_use = runtime.GetDeviceMemoryUsage();
+        if (undeducted_use < critical_memory && out_of_memory) {
+            runtime.TrimHostImagePool(runtime.HostImagePoolBytes());
+        }
+        while (undeducted_use >= critical_memory && runtime.HostImagePoolBytes() != 0) {
+            runtime.TrimHostImagePool(undeducted_use - critical_memory + 1);
+            undeducted_use = runtime.GetDeviceMemoryUsage();
+        }
+        // Active-cache use already excludes this pool; trimming must not increase it.
+    }
 }
 
 template <class P>
@@ -711,6 +732,7 @@ void TextureCache<P>::TickFrame() {
     }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
+        TrimHostImagePool(false);
         total_used_memory = runtime.GetDeviceMemoryUsage();
         // Images the collector deleted keep their memory for TICKS_TO_DESTROY frames: counting
         // it kept the collector in aggressive mode, deleting 40+ images a frame for frames after
@@ -3682,9 +3704,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    const bool render_target_origin = std::string_view{trace_origin} == "render-target" ||
+                                      std::string_view{trace_origin} == "clear-target";
     const ImageId new_image_id = [&] {
         const StreamStats::Scope create_scope{StreamStats::Counter::CreateNs};
-        return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+        if constexpr (requires {
+                          Image(runtime, new_info, gpu_addr, cpu_addr, render_target_origin);
+                      }) {
+            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr, render_target_origin);
+        } else {
+            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+        }
     }();
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
@@ -3722,9 +3752,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     Image& new_image = slot_images[new_image_id];
 
-    TextureCacheOperations::Created(*this, new_image,
-                                    std::string_view{trace_origin} == "render-target" ||
-                                        std::string_view{trace_origin} == "clear-target");
+    TextureCacheOperations::Created(*this, new_image, render_target_origin);
     new_image.allocation_tick = frame_tick;
     if (mem_trace_enabled) {
         ++trace_created;

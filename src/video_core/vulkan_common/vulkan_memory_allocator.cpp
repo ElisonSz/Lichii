@@ -239,6 +239,19 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
     return image;
 }
 
+vk::Image MemoryAllocator::TryCreateImageWithinBudget(const VkImageCreateInfo& ci,
+                                                       bool render_target) const {
+    vk::Image image;
+    if (render_target && CreateImageInRenderTargetPool(ci, image)) {
+        return image;
+    }
+    const VkResult result = AllocateImage(ci, false, true, image, true);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return image;
+}
+
 vk::Image MemoryAllocator::CreateOptionalImage(const VkImageCreateInfo& ci) const {
     vk::Image image;
     const VkResult result = AllocateImage(ci, true, true, image, true);

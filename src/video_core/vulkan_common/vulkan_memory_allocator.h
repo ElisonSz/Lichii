@@ -118,6 +118,10 @@ namespace Vulkan {
         vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
                                  bool render_target = false) const;
 
+        /// Budget-respecting image attempts, including the target pool, without pressure fallbacks.
+        vk::Image TryCreateImageWithinBudget(const VkImageCreateInfo& ci,
+                                             bool render_target = false) const;
+
         /// Optional resources: one budget-respecting attempt, no pressure/failure signals or
         /// mandatory-resource fallbacks. Only allocation OOM returns null; other errors propagate.
         vk::Image CreateOptionalImage(const VkImageCreateInfo& ci) const;

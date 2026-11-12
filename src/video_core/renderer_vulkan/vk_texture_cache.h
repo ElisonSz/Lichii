@@ -98,6 +98,7 @@ public:
         VkImageUsageFlags usage;
         const VkFormat* view_formats; ///< The view format list's storage, one per guest format
         size_t view_format_count;
+        bool render_target_origin; ///< Keep target-pool blocks out of sampled-texture reuse.
 
         [[nodiscard]] bool operator==(const Key&) const noexcept = default;
     };
@@ -108,7 +109,12 @@ public:
         u64 refused{};
         u64 evicted{};
         u64 expired{};
+        u64 expired_bytes{};
         u64 released{};
+        u64 trimmed{};
+        u64 trimmed_bytes{};
+        u64 refused_nonlocal{};
+        u64 refused_pending{};
     };
 
     /// A kept image made as `key` that the GPU no longer uses, or none.
@@ -117,11 +123,14 @@ public:
     /// Keeps `image`, whose last commands were recorded by `tick`. A pool holding `limit` bytes
     /// makes room by destroying the images that waited longest; `image` is left to its owner
     /// if nothing here waited longer than it, or it is too large to keep.
-    void Keep(const Key& key, vk::Image& image, u64 tick, u64 limit);
+    void Keep(const Key& key, vk::Image& image, u64 tick, u64 limit,
+              const Scheduler& scheduler, const Device& device);
 
-    /// Once a frame: images nothing asked for in MaxUnusedFrames frames are destroyed, at most
-    /// MaxExpiredBytes of them a frame.
+    /// Once a frame: expire unused images against a byte allowance, carrying overshoot as debt.
     void Tick();
+
+    /// Destroys the longest-waiting entries until at least requested_bytes have been freed.
+    void Trim(u64 requested_bytes);
 
     /// Destroys every kept image: an image did not fit in the device's memory.
     void Release();
@@ -138,12 +147,16 @@ public:
     [[nodiscard]] size_t Count() const noexcept {
         return count;
     }
+    [[nodiscard]] u64 ExpiryDebt() const noexcept {
+        return expiry_debt;
+    }
     [[nodiscard]] Stats TakeStats() noexcept {
         return std::exchange(stats, Stats{});
     }
 
 private:
     static constexpr u32 MaxUnusedFrames = 30;
+    // A frame may exceed this allowance by one image; later frames repay the excess first.
     static constexpr u64 MaxExpiredBytes = u64{64} << 20;
     static constexpr size_t MaxImages = 2048;
 
@@ -166,6 +179,7 @@ private:
 
     std::unordered_map<Key, std::vector<Entry>, KeyHash> images; ///< Longest wait first
     u64 bytes{};
+    u64 expiry_debt{};
     size_t count{};
     Stats stats;
     bool trace{};
@@ -213,9 +227,14 @@ public:
         return host_image_pool.Bytes();
     }
 
-    /// The cache is at its critical threshold, or an image did not fit: the kept images go.
+    /// Reclaim completed optional images before the allocator's pressure fallbacks.
     void ReleaseHostImagePool() {
+        ++host_object_stats.pool_pressure_releases;
         host_image_pool.Release();
+    }
+
+    void TrimHostImagePool(u64 requested_bytes) {
+        host_image_pool.Trim(requested_bytes);
     }
 
     /// TEST (EDEN_NX2_MEM_TRACE): host objects made, and the time that took.
@@ -230,8 +249,11 @@ public:
         u64 view_ns{};
         u64 framebuffers{};
         u64 framebuffer_ns{};
+        u64 pool_pressure_releases{};
+        u64 target_refused_origin{};
     };
     HostObjectStats host_object_stats;
+    bool host_memory_trace{};
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
@@ -615,7 +637,7 @@ private:
 class Image : public VideoCommon::ImageBase {
 public:
     explicit Image(TextureCacheRuntime&, const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
-                   VAddr cpu_addr);
+                   VAddr cpu_addr, bool render_target_origin = false);
     explicit Image(const VideoCommon::NullImageParams&);
 
     ~Image();
@@ -624,7 +646,7 @@ public:
     Image& operator=(const Image&) = delete;
 
     Image(Image&&) = default;
-    Image& operator=(Image&&) = default;
+    Image& operator=(Image&&) = delete;
 
     /// The cache deleted the image: no command is recorded on it after `tick`. Its host image
     /// can serve another image once the GPU is past that tick (HostImagePool).
