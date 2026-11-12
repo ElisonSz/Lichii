@@ -3258,6 +3258,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::Invalidate};
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -3275,6 +3276,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::GpuWrite};
     // The GPU's own cached writes (constant buffer data, every draw): most land where no image,
     // query or shader was ever registered, which page_filter tells without the caches' locks.
     const auto any = [&](const VideoCommon::PageFilter& filter) {
@@ -3298,8 +3300,22 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            buffer_cache.WriteMemory(addr, size);
+        if (VideoCommon::Nx2Protect::g_inline) [[unlikely]] {
+            // EDEN_NX2_PROTECT_INLINE: tracked pages get these bytes now and stay protected. An
+            // upload that ends the render pass waits for the next scan as before, unless a
+            // compute dispatch flushes (it ends the render pass anyway).
+            const bool render_pass_active =
+                scheduler.IsRenderPassActive() && !VideoCommon::Nx2Protect::t_dispatch_flush;
+            BufferCache::InPlaceBatch batch{};
+            for (const auto& [addr, size] : sequences) {
+                if (!buffer_cache.WriteGpuMemoryInPlace(addr, size, render_pass_active, batch)) {
+                    buffer_cache.WriteMemory(addr, size);
+                }
+            }
+        } else {
+            for (const auto& [addr, size] : sequences) {
+                buffer_cache.WriteMemory(addr, size);
+            }
         }
     }
     if (any(query_cache.page_filter)) {
@@ -3314,6 +3330,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::CpuWrite};
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {
@@ -3344,6 +3361,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::Collected};
 
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -4240,6 +4258,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }();
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::Inline};
     bool uploaded;
     {
         std::scoped_lock lock{buffer_cache.mutex};

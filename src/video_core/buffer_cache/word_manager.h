@@ -22,6 +22,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memtrack_translation.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_protect.h"
 
 namespace VideoCommon {
 
@@ -35,7 +36,19 @@ enum class Type {
     CachedCPU,
     Untracked,
     Preflushable,
+    /// EDEN_NX2_PROTECT_INLINE: uploaded in place (BufferCache::WriteGpuMemoryInPlace) since an
+    /// upload scan last covered the page. Only that switch sets it; nothing else reads it.
+    InPlace,
     Max
+};
+
+/// EDEN_NX2_PROTECT_INLINE: whether the pages of a range can take an in-place upload of the GPU
+/// thread's own writes (WordManager::CheckInPlace), or what stops them.
+enum class InPlaceCheck {
+    Clean,     ///< tracked (protected), nothing to upload or download, no in-place upload since a scan
+    Untracked, ///< a page is CPU-modified, cached-CPU-written or untracked
+    GpuState,  ///< a page holds GPU-written or preflushable data
+    Uploaded,  ///< a page was uploaded in place and no upload scan covered it since
 };
 
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
@@ -245,8 +258,54 @@ struct WordManager {
             release();
         }
         if (!ranges.empty()) {
+            // EDEN_NX2_PROTECT_STATS: an upload scan tracks (protects) these pages again.
+            const Nx2Protect::SourceScope source{Nx2Protect::Source::Rearm};
+            if (Nx2Protect::g_stats) [[unlikely]] {
+                Nx2Protect::NoteRearm(ranges);
+            }
             ApplyCollectedRanges(ranges, 1);
         }
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE: InPlaceCheck::Clean when no page of [offset, offset + size) is
+    /// CPU-modified, cached-CPU-written, untracked, GPU-modified, preflushable or uploaded in place
+    /// since the last upload scan over it.
+    [[nodiscard]] InPlaceCheck CheckInPlace(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> gpu_words = Span(Type::GPU);
+        const std::span<const u64> cached_words = Span(Type::CachedCPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        const std::span<const u64> preflushable_words = Span(Type::Preflushable);
+        const std::span<const u64> in_place_words = Span(Type::InPlace);
+        InPlaceCheck result = InPlaceCheck::Clean;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (((cpu_words[index] | cached_words[index] | untracked_words[index]) & mask) != 0) {
+                result = InPlaceCheck::Untracked;
+                return true;
+            }
+            if (((gpu_words[index] | preflushable_words[index]) & mask) != 0) {
+                result = InPlaceCheck::GpuState;
+                return true;
+            }
+            if ((in_place_words[index] & mask) != 0) {
+                result = InPlaceCheck::Uploaded;
+                return true;
+            }
+            return false;
+        });
+        return result;
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE: sets or clears the InPlace bits of the pages of the range.
+    void SetInPlace(u64 offset, u64 size, bool in_place) noexcept {
+        const std::span<u64> in_place_words = Span(Type::InPlace);
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (in_place) {
+                in_place_words[index] |= mask;
+            } else {
+                in_place_words[index] &= ~mask;
+            }
+        });
     }
 
     /// @brief Returns true when a region has been modified

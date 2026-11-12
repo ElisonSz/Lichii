@@ -159,8 +159,44 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        NoteUploadScan(query_cpu_range, query_size);
         IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+        });
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE (BufferCache::WriteGpuMemoryInPlace): InPlaceCheck::Clean when
+    /// every page of the range is tracked, holds no GPU-written or preflushable data and took no
+    /// in-place upload since an upload scan last covered it. A page no manager covers is
+    /// untracked (a new manager starts with every page CPU-modified).
+    [[nodiscard]] InPlaceCheck CheckInPlace(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        if (query_size == 0) {
+            return InPlaceCheck::Untracked;
+        }
+        std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
+        u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
+        u64 remaining_size{query_size};
+        while (remaining_size > 0) {
+            const u64 copy_amount{(std::min<u64>)(HIGHER_PAGE_SIZE - page_offset, remaining_size)};
+            if (page_index >= NUM_HIGH_PAGES || top_tier[page_index] == nullptr) {
+                return InPlaceCheck::Untracked;
+            }
+            const InPlaceCheck check = top_tier[page_index]->CheckInPlace(page_offset, copy_amount);
+            if (check != InPlaceCheck::Clean) {
+                return check;
+            }
+            ++page_index;
+            page_offset = 0;
+            remaining_size -= copy_amount;
+        }
+        return InPlaceCheck::Clean;
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE: the pages of the range were uploaded in place; until an upload
+    /// scan covers them they take no other in-place upload.
+    void MarkInPlace(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+            manager->SetInPlace(offset, size, true);
         });
     }
 
@@ -191,6 +227,7 @@ public:
     /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
     template <typename Func>
     void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        NoteUploadScan(query_cpu_range, query_size);
         IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             const u64 dirty =
                 manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
@@ -217,6 +254,21 @@ public:
     }
 
 private:
+    /// An upload scan over the whole range, before clean words are skipped: the GPU uses the
+    /// range after it. EDEN_NX2_PROTECT_STATS counts the scans over churning pages; with
+    /// EDEN_NX2_PROTECT_INLINE the range's pages may take an in-place upload again.
+    void NoteUploadScan(VAddr query_cpu_range, u64 query_size) noexcept {
+        if (Nx2Protect::g_stats) [[unlikely]] {
+            Nx2Protect::NoteScan(query_cpu_range, query_cpu_range + query_size);
+        }
+        if (Nx2Protect::g_inline) [[unlikely]] {
+            IteratePages<false>(query_cpu_range, query_size,
+                                [](Manager* manager, u64 offset, size_t size) {
+                                    manager->SetInPlace(offset, size, false);
+                                });
+        }
+    }
+
     /// The tracker marks whole pages: a write next to a range on one of its pages reaches it.
     void ForgetSynchronized(VAddr cpu_addr, u64 size) noexcept {
         const VAddr write_begin = Common::AlignDown(cpu_addr, BYTES_PER_PAGE);

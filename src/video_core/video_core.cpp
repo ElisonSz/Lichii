@@ -28,6 +28,7 @@
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_protect.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
@@ -107,6 +108,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::Nx2FastDraw::ReadDrawDeltaSwitch();
     VideoCommon::Nx2FastDraw::ReadDrawReuseSwitches();
     VideoCommon::StaleTargets::ReadSwitch();
+    VideoCommon::Nx2Protect::ReadSwitch();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;

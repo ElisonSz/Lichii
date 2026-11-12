@@ -37,6 +37,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_protect.h"
 #include "video_core/nx2_sem_recorder.h"
 #include "video_core/rasterizer_download_area.h"
 
@@ -529,7 +530,17 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                // EDEN_NX2_PROTECT_STATS: the call's time and source.
+                const u64 start = VideoCommon::Nx2Protect::NowNs();
+                host_buffer->Protect(vaddr, size, perm);
+                const u64 end = VideoCommon::Nx2Protect::NowNs();
+                VideoCommon::Nx2Protect::NoteProtect(
+                    cached, size, end - start,
+                    system.GetCurrentHostThreadID() < Core::Hardware::NUM_CPU_CORES, end);
+            } else {
+                host_buffer->Protect(vaddr, size, perm);
+            }
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
@@ -947,6 +958,9 @@ struct Memory::Impl {
             ReportForeignPointer(v_address, p);
             return;
         }
+        if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+            VideoCommon::Nx2Protect::NoteCpuRead(v_address);
+        }
         const size_t core = system.GetCurrentHostThreadID();
         if (core >= Core::Hardware::NUM_CPU_CORES) {
             // A service thread has no slot in the arrays below, and it does not use a slot of a
@@ -957,6 +971,9 @@ struct Memory::Impl {
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
                 DisarmReadTraps(v_address, size);
+                if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                    VideoCommon::Nx2Protect::NoteCpuReadAsked();
+                }
                 (void)system.GPU().OnCPURead(address, size);
             });
             return;
@@ -974,6 +991,9 @@ struct Memory::Impl {
                 return;
             }
             DisarmReadTraps(v_address, size);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                VideoCommon::Nx2Protect::NoteCpuReadAsked();
+            }
             current_area = system.GPU().OnCPURead(address, size);
         });
     }
@@ -990,6 +1010,9 @@ struct Memory::Impl {
         if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
             ReportForeignPointer(v_address, p);
             return;
+        }
+        if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+            VideoCommon::Nx2Protect::NoteCpuWrite(v_address);
         }
         // Guard on sys_core;
         if (core == sys_core) [[unlikely]] {
@@ -1013,6 +1036,9 @@ struct Memory::Impl {
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
+                if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                    VideoCommon::Nx2Protect::NoteCpuWriteAsked(do_collection);
+                }
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {

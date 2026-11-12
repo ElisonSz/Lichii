@@ -262,6 +262,24 @@ public:
     /// when the memory is going away).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
+    /// The pages one InnerInvalidation call uploaded in place so far (WriteGpuMemoryInPlace).
+    struct InPlaceBatch {
+        DAddr begin{};
+        DAddr end{};
+    };
+
+    /// EDEN_NX2_PROTECT_INLINE, for the GPU thread's own writes to guest memory, applied at
+    /// FlushCaching (RasterizerVulkan::InnerInvalidation), `mutex` held: when every page under
+    /// [device_addr, device_addr + size) is tracked (protected) by the buffer cache, holds no
+    /// GPU-written data and lies in one buffer, uploads those pages from guest memory into the
+    /// buffer now and leaves them tracked, instead of WriteMemory's CPU-modified mark: the mark
+    /// unprotected the pages and the next upload scan protected them again. Makes WriteMemory's
+    /// other notes. Returns false when it did nothing: the caller calls WriteMemory then.
+    /// `render_pass_active`: an upload that cannot go to the upload command buffer is left to
+    /// the next scan as before, rather than ending the render pass here.
+    bool WriteGpuMemoryInPlace(DAddr device_addr, u64 size, bool render_pass_active,
+                               InPlaceBatch& batch);
+
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
     /// Cancels pending downloads over the range (fences' and reads'), so none writes them over

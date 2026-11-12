@@ -132,6 +132,8 @@ add_library(video_core STATIC
     nx2_list_indirect.h
     nx2_list_indirect_stats.h
     nx2_profile.h
+    nx2_protect.cpp
+    nx2_protect.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h

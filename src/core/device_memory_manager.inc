@@ -28,6 +28,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_protect.h"
 #include "video_core/nx2_sem_recorder.h"
 
 namespace Core {
@@ -735,6 +736,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
+    // EDEN_NX2_PROTECT_STATS: single ranges are the texture and shader caches' (the buffer
+    // cache's tracker passes batches).
+    const VideoCommon::Nx2Protect::TrackerScope tracker{VideoCommon::Nx2Protect::Tracker::Single};
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
 }

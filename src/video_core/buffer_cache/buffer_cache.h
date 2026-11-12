@@ -341,6 +341,107 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
 }
 
 template <class P>
+bool BufferCache<P>::WriteGpuMemoryInPlace(DAddr device_addr, u64 size, bool render_pass_active,
+                                           InPlaceBatch& batch) {
+    if constexpr (!USE_MEMORY_MAPS_FOR_UPLOADS) {
+        return false;
+    } else {
+        using Nx2Protect::InPlace;
+        const auto note = [](InPlace result, u64 bytes) {
+            if (Nx2Protect::g_stats) [[unlikely]] {
+                Nx2Protect::NoteInPlace(result, bytes);
+            }
+        };
+        // Only the scheduler's owner records uploads (WriteMemory's downloads have the same rule).
+        if (size == 0 || !VideoCommon::GpuSplit::OwnsScheduler()) {
+            return false;
+        }
+        // An in-place upload copies a few pages; larger writes (copies, clears) keep the lazy
+        // upload of the pages the GPU uses.
+        static constexpr u64 MAX_IN_PLACE_BYTES = 16 * DEVICE_PAGESIZE;
+        const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+        const u64 pages_size = page_end - page_begin;
+        // WriteMemory's notes, before its CPU-modified mark.
+        const auto note_write = [&] {
+            Nx2NoteListHostWrite(device_addr, size);
+            NoteUniformWrite(device_addr, size);
+            if (!early_landed.empty()) {
+                ForgetEarlyLanded(device_addr, size);
+            }
+        };
+        if (batch.begin <= page_begin && page_end <= batch.end) {
+            // An earlier range of this flush uploaded these pages from guest memory, which held
+            // every write of the flush already.
+            note_write();
+            MarkVertexBuffersStale(device_addr, size);
+            note(InPlace::Repeated, 0);
+            return true;
+        }
+        if (pages_size > MAX_IN_PLACE_BYTES) {
+            note(InPlace::Large, 0);
+            return false;
+        }
+        const u64 caching_page = page_begin >> CACHING_PAGEBITS;
+        const BufferId buffer_id = caching_page < page_table.size() ? page_table[caching_page]
+                                                                    : NULL_BUFFER_ID;
+        if (!buffer_id || !slot_buffers[buffer_id].IsInBounds(page_begin, pages_size)) {
+            note(InPlace::NoBuffer, 0);
+            return false;
+        }
+        Buffer& buffer = slot_buffers[buffer_id];
+        // The byte ranges WriteMemory tests, and the tracker's GPU and preflush state.
+        if (gpu_modified_ranges.Intersects(page_begin, pages_size)) {
+            note(InPlace::GpuData, 0);
+            return false;
+        }
+        switch (memory_tracker.CheckInPlace(page_begin, pages_size)) {
+        case InPlaceCheck::Clean:
+            break;
+        case InPlaceCheck::Untracked:
+            // Untracked pages are unprotected already, and the next scan uploads them.
+            note(InPlace::Untracked, 0);
+            return false;
+        case InPlaceCheck::GpuState:
+            note(InPlace::GpuData, 0);
+            return false;
+        case InPlaceCheck::Uploaded:
+            // Written again before anything used the last in-place upload: as before, so pages
+            // written over and over between uses get one upload at their next use.
+            note(InPlace::AgainBeforeUse, 0);
+            return false;
+        }
+        std::array copies{BufferCopy{
+            .src_offset = 0,
+            .dst_offset = buffer.Offset(page_begin),
+            .size = pages_size,
+        }};
+        const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        if (!can_reorder && render_pass_active) {
+            note(InPlace::RenderPass, 0);
+            return false;
+        }
+        note_write();
+        // The upload the next scan made of these pages before (SynchronizeBuffer's add_upload,
+        // MappedUploadMemory): whole pages from guest memory, which holds this write already.
+        ForgetUploadedEarlyLanded(page_begin, pages_size); // EDEN_NX2_READ_CHECK
+        if (OotWhiteout::Enabled()) {
+            OotWhiteout::Add(OotWhiteout::Event::UploadBytes, page_begin, pages_size, 0, 0,
+                             pages_size);
+        }
+        auto upload_staging = runtime.UploadStagingBuffer(pages_size);
+        device_memory.ReadBlockUnsafe(page_begin, upload_staging.mapped_span.data(), pages_size);
+        copies[0].src_offset = upload_staging.offset;
+        runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+        memory_tracker.MarkInPlace(page_begin, pages_size);
+        MarkVertexBuffersStale(device_addr, size);
+        batch = InPlaceBatch{.begin = page_begin, .end = page_end};
+        note(InPlace::Uploaded, pages_size);
+        return true;
+    }
+}
+
+template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
