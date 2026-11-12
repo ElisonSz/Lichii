@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include "common/container/unordered_map.h"
 
@@ -35,11 +36,16 @@ public:
     [[nodiscard]] bool HasPendingChannelsAnyThread() const {
         return any_pending.load(std::memory_order_acquire);
     }
+    /// EDEN_NX2_SYNC_SUSPEND: the earliest ring position a pending channel's acquire, suspended
+    /// before the back ran its release, waits for (Puller::EarlyPosition).
+    [[nodiscard]] std::optional<u64> EarlyWaitPosition() const;
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 
 private:
     void BindChannel(GPU& gpu, s32 bind_id);
+    /// EDEN_NX2_SYNC_SUSPEND: before `channel` dispatches, how many other channels are pending.
+    void NoteOtherPending(const ChannelState& channel) const;
 
     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
     std::mutex scheduling_guard;

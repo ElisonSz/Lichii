@@ -31,6 +31,7 @@
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_base.h"
 
@@ -61,6 +62,8 @@ ThreadManager::~ThreadManager() = default;
 
 void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Frontend::GraphicsContext& context, Tegra::Control::Scheduler& scheduler) {
     rasterizer = renderer.ReadRasterizer();
+    // A command an earlier session's front left in its queue at shutdown is gone with it.
+    VideoCommon::SyncSuspend::queued_commands.store(0, std::memory_order_relaxed);
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         const VideoCommon::StutterTrace::ThreadScope stutter_thread{
@@ -119,6 +122,26 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     if (!scheduler.HasPendingChannels()) {
                         continue;
                     }
+                    if (VideoCommon::SyncSuspend::enabled && split.Active()) [[unlikely]] {
+                        // A channel suspended before the back ran the release it waits for
+                        // (EDEN_NX2_SYNC_SUSPEND): with nothing else to send, wait for that entry
+                        // as the baseline's acquire did, then poll from there. Bounded: after
+                        // IdleWaitLimit, new commands and the channels are looked at again.
+                        if (const auto target = scheduler.EarlyWaitPosition();
+                            target && !split.Ran(*target)) {
+                            namespace Suspension = VideoCommon::SyncSuspend;
+                            const auto begin = Suspension::Clock::now();
+                            const bool reached =
+                                split.WaitForPositionFor(*target, Suspension::IdleWaitLimit);
+                            auto& counts = Suspension::counters;
+                            ++counts.idle_waits;
+                            counts.idle_wait_ns +=
+                                Suspension::Nanoseconds(Suspension::Clock::now() - begin);
+                            counts.idle_timeouts += reached ? 0 : 1;
+                            last_progress = std::chrono::steady_clock::now();
+                            continue;
+                        }
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
                     // second and its present waits for the work behind them: with 1 ms sleeps the
@@ -173,6 +196,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             if (stop_token.stop_requested()) {
                 break;
+            }
+            if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+                VideoCommon::SyncSuspend::queued_commands.fetch_sub(1, std::memory_order_relaxed);
             }
             if (split.Active()) {
                 split.PublishSoon();
@@ -288,6 +314,10 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
+    if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+        // Before the push: the front takes it off only after it is counted.
+        VideoCommon::SyncSuspend::queued_commands.fetch_add(1, std::memory_order_relaxed);
+    }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
     if (VideoCommon::FastWake::enabled && VideoCommon::FastWake::pending.Notify()) {
         VideoCommon::FastWake::counters.command_signals.fetch_add(1, std::memory_order_relaxed);

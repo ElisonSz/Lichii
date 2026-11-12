@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -20,8 +21,10 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "common/thread.h"
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_sem_recorder.h"
+#include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
 
 namespace Core {
@@ -390,6 +393,10 @@ public:
         }
         return waited;
     }
+    /// EDEN_NX2_SYNC_SUSPEND: WaitForPosition for at most `limit` (the front, with nothing else to
+    /// do while a channel waits for that entry). Returns whether the back ran everything before
+    /// `position`.
+    bool WaitForPositionFor(u64 position, std::chrono::nanoseconds limit);
     /// Whether the back executed everything sent before `position`. It may tell so a little
     /// late: the back stores its position every few thousand words and when it runs out of work.
     [[nodiscard]] bool Ran(u64 position) const {
@@ -459,6 +466,11 @@ public:
         bool fenced;
         SemaphoreWriter writer;
         u64 position; ///< Once the back ran this (Ran), the word holds the write, unless `fenced`
+        /// EDEN_NX2_SYNC_SUSPEND (0 otherwise): once the back ran this, no work sent before the
+        /// write that could change the word as the back runs it is still queued: compute and copy
+        /// work, writes the front could not place, earlier writes to the word landing at run (and
+        /// this one, unless it lands once a fence ran).
+        u64 settle{};
     };
     /// The last write sent to the semaphore word at `device_address`, if it may not be in memory
     /// yet.
@@ -604,6 +616,7 @@ public:
 private:
     friend struct GpuSplitTestAccess;
     friend struct FastWakeTestAccess;
+    friend struct SyncSuspendTestAccess;
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -759,6 +772,10 @@ private:
     void Backoff(u32 spins, u64 target);
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
+        if (SyncSuspend::enabled && front_event_waiting.load(std::memory_order_seq_cst))
+            [[unlikely]] {
+            front_event.Set();
+        }
         if (front_waiting.load(std::memory_order_seq_cst)) {
             if (FastWake::enabled) {
                 if (position_signal.Notify()) {
@@ -819,9 +836,13 @@ private:
         bool at_least;
         bool fenced;
         SemaphoreWriter writer;
+        u64 settle; ///< QueuedSemaphoreWrite::settle
     };
     /// The front's NoteSemaphoreWrite, by word address.
     std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
+    /// EDEN_NX2_SYNC_SUSPEND: QueuedSemaphoreWrite::settle of `write` to `word`, about to replace
+    /// what the front noted there; `lands_at_run`: the write itself lands as the back runs it.
+    [[nodiscard]] u64 SettleBefore(u64 word, const SemaphoreWrite& write, bool lands_at_run) const;
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
     /// NoteWrite placed, and the last placed write in each slot's granules.
@@ -920,6 +941,9 @@ private:
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
     FastWake::Signal position_signal;
+    /// EDEN_NX2_SYNC_SUSPEND: the front sleeps in WaitForPositionFor, bounded.
+    std::atomic<bool> front_event_waiting{};
+    Common::Event front_event;
     /// The back's position when it last ran out of work, stored before it waits: while
     /// it equals published_local, the back waits for the words the front holds (Commit). Port of
     /// the publish part of 62db242b34 (jpkto, PR #805).

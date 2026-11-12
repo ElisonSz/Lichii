@@ -19,6 +19,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_wake.h"
+#include "video_core/nx2_sync_suspend.h"
 
 // All accounting belongs to the front. The latch publishes its source in its existing atomic;
 // neither the back nor a fence callback touches these counters or takes an accounting lock.
@@ -318,8 +319,46 @@ inline void ReportFastWake() {
              take(counts.back_timeouts));
 }
 
+// EDEN_NX2_SYNC_SUSPEND: what the early suspensions did and the waiting left, every 10 s.
+inline void ReportSyncSuspend() {
+    namespace Suspension = SyncSuspend;
+    if (!Suspension::enabled) {
+        return;
+    }
+    static u32 calls{};
+    if (++calls % 64 != 0) {
+        return;
+    }
+    static auto last_report = Clock::now();
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last_report = now;
+    const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+    auto& counts = Suspension::counters;
+    const u64 idle_spans = Suspension::back.idle_spans.exchange(0, std::memory_order_relaxed);
+    const u64 idle_ns = Suspension::back.idle_ns.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(HW_GPU,
+             "Sync suspend{} {:.1f} s: {} acquires, {} wait for a fence-flagged release: {} "
+             "suspended early ({:.2f} ms until the back ran the release, {} ring words sent "
+             "meanwhile, {} met before, {} deviations), kept waiting {} (nothing else queued "
+             "{}, met {}, changed {}); settle waits {} {:.2f} ms; other positioned waits {} "
+             "{:.2f} ms; idle front waits {} {:.2f} ms ({} timed out); back idle {} spans "
+             "{:.2f} ms",
+             Suspension::relaxed ? " (relaxed)" : "", seconds, counts.acquires, counts.fenced,
+             counts.early, ms(counts.reached_ns), counts.reached_words, counts.unreached_resumes,
+             counts.deviations, counts.no_work + counts.met + counts.changed, counts.no_work,
+             counts.met, counts.changed, counts.settle_waits, ms(counts.settle_ns), counts.waits,
+             ms(counts.wait_ns), counts.idle_waits, ms(counts.idle_wait_ns),
+             counts.idle_timeouts, idle_spans, ms(idle_ns));
+    counts = {};
+}
+
 inline void Report() {
     ReportFastWake();
+    ReportSyncSuspend();
     if (!g_enabled) {
         return;
     }

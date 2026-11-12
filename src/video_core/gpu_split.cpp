@@ -432,6 +432,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         .at_least = at_least,
         .fenced = landing == Landing::Fenced,
         .writer = writer,
+        .settle = 0,
     };
     const u64 word = device_address & ~u64{3};
     if (const auto it = semaphore_writes.find(word);
@@ -442,6 +443,9 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.entry = it->second.entry;
         write.known = false;
         write.fenced = true;
+    }
+    if (SyncSuspend::enabled) [[unlikely]] {
+        write.settle = SettleBefore(word, write, landing == Landing::AtRun);
     }
     semaphore_writes.insert_or_assign(word, write);
     if (SemRecorder::Relevant(word)) {
@@ -500,7 +504,32 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
         return std::nullopt;
     }
     return QueuedSemaphoreWrite{it->second.payload, it->second.known,  it->second.at_least,
-                                it->second.fenced,  it->second.writer, it->second.position};
+                                it->second.fenced,  it->second.writer, it->second.position,
+                                it->second.settle};
+}
+
+u64 GpuSplit::SettleBefore(u64 word, const SemaphoreWrite& write, bool lands_at_run) const {
+    // Compute and copy work sent before may release the word without the front's knowing (QMD
+    // releases), and a write the front could not place may hit it (the measurement mode leaves
+    // out the former).
+    u64 settle = SyncSuspend::relaxed ? last_unplaced_write
+                                      : (std::max)(last_writer_position, last_unplaced_write);
+    if (lands_at_run) {
+        // The word holds it once the back ran it, also when it only counts as fenced because an
+        // earlier fenced write may still land after it.
+        settle = (std::max)(settle, write.position);
+    }
+    if (const auto it = semaphore_writes.find(word);
+        it != semaphore_writes.end() && !InMemory(it->second)) {
+        // The write it replaces: one landing at run changes the word once the back runs it, a
+        // fenced one once its fence ran (whenever that is), after what it followed.
+        const SemaphoreWrite& previous = it->second;
+        settle = (std::max)(settle, previous.settle);
+        if (!previous.fenced) {
+            settle = (std::max)(settle, previous.position);
+        }
+    }
+    return (std::min)(settle, write_position);
 }
 
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::SemaphoreWriteForStats(
@@ -510,8 +539,8 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::SemaphoreWriteForStats(
         return std::nullopt;
     }
     const auto& write = it->second;
-    return QueuedSemaphoreWrite{write.payload, write.known,  write.at_least,
-                                write.fenced,  write.writer, write.position};
+    return QueuedSemaphoreWrite{write.payload, write.known,  write.at_least, write.fenced,
+                                write.writer,  write.position, write.settle};
 }
 
 namespace {
@@ -670,6 +699,47 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         }
         Backoff(spins, target);
     }
+}
+
+bool GpuSplit::WaitForPositionFor(u64 position, std::chrono::nanoseconds limit) {
+    const u64 target = (std::min)(position, write_position);
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= target) {
+        return true;
+    }
+    // As WaitFor: the back stores its position as soon as it is past the target.
+    wait_target.store(target, std::memory_order_seq_cst);
+    Publish();
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    bool reached = false;
+    for (u32 spins = 0;; ++spins) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        if (consumed_cache >= target) {
+            reached = true;
+            break;
+        }
+        if (spins < 16384) {
+            Pause();
+            continue;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline || !back_running.load(std::memory_order_acquire)) {
+            break;
+        }
+        // The back stores `consumed` before it reads front_event_waiting (NotifyFront), the front
+        // sets that before it reads `consumed`: one sees the other, and the event stays set.
+        front_event_waiting.store(true, std::memory_order_seq_cst);
+        if (consumed.load(std::memory_order_seq_cst) < target) {
+            front_event.SleepFor(deadline - now);
+        }
+        front_event_waiting.store(false, std::memory_order_seq_cst);
+    }
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    if (reached) {
+        // The back may run out of what was sent before long.
+        publish_every = PublishAfterWait;
+    }
+    return reached;
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target) {
@@ -913,6 +983,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    // EDEN_NX2_SYNC_SUSPEND: when the current idle span began (none while the back has work).
+    std::optional<std::chrono::steady_clock::time_point> idle_since;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
         MaybeTick();
@@ -920,6 +992,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             if (SyncTrace::enabled) {
                 SyncTrace::IdleBegin();
+            }
+            if (SyncSuspend::enabled && !idle_since) [[unlikely]] {
+                idle_since = std::chrono::steady_clock::now();
             }
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front publishes what it holds after a few more words from now on.
@@ -996,6 +1071,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (SyncTrace::enabled) {
             SyncTrace::IdleEnd();
         }
+        if (idle_since) [[unlikely]] {
+            SyncSuspend::back.idle_spans.fetch_add(1, std::memory_order_relaxed);
+            SyncSuspend::back.idle_ns.fetch_add(
+                SyncSuspend::Nanoseconds(std::chrono::steady_clock::now() - *idle_since),
+                std::memory_order_relaxed);
+            idle_since.reset();
+        }
         if (profile_publishes) {
             back_idle_since.store(0, std::memory_order_relaxed);
         }
@@ -1049,6 +1131,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     back_running.store(false, std::memory_order_seq_cst);
     if (FastWake::enabled) {
         position_signal.Notify();
+    }
+    if (SyncSuspend::enabled) {
+        front_event.Set();
     }
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();

@@ -29,6 +29,7 @@
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_suspend.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -477,6 +478,8 @@ bool Puller::CanResumeAcquireImpl(DmaPusher& dma_pusher) {
     }
     VideoCommon::Count(stats.drained);
     VideoCommon::Count(device ? stats.drain_settings : stats.drain_word);
+    // The drain below runs the release's entry too.
+    pending_acquire->early_position.reset();
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
@@ -545,6 +548,7 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         acquire.writers_before = 0;
         acquire.sent_at = 0;
         acquire.flush_position.reset();
+        acquire.early_position.reset();
     }
     if (acquire.flush_position && split.Ran(*acquire.flush_position)) {
         acquire.flush_position.reset();
@@ -572,6 +576,9 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
                                     answer.kind == Kind::MetByQueued ? Details::Resume::Queued
                                                                      : Details::Resume::Memory);
             }
+            if (acquire.early_position && FencedWritePending(device)) [[unlikely]] {
+                ++VideoCommon::SyncSuspend::counters.deviations;
+            }
             return true;
         case Kind::Flush:
             RequestFlush<Track>(dma_pusher, acquire, device);
@@ -582,6 +589,17 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
             // the acquire (which latches the waiter) or the work before `position`, nothing the
             // front sees meets it.
             break;
+        }
+    }
+    if (acquire.early_position) [[unlikely]] {
+        // Suspended before the back ran the release's entry (EDEN_NX2_SYNC_SUSPEND), while the
+        // baseline still waited for it: until the back ran it the release cannot have landed,
+        // so its 1 ms valve starts from then, as from the baseline's suspension.
+        acquire.last_drain = std::chrono::steady_clock::now();
+        if (split.Ran(*acquire.early_position)) {
+            VideoCommon::SyncSuspend::NoteReached(acquire.early_since, acquire.early_sent,
+                                                  split.Position());
+            acquire.early_position.reset();
         }
     }
     // Work only a drain finishes (the back's idle hook submits what the host GPU writes) still
@@ -630,6 +648,17 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (pending_acquire->early_position) [[unlikely]] {
+            // Met before a poll saw the release's entry run (EDEN_NX2_SYNC_SUSPEND).
+            const auto& split = VideoCommon::GpuSplit::Get();
+            if (split.Ran(*pending_acquire->early_position)) {
+                VideoCommon::SyncSuspend::NoteReached(pending_acquire->early_since,
+                                                      pending_acquire->early_sent,
+                                                      split.Position());
+            } else {
+                ++VideoCommon::SyncSuspend::counters.unreached_resumes;
+            }
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -876,12 +905,22 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
         }
     }
     ViewAnswer answer = AskView(dma_pusher, acquire, *device);
+    bool waited = false;
+    if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+        ++VideoCommon::SyncSuspend::counters.acquires;
+        if (answer.kind == Kind::Unknown && answer.write_dependency &&
+            SuspendEarly<Track>(dma_pusher, acquire, *device, answer, waited, observed)) {
+            return true;
+        }
+    }
     // The value is in memory once the back ran that work, before what was sent after it. A
     // release the front can't value, then the writers before the acquire: two waits at most.
-    bool waited = false;
     for (u32 waits = 0; answer.kind == Kind::Unknown && waits < 2; ++waits) {
         VideoCommon::Count(stats.positioned);
         bool actually_waited;
+        const auto wait_begin = VideoCommon::SyncSuspend::enabled
+                                    ? VideoCommon::SyncSuspend::Clock::now()
+                                    : VideoCommon::SyncSuspend::Clock::time_point{};
         if constexpr (Track) {
             auto wait = observed->Begin(split, *device, answer.position, acquire.operation,
                                         answer.write_dependency);
@@ -890,6 +929,9 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
             observed->End(wait, begin, actually_waited);
         } else {
             actually_waited = split.WaitForPosition(answer.position, DrainSite::Acquire);
+        }
+        if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+            VideoCommon::SyncSuspend::NoteWait(wait_begin);
         }
         if (actually_waited) {
             VideoCommon::Count(stats.positioned_waited);
@@ -948,9 +990,14 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
         waiters.Remove(this);
         return true;
     }
+    Suspend(dma_pusher, acquire);
+    return true;
+}
+
+void Puller::Suspend(DmaPusher& dma_pusher, PendingAcquire& acquire) {
     // Suspended: a release the back runs latches the waiter, and the polls see the others in
     // memory or in the view (PollWithoutDrain).
-    VideoCommon::Count(stats.suspended);
+    VideoCommon::Count(VideoCommon::g_acquire_stats.suspended);
     if (VideoCommon::SyncTrace::enabled) {
         VideoCommon::SyncTrace::Suspend(this);
     }
@@ -959,6 +1006,91 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     pending_acquire = acquire;
     dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+}
+
+template <bool Track, typename Answer, typename Observation>
+bool Puller::SuspendEarly(DmaPusher& dma_pusher, PendingAcquire& acquire, u64 device,
+                          Answer& answer, bool& waited, Observation* observed) {
+    namespace Suspension = VideoCommon::SyncSuspend;
+    using Kind = ViewAnswer::Kind;
+    using Decision = Suspension::Decision;
+    auto& split = VideoCommon::GpuSplit::Get();
+    auto& counts = Suspension::counters;
+    // The fence-flagged release the view waits for, as long as that is what it waits for.
+    const auto release = [&]() -> std::optional<VideoCommon::GpuSplit::QueuedSemaphoreWrite> {
+        if (answer.kind != Kind::Unknown || !answer.write_dependency) {
+            return std::nullopt;
+        }
+        const auto queued = split.QueuedSemaphoreWriteAt(device);
+        if (!queued || !queued->fenced || queued->position != answer.position) {
+            return std::nullopt;
+        }
+        return queued;
+    };
+    // The verifier drains at each decision: it compares the baseline path only.
+    auto queued = VideoCommon::g_acquire_verify ? std::nullopt : release();
+    if (!queued) {
+        return false;
+    }
+    ++counts.fenced;
+    // After the wait, the baseline passes on a latch, or on the word in memory as the view reads
+    // it while the release is pending (a mirror shadow an older fence callback may still remove
+    // doesn't count: AskView). Anything else suspends unless the release lands during the wait.
+    const auto met = [&] {
+        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+            return true;
+        }
+        bool shadow_used = false;
+        const u32 value = ReadSemaphoreMemory(dma_pusher, acquire.address, device, &shadow_used);
+        return !shadow_used && acquire.Matches(value);
+    };
+    const auto decide = [&] {
+        return Suspension::Decide(
+            Suspension::WorkQueued(), [&] { return split.Ran(queued->settle); }, met);
+    };
+    Decision decision = decide();
+    if (decision == Decision::Settle) {
+        // Work sent before the release may still change the word as the back runs it: the
+        // baseline's wait passes it first, so wait for it here too, then ask again.
+        VideoCommon::Count(VideoCommon::g_acquire_stats.positioned);
+        const auto begin = Suspension::Clock::now();
+        const bool actually_waited =
+            split.WaitForPosition(queued->settle, VideoCommon::DrainSite::Acquire);
+        ++counts.settle_waits;
+        counts.settle_ns += Suspension::Nanoseconds(Suspension::Clock::now() - begin);
+        if (actually_waited) {
+            VideoCommon::Count(VideoCommon::g_acquire_stats.positioned_waited);
+        }
+        waited = waited || actually_waited;
+        answer = AskView(dma_pusher, acquire, device);
+        queued = release();
+        decision = queued ? decide() : Decision::Settle;
+        if (decision == Decision::Settle) {
+            ++counts.changed;
+            return false;
+        }
+    }
+    switch (decision) {
+    case Decision::NoWork:
+        ++counts.no_work;
+        return false;
+    case Decision::Met:
+        ++counts.met;
+        return false;
+    case Decision::Settle:
+        ++counts.changed;
+        return false;
+    case Decision::Suspend:
+        break;
+    }
+    acquire.early_position = answer.position;
+    acquire.early_since = Suspension::Clock::now();
+    acquire.early_sent = split.Position();
+    ++counts.early;
+    if constexpr (Track) {
+        observed->decision = Details::Decision::Suspended;
+    }
+    Suspend(dma_pusher, acquire);
     return true;
 }
 

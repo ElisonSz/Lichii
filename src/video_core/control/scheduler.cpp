@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
 
 namespace Tegra::Control {
@@ -48,6 +49,9 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
     channel_state->payload->dma_pusher.Push(std::move(entries));
+    if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+        NoteOtherPending(*channel_state);
+    }
     channel_state->payload->dma_pusher.DispatchCalls();
     if (channel_state->payload->dma_pusher.HasPendingAcquire() &&
         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
@@ -82,6 +86,9 @@ bool Scheduler::ResumePending(GPU& gpu) {
             const VideoCommon::SyncTrace::FrontScope sync_scope{
                 VideoCommon::SyncTrace::enabled ? &dma_pusher.puller : nullptr};
             BindChannel(gpu, state->bind_id);
+            if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
+                NoteOtherPending(*state);
+            }
             dma_pusher.DispatchCalls();
             progress = true;
             any_progress = true;
@@ -92,6 +99,25 @@ bool Scheduler::ResumePending(GPU& gpu) {
     });
     any_pending.store(!pending_channels.empty(), std::memory_order_release);
     return any_progress;
+}
+
+void Scheduler::NoteOtherPending(const ChannelState& channel) const {
+    u64 others = 0;
+    for (const auto& state : pending_channels) {
+        const bool other = state.get() != &channel;
+        others += (other && state->payload->dma_pusher.HasPendingAcquire()) ? 1 : 0;
+    }
+    VideoCommon::SyncSuspend::other_pending = others;
+}
+
+std::optional<u64> Scheduler::EarlyWaitPosition() const {
+    std::optional<u64> earliest;
+    for (const auto& state : pending_channels) {
+        if (const auto position = state->payload->dma_pusher.puller.EarlyPosition()) {
+            earliest = earliest ? (std::min)(*earliest, *position) : *position;
+        }
+    }
+    return earliest;
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

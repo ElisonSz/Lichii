@@ -29,6 +29,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_null/renderer_null.h"
@@ -75,6 +76,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
                Core::System& system) {
     Settings::UpdateRescalingInfo();
     VideoCommon::FastWake::ReadSwitch();
+    VideoCommon::SyncSuspend::ReadSwitch();
     VideoCommon::SyncTrace::ReadSwitch();
     VideoCommon::StreamStats::ReadSwitch();
     VideoCommon::WaitStats::ReadSwitch();

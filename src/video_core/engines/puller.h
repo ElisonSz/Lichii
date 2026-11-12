@@ -99,6 +99,11 @@ public:
         bool met{};
         bool stats_flushed{}; ///< EDEN_NX2_ACQUIRE_STATS: a cache flush was requested
         bool stats_resumed{}; ///< The scheduler may ask again before clearing this acquire
+        /// EDEN_NX2_SYNC_SUSPEND: suspended before the back ran the entry of the fence-flagged
+        /// release it waits for, which ends at this position; cleared once a poll sees it ran.
+        std::optional<u64> early_position{};
+        std::chrono::steady_clock::time_point early_since{}; ///< When it was suspended so
+        u64 early_sent{}; ///< GpuSplit::Position then
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
@@ -107,6 +112,11 @@ public:
 
     [[nodiscard]] bool HasPendingAcquire() const {
         return pending_acquire.has_value();
+    }
+    /// EDEN_NX2_SYNC_SUSPEND: the ring position the back has to reach before the pending acquire
+    /// can be decided, if it was suspended before that (PendingAcquire::early_position).
+    [[nodiscard]] std::optional<u64> EarlyPosition() const {
+        return pending_acquire ? pending_acquire->early_position : std::nullopt;
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
@@ -176,6 +186,15 @@ private:
     /// suspends the channel on it. False when the view doesn't apply (drain as before).
     template <bool Track, typename Observation>
     bool AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire, Observation* observed);
+    /// EDEN_NX2_SYNC_SUSPEND: for an acquire whose view `answer` is a wait for the entry of a
+    /// fence-flagged release, suspends it before the back gets there where the baseline may
+    /// suspend it after that wait; may first wait for the work sent before the release (then
+    /// `answer` is asked again, and `waited` set). True when it suspended the acquire.
+    template <bool Track, typename Answer, typename Observation>
+    bool SuspendEarly(DmaPusher& dma_pusher, PendingAcquire& acquire, u64 device, Answer& answer,
+                      bool& waited, Observation* observed);
+    /// Suspends the channel on `acquire` (the view's path).
+    void Suspend(DmaPusher& dma_pusher, PendingAcquire& acquire);
     /// CanResumeAcquire for an acquire the view decides, at `device`.
     template <bool Track>
     bool PollWithoutDrain(DmaPusher& dma_pusher, u64 device);
