@@ -16,6 +16,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/ocarina_upscale.h"
@@ -259,6 +260,18 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// A dynamic vertex input state: what vkCmdSetVertexInputEXT is given.
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
+    /// registers VideoCommon::VertexInputKey holds).
+    void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                          u32 max_bindings, VertexInputState& state);
+    /// EDEN_NX2_DRAW_VERTEX_INPUT: states built before, by their registers.
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
+
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
     bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
@@ -454,8 +467,17 @@ private:
         Count,
     };
     enum class DrawPath : u8 { Full, Delta, Count };
+    /// EDEN_NX2_DRAW_REUSE: how candidates' handles were found to hold (DeltaStillHolds).
+    enum class ReuseCheck : u8 { Untouched, Reevaluated, Changed, BackedOff, Count };
     struct FastDrawStats {
         u64 delta{};
+        std::array<u64, static_cast<size_t>(ReuseCheck::Count)> reuse{};
+        /// EDEN_NX2_DRAW_VERTEX_INPUT: states recorded from the cache and built.
+        u64 vertex_input_hits{};
+        u64 vertex_input_misses{};
+        /// EDEN_NX2_DRAW_REUSE: full resolves whose delta candidate failed its checks.
+        u64 candidate_full_ns{};
+        u64 candidate_full_draws{};
         std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
         std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
         /// PrepareDraw time and draws per path.
@@ -489,11 +511,23 @@ private:
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial, bool matching = false);
+    /// EDEN_NX2_DRAW_REUSE: whether a constant buffer bind or data written since the previous draw
+    /// (taken_delta) reaches what the pipeline's handles are computed from.
+    bool DeltaHandleInputsReached(const GraphicsPipeline& pipeline);
+    /// EDEN_NX2_DRAW_REUSE: whether a write the caches were told about since the previous draw
+    /// reaches the texture or sampler header tables (or such writes were lost).
+    bool NotedWritesReachHeaders();
+    /// Device memory of the header tables NotedWritesReachHeaders checks.
+    VideoCommon::Nx2FastDraw::DeviceSpans header_spans;
+    VideoCommon::Nx2FastDraw::DeviceSpans sampler_spans;
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial, u64 match_serial);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// EDEN_NX2_DRAW_REUSE: the pipeline TakeReusableDraw looked up for a vertex layout change,
+    /// which PrepareDraw takes instead of looking it up again (null: none).
+    GraphicsPipeline* prelooked_pipeline{};
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>

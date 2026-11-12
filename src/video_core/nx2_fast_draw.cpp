@@ -2,12 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 
+#include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_fast_draw.h"
 
 namespace VideoCommon::Nx2FastDraw {
+
+void ReadDrawReuseSwitches() {
+    const auto on = [](const char* name) {
+        const char* const value = std::getenv(name);
+        return value != nullptr && value[0] == '1';
+    };
+    g_draw_reuse = on("EDEN_NX2_DRAW_REUSE");
+    g_draw_reuse_verify = g_draw_reuse && on("EDEN_NX2_DRAW_REUSE_VERIFY");
+    if (g_draw_reuse) {
+        g_draw_delta = true;
+        g_draw_delta_verify = g_draw_delta_verify || g_draw_reuse_verify;
+    }
+    g_draw_vertex_input = on("EDEN_NX2_DRAW_VERTEX_INPUT");
+    g_draw_handle_eval = on("EDEN_NX2_DRAW_HANDLE_EVAL");
+    Shader::g_lean_handle_programs = g_draw_handle_eval;
+}
 
 u32 ClassifyBreak(Reason reason, u32 method) {
     using Maxwell3D = Tegra::Engines::Maxwell3D;

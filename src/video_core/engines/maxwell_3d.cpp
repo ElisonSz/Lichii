@@ -416,6 +416,14 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
         !(VideoCommon::Nx2FastDraw::Enabled() && query_method && NoteFastDrawState(method))) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+    } else if (VideoCommon::Nx2FastDraw::g_draw_reuse && query_method &&
+               method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        // EDEN_NX2_DRAW_REUSE: the report writes its value (and timestamp) at the report address
+        // now; results that land later come with a fence release, which ends the delta chain.
+        // Count the bytes as data written since the previous draw, as constant buffer data.
+        constexpr u64 ReportBytes = 16;
+        const GPUVAddr address = regs.report_semaphore.Address();
+        NoteFastDrawConstantData(address, address + ReportBytes);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);

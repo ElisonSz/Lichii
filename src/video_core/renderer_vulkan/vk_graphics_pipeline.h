@@ -366,6 +366,22 @@ public:
     /// Reevaluate handles (including storage-backed programs), then compare TIC/TSC contents.
     [[nodiscard]] VideoCommon::DrawDeltaTextureResult CheckDrawDeltaTextures();
 
+    /// EDEN_NX2_DRAW_REUSE: what the handles of the stages are computed from (constant buffer
+    /// slots, storage bindings), and the stages the last captured Configure resolved.
+    [[nodiscard]] const VideoCommon::DrawHandleInputs& DeltaHandleInputs() const noexcept {
+        return delta_handle_inputs;
+    }
+    [[nodiscard]] const std::array<bool, NUM_STAGES>& ConfiguredStages() const noexcept {
+        return configured_stages;
+    }
+
+    /// EDEN_NX2_DRAW_REUSE: evaluates the handles again (as Configure does) and compares them with
+    /// the ones the last captured Configure resolved; texture and sampler headers are not read
+    /// (the delta chain breaks on anything that writes them). BackedOff: the pipeline's recent
+    /// checks kept failing, so this one was skipped (DeltaCheckBackoff).
+    enum class DeltaHandleCheck : u8 { Held, Changed, BackedOff };
+    [[nodiscard]] DeltaHandleCheck CheckDeltaHandles();
+
     /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
@@ -385,6 +401,10 @@ private:
     bool ConfigureImpl(bool is_indexed);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
+
+    /// The handles of the configured stages from current memory, in Configure's order, into
+    /// draw_delta_handles.
+    void EvaluateDeltaHandles();
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -439,6 +459,12 @@ private:
     VideoCommon::DrawDeltaTextures<Tegra::Texture::TICEntry, Tegra::Texture::TSCEntry>
         draw_delta_textures;
     std::vector<std::pair<u32, u32>> draw_delta_handles;
+    /// EDEN_NX2_DRAW_REUSE: the handles the last captured Configure resolved, what they are
+    /// computed from, and the back-off for pipelines whose handles keep changing.
+    std::vector<std::pair<u32, u32>> delta_handles;
+    bool delta_handles_valid{};
+    VideoCommon::DrawHandleInputs delta_handle_inputs;
+    VideoCommon::DeltaCheckBackoff delta_check_backoff;
     bool capture_delta{};
     bool verify_delta{};
     bool delta_mismatch{};

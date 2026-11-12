@@ -559,6 +559,23 @@ GraphicsPipeline::GraphicsPipeline(
             }
             handles |= 1U << desc.cbuf_index;
         }
+        if (VideoCommon::Nx2FastDraw::g_draw_reuse) {
+            auto& inputs = delta_handle_inputs;
+            inputs.cbufs[stage] = handles & ((1U << VideoCommon::DrawHandleInputs::NumCbufs) - 1);
+            const auto add_programs = [&](const auto& descriptors) {
+                for (const auto& desc : descriptors) {
+                    // A program index past the list evaluates to no handle, reading nothing.
+                    if (desc.handle_program < info.handle_programs.size()) {
+                        inputs.AddProgram(stage, info.handle_programs[desc.handle_program],
+                                          info.storage_buffers_descriptors);
+                    }
+                }
+            };
+            add_programs(info.texture_buffer_descriptors);
+            add_programs(info.image_buffer_descriptors);
+            add_programs(info.texture_descriptors);
+            add_programs(info.image_descriptors);
+        }
     }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
@@ -1081,7 +1098,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
         configured_stages = Spec::enabled_stages;
-        if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+        if (VideoCommon::Nx2FastDraw::g_draw_reuse) {
+            // The handles alone: the chain breaks on anything that writes the headers.
+            std::swap(delta_handles, draw_delta_handles);
+            delta_handles_valid = true;
+        } else if (VideoCommon::Nx2FastDraw::g_draw_delta) {
             texture_cache.CaptureDrawDeltaTextures(draw_delta_textures, draw_delta_handles);
         }
         delta_views_valid = true;
@@ -1283,6 +1304,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 }
 
 VideoCommon::DrawDeltaTextureResult GraphicsPipeline::CheckDrawDeltaTextures() {
+    EvaluateDeltaHandles();
+    return texture_cache.MatchDrawDeltaTextures(draw_delta_textures, draw_delta_handles);
+}
+
+GraphicsPipeline::DeltaHandleCheck GraphicsPipeline::CheckDeltaHandles() {
+    if (!delta_handles_valid) {
+        return DeltaHandleCheck::Changed;
+    }
+    if (!delta_check_backoff.ShouldTry()) {
+        return DeltaHandleCheck::BackedOff;
+    }
+    EvaluateDeltaHandles();
+    const bool held = draw_delta_handles == delta_handles;
+    delta_check_backoff.Note(held);
+    return held ? DeltaHandleCheck::Held : DeltaHandleCheck::Changed;
+}
+
+void GraphicsPipeline::EvaluateDeltaHandles() {
     draw_delta_handles.clear();
     const bool via_header =
         maxwell3d->regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
@@ -1329,7 +1368,6 @@ VideoCommon::DrawDeltaTextureResult GraphicsPipeline::CheckDrawDeltaTextures() {
         append(info.texture_descriptors, true);
         append(info.image_descriptors, false);
     }
-    return texture_cache.MatchDrawDeltaTextures(draw_delta_textures, draw_delta_handles);
 }
 
 bool GraphicsPipeline::DeltaImagesChange() const noexcept {

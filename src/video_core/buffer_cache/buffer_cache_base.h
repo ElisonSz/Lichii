@@ -527,6 +527,27 @@ public:
     /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
     [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
+    /// EDEN_NX2_DRAW_REUSE: the GPU and device range graphics storage binding `index` of `stage`
+    /// was last bound to (aligned down as bound), or nothing when it isn't one range there.
+    struct StorageRange {
+        GPUVAddr gpu_begin{};
+        GPUVAddr gpu_end{};
+        DAddr device_begin{};
+        DAddr device_end{};
+    };
+    [[nodiscard]] std::optional<StorageRange> GraphicsStorageRange(size_t stage,
+                                                                   u32 index) const noexcept;
+
+    /// EDEN_NX2_DRAW_REUSE: the device ranges the caches were told were written (CPU writes,
+    /// copies, GPU writes; NoteUniformWrite) since the previous draw began preparing, and whether
+    /// more were written than the list holds.
+    [[nodiscard]] std::span<const std::pair<DAddr, DAddr>> NotedWrites() const noexcept {
+        return {uniform_keep.memory_writes.data(), uniform_keep.memory_writes.size()};
+    }
+    [[nodiscard]] bool NotedWritesLost() const noexcept {
+        return uniform_keep.memory_writes_lost;
+    }
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {

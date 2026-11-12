@@ -76,6 +76,22 @@ inline void ReadDrawDeltaSwitch() {
     g_draw_delta_verify = g_draw_delta && verify != nullptr && verify[0] == '1';
 }
 
+/// EDEN_NX2_DRAW_REUSE=1: the delta draws EDEN_NX2_DRAW_DELTA takes (it turns that switch on),
+/// checked without reading guest memory unless data written since the previous draw reaches the
+/// pipeline's handle inputs (RasterizerVulkan::DeltaHandleInputsReached), and then by the
+/// handles alone; report targets count as data written, which keeps uniform keeps valid across
+/// reports. EDEN_NX2_DRAW_REUSE_VERIFY=1 prepares those draws in full and compares (diagnostic).
+inline bool g_draw_reuse{};
+inline bool g_draw_reuse_verify{};
+/// EDEN_NX2_DRAW_VERTEX_INPUT=1: dynamic vertex input states are kept by the registers they are
+/// built from (VideoCommon::VertexInputCache) and recorded by reference.
+inline bool g_draw_vertex_input{};
+/// EDEN_NX2_DRAW_HANDLE_EVAL=1: handle programs run without zeroing their stack and slots
+/// (Shader::g_lean_handle_programs).
+inline bool g_draw_handle_eval{};
+/// Reads the four switches above; called by VideoCore::CreateGPU after ReadDrawDeltaSwitch.
+void ReadDrawReuseSwitches();
+
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
 [[nodiscard]] inline bool Enabled() {

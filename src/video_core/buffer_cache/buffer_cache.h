@@ -1692,6 +1692,26 @@ u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool tex
 }
 
 template <class P>
+auto BufferCache<P>::GraphicsStorageRange(size_t stage, u32 index) const noexcept
+    -> std::optional<StorageRange> {
+    if (stage >= NUM_STAGES || index >= NUM_STORAGE_BUFFERS ||
+        ((channel_state->enabled_storage_buffers[stage] >> index) & 1) == 0) {
+        return std::nullopt;
+    }
+    const Binding& binding = channel_state->storage_buffers[stage][index];
+    // Unbound, or split over several device ranges (multi-range storage).
+    if (binding.size == 0 || binding.device_addr == 0 || binding.segment_count != 0) {
+        return std::nullopt;
+    }
+    return StorageRange{
+        .gpu_begin = binding.gpu_addr,
+        .gpu_end = binding.gpu_addr + binding.size,
+        .device_begin = binding.device_addr,
+        .device_end = binding.device_addr + binding.size,
+    };
+}
+
+template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (is_indexed) {
         BindHostIndexBuffer();

@@ -433,6 +433,12 @@ enum class HandleOp : u32 {
     Index,  ///< the element of the descriptor array being computed (see TextureDescriptor)
 };
 
+/// EDEN_NX2_DRAW_HANDLE_EVAL=1 (set by VideoCore::CreateGPU): EvaluateHandleProgram leaves its
+/// stack and slots unzeroed. Nothing reads an element it has not written (the stack below its
+/// size, a slot once `initialized`), so the results are the same; zeroing the 2.5 KiB was 30 % of
+/// an evaluation (shader_info.h:447 in the test-33 profile).
+inline bool g_lean_handle_programs{};
+
 /// Runs a handle program; read_cbuf(index, offset) and read_storage(binding, offset) return the
 /// words it reads, and element is the descriptor array element computed (HandleOp::Index).
 /// Returns nothing for a malformed program.
@@ -440,11 +446,15 @@ template <typename ReadCbuf, typename ReadStorage>
 std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
                                          ReadStorage&& read_storage, u32 element = 0) {
     struct Entry {
-        u32 value{};
-        bool failed{};
+        u32 value;
+        bool failed;
     };
-    std::array<Entry, 64> stack{};
-    std::array<Entry, 256> slots{};
+    std::array<Entry, 64> stack;
+    std::array<Entry, 256> slots;
+    if (!g_lean_handle_programs) {
+        stack.fill(Entry{});
+        slots.fill(Entry{});
+    }
     std::array<bool, 256> initialized{};
     size_t size = 0;
     bool valid = true;
