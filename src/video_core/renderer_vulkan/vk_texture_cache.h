@@ -106,6 +106,7 @@ public:
         u64 misses{};
         u64 kept{};
         u64 refused{};
+        u64 evicted{};
         u64 expired{};
         u64 released{};
     };
@@ -113,15 +114,23 @@ public:
     /// A kept image made as `key` that the GPU no longer uses, or none.
     [[nodiscard]] vk::Image Take(const Key& key, const Scheduler& scheduler);
 
-    /// Keeps `image`, whose last commands were recorded by `tick`, while the pool holds less
-    /// than `limit` bytes. Leaves it to its owner otherwise.
+    /// Keeps `image`, whose last commands were recorded by `tick`. A pool holding `limit` bytes
+    /// makes room by destroying the images that waited longest; `image` is left to its owner
+    /// if nothing here waited longer than it, or it is too large to keep.
     void Keep(const Key& key, vk::Image& image, u64 tick, u64 limit);
 
-    /// Once a frame: images nothing asked for in MaxUnusedFrames frames are destroyed.
+    /// Once a frame: images nothing asked for in MaxUnusedFrames frames are destroyed, at most
+    /// MaxExpiredBytes of them a frame.
     void Tick();
 
-    /// Destroys every kept image: the device needs the memory.
+    /// Destroys every kept image: an image did not fit in the device's memory.
     void Release();
+
+    /// TEST (EDEN_NX2_MEM_TRACE): count per shape, and log the busiest ones.
+    void SetTrace(bool enabled) noexcept {
+        trace = enabled;
+    }
+    void ReportShapes();
 
     [[nodiscard]] u64 Bytes() const noexcept {
         return bytes;
@@ -134,7 +143,8 @@ public:
     }
 
 private:
-    static constexpr u32 MaxUnusedFrames = 60;
+    static constexpr u32 MaxUnusedFrames = 30;
+    static constexpr u64 MaxExpiredBytes = u64{64} << 20;
     static constexpr size_t MaxImages = 2048;
 
     struct Entry {
@@ -147,10 +157,19 @@ private:
         [[nodiscard]] size_t operator()(const Key& key) const noexcept;
     };
 
-    std::unordered_map<Key, std::vector<Entry>, KeyHash> images;
+    struct ShapeStats {
+        u64 hits{};
+        u64 misses{};
+        u64 kept{};
+        u64 refused{};
+    };
+
+    std::unordered_map<Key, std::vector<Entry>, KeyHash> images; ///< Longest wait first
     u64 bytes{};
     size_t count{};
     Stats stats;
+    bool trace{};
+    std::unordered_map<Key, ShapeStats, KeyHash> shape_stats;
 };
 
 class TextureCacheRuntime {

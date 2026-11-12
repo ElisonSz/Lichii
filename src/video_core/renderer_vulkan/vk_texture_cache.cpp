@@ -3091,17 +3091,23 @@ size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
 }
 
 vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
+    ShapeStats* const shape = trace ? &shape_stats[key] : nullptr;
+    const auto miss = [&] {
+        ++stats.misses;
+        if (shape != nullptr) {
+            ++shape->misses;
+        }
+        return vk::Image{};
+    };
     const auto found = images.find(key);
     if (found == images.end()) {
-        ++stats.misses;
-        return vk::Image{};
+        return miss();
     }
     std::vector<Entry>& list = found->second;
     const auto entry = std::ranges::find_if(
         list, [&scheduler](const Entry& kept) { return scheduler.IsFree(kept.tick); });
     if (entry == list.end()) {
-        ++stats.misses;
-        return vk::Image{};
+        return miss();
     }
     vk::Image image = std::move(entry->image);
     bytes -= entry->bytes;
@@ -3111,14 +3117,47 @@ vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
         images.erase(found);
     }
     ++stats.hits;
+    if (shape != nullptr) {
+        ++shape->hits;
+    }
     return image;
 }
 
 void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) {
-    const u64 size = image.GetMemoryBlock().size;
-    if (size == 0 || bytes + size > limit || count >= MaxImages) {
+    ShapeStats* const shape = trace ? &shape_stats[key] : nullptr;
+    const auto refuse = [&] {
         ++stats.refused;
+        if (shape != nullptr) {
+            ++shape->refused;
+        }
+    };
+    const u64 size = image.GetMemoryBlock().size;
+    if (size == 0 || size > limit / 4) {
+        refuse();
         return;
+    }
+    while (bytes + size > limit || count >= MaxImages) {
+        // Full: the image that waited longest makes room. What a game asks for again it asks
+        // for within a frame or two, so that one is the least likely to be wanted.
+        auto longest = images.end();
+        for (auto list = images.begin(); list != images.end(); ++list) {
+            if (longest == images.end() || list->second.front().unused_frames >
+                                               longest->second.front().unused_frames) {
+                longest = list;
+            }
+        }
+        if (longest == images.end() || longest->second.front().unused_frames == 0) {
+            refuse();
+            return;
+        }
+        std::vector<Entry>& list = longest->second;
+        bytes -= list.front().bytes;
+        --count;
+        ++stats.evicted;
+        list.erase(list.begin());
+        if (list.empty()) {
+            images.erase(longest);
+        }
     }
     images[key].push_back(Entry{
         .image = std::move(image),
@@ -3129,14 +3168,20 @@ void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) 
     bytes += size;
     ++count;
     ++stats.kept;
+    if (shape != nullptr) {
+        ++shape->kept;
+    }
 }
 
 void HostImagePool::Tick() {
+    // Freeing much at once empties whole memory blocks, and the driver reports those late.
+    u64 budget = MaxExpiredBytes;
     for (auto list = images.begin(); list != images.end();) {
-        std::erase_if(list->second, [this](Entry& entry) {
-            if (++entry.unused_frames <= MaxUnusedFrames) {
+        std::erase_if(list->second, [&](Entry& entry) {
+            if (++entry.unused_frames <= MaxUnusedFrames || budget == 0) {
                 return false;
             }
+            budget -= (std::min)(budget, entry.bytes);
             bytes -= entry.bytes;
             --count;
             ++stats.expired;
@@ -3151,6 +3196,60 @@ void HostImagePool::Release() {
     images.clear();
     bytes = 0;
     count = 0;
+}
+
+void HostImagePool::ReportShapes() {
+    struct Row {
+        Key key;
+        ShapeStats shape;
+        size_t held;
+        u64 held_bytes;
+    };
+    std::vector<Row> rows;
+    rows.reserve(shape_stats.size() + images.size());
+    for (const auto& counted : shape_stats) {
+        rows.push_back(Row{counted.first, counted.second, 0, 0});
+    }
+    for (const auto& held : images) {
+        const Key& key = held.first;
+        auto row =
+            std::ranges::find_if(rows, [&key](const Row& known) { return known.key == key; });
+        if (row == rows.end()) {
+            rows.push_back(Row{key, ShapeStats{}, 0, 0});
+            row = std::prev(rows.end());
+        }
+        row->held = held.second.size();
+        for (const Entry& entry : held.second) {
+            row->held_bytes += entry.bytes;
+        }
+    }
+    shape_stats.clear();
+    // The shapes asked for most, then the ones that hold the most memory unasked.
+    std::ranges::sort(rows, [](const Row& left, const Row& right) {
+        const u64 left_asked = left.shape.hits + left.shape.misses;
+        const u64 right_asked = right.shape.hits + right.shape.misses;
+        return left_asked != right_asked ? left_asked > right_asked
+                                         : left.held_bytes > right.held_bytes;
+    });
+    size_t listed{};
+    size_t unasked{};
+    for (const Row& row : rows) {
+        const bool asked = row.shape.hits + row.shape.misses != 0;
+        if (asked ? listed >= 14 : unasked >= 6) {
+            continue;
+        }
+        ++(asked ? listed : unasked);
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: pool shape format {} {}x{}x{} levels {} layers {} samples {} "
+                 "usage {:#x} flags {:#x} views {}@{}: hits {} misses {} kept {} refused {}; "
+                 "holds {} images {} MiB",
+                 static_cast<u32>(row.key.format), row.key.width, row.key.height, row.key.depth,
+                 row.key.levels, row.key.layers, static_cast<u32>(row.key.samples),
+                 static_cast<u32>(row.key.usage), static_cast<u32>(row.key.flags),
+                 row.key.view_format_count, fmt::ptr(row.key.view_formats), row.shape.hits,
+                 row.shape.misses, row.shape.kept, row.shape.refused, row.held,
+                 row.held_bytes >> 20);
+    }
 }
 
 vk::Image TextureCacheRuntime::TakeHostImage(const HostImagePool::Key& key) {
@@ -3215,6 +3314,7 @@ void TextureCacheRuntime::TickFrame() {
     });
     host_image_pool.Tick();
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    host_image_pool.SetTrace(mem_trace);
     if (const auto now = std::chrono::steady_clock::now();
         mem_trace && now - host_object_report >= std::chrono::seconds{2}) {
         host_object_report = now;
@@ -3222,13 +3322,14 @@ void TextureCacheRuntime::TickFrame() {
         const HostImagePool::Stats pool = host_image_pool.TakeStats();
         LOG_INFO(Render_Vulkan,
                  "Memory trace: host images made {} in {} us, views {} in {} us, framebuffers {} "
-                 "in {} us; image pool {}: hits {} misses {} kept {} refused {} expired {} "
-                 "released {}; holds {} images, {} MiB",
+                 "in {} us; image pool {}: hits {} misses {} kept {} refused {} evicted {} "
+                 "expired {} released {}; holds {} images, {} MiB",
                  made.images, made.image_ns / 1000, made.views, made.view_ns / 1000,
                  made.framebuffers, made.framebuffer_ns / 1000,
                  VideoCommon::StaleTargets::pool_images, pool.hits, pool.misses, pool.kept,
-                 pool.refused, pool.expired, pool.released, host_image_pool.Count(),
+                 pool.refused, pool.evicted, pool.expired, pool.released, host_image_pool.Count(),
                  host_image_pool.Bytes() >> 20);
+        host_image_pool.ReportShapes();
     }
 }
 

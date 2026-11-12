@@ -859,14 +859,6 @@ void TextureCache<P>::TickFrame() {
             }
         }
     }
-    if constexpr (requires { runtime.ReleaseHostImagePool(); }) {
-        // Host images kept for reuse are not counted as used. The cache sits at its expected
-        // threshold for as long as it has aged images to drop, so that is no reason to give
-        // them up: the critical threshold, or an image that did not fit, is.
-        if (out_of_memory || total_used_memory >= critical_memory) {
-            runtime.ReleaseHostImagePool();
-        }
-    }
     RetireStaleTargets();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
