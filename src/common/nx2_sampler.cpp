@@ -345,6 +345,46 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::fclose(out);
     }
+
+    // <out>.addr: the same stacks with module+offset frames, root first. Names from public
+    // symbols alone can be wrong (internal functions take the name before them); these frames
+    // symbolize offline with inlined functions and lines (llvm-symbolizer --relative-address,
+    // one byte back for a return address).
+    std::unordered_map<DWORD64, std::string> module_offsets;
+    const auto module_offset = [&module_offsets](DWORD64 frame) -> const std::string& {
+        const auto [entry, is_new] = module_offsets.try_emplace(frame);
+        if (is_new) {
+            HMODULE module_handle{};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(frame), &module_handle)) {
+                char module_path[MAX_PATH] = "?";
+                GetModuleFileNameA(module_handle, module_path, sizeof(module_path));
+                const char* const module_name = std::strrchr(module_path, '\\');
+                entry->second =
+                    fmt::format("{}+{:#x}", module_name != nullptr ? module_name + 1 : module_path,
+                                frame - reinterpret_cast<DWORD64>(module_handle));
+            } else {
+                entry->second = fmt::format("jit+{:#x}", frame);
+            }
+        }
+        return entry->second;
+    };
+    std::map<std::string, unsigned> folded_addresses;
+    for (const Sample& sample : samples) {
+        std::string line = targets[sample.thread].name;
+        for (unsigned i = sample.depth; i-- > 0;) {
+            line += ';';
+            line += module_offset(sample.frames[i]);
+        }
+        ++folded_addresses[line];
+    }
+    if (std::FILE* const addr_file = std::fopen((std::string{path} + ".addr").c_str(), "w")) {
+        for (const auto& [line, count] : folded_addresses) {
+            std::fprintf(addr_file, "%s %u\n", line.c_str(), count);
+        }
+        std::fclose(addr_file);
+    }
     return text;
 }
 
