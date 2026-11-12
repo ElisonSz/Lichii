@@ -1614,6 +1614,16 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
         return;
     }
+    if constexpr (!IS_OPENGL) {
+        if (Nx2FastDraw::g_draw_delta) {
+            const Binding& current = channel_state->uniform_buffers[stage][index];
+            if (current.device_addr == *device_addr && current.size == size) {
+                // Keep the resolved ID on an identical bind. Contents are still synchronized or
+                // compared by BindHostGraphicsUniformBuffer, and deletions clear IDs normally.
+                return;
+            }
+        }
+    }
     const Binding binding{
         .device_addr = *device_addr,
         .size = size,

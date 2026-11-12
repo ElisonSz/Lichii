@@ -14,12 +14,14 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/evicted_pointer_slots.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/evicted_pointer_slots.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/graphics_stage_info.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
@@ -361,6 +363,9 @@ public:
         return delta_mismatch;
     }
 
+    /// Reevaluate handles (including storage-backed programs), then compare TIC/TSC contents.
+    [[nodiscard]] VideoCommon::DrawDeltaTextureResult CheckDrawDeltaTextures();
+
     /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
@@ -431,6 +436,9 @@ private:
 
     DeltaBlocker delta_blocker{};
     bool delta_views_valid{};
+    VideoCommon::DrawDeltaTextures<Tegra::Texture::TICEntry, Tegra::Texture::TSCEntry>
+        draw_delta_textures;
+    std::vector<std::pair<u32, u32>> draw_delta_handles;
     bool capture_delta{};
     bool verify_delta{};
     bool delta_mismatch{};

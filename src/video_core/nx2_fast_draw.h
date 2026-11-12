@@ -66,6 +66,16 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
 
 inline std::atomic<bool> g_enabled{true};
 
+/// Initialized at GPU creation, before command processing starts. Hot switches are plain flags.
+inline bool g_draw_delta{};
+inline bool g_draw_delta_verify{};
+inline void ReadDrawDeltaSwitch() {
+    const char* const enabled = std::getenv("EDEN_NX2_DRAW_DELTA");
+    const char* const verify = std::getenv("EDEN_NX2_DRAW_DELTA_VERIFY");
+    g_draw_delta = enabled != nullptr && enabled[0] == '1';
+    g_draw_delta_verify = g_draw_delta && verify != nullptr && verify[0] == '1';
+}
+
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
 [[nodiscard]] inline bool Enabled() {

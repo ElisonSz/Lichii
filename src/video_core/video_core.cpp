@@ -92,6 +92,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::GpuSplit::ReadTickSwitch();
     VideoCommon::ReadUniformStreamReuseSwitch();
     VideoCommon::Nx2FastDraw::ReadDrawCostStatsSwitch();
+    VideoCommon::Nx2FastDraw::ReadDrawDeltaSwitch();
     VideoCommon::StaleTargets::ReadSwitch();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();

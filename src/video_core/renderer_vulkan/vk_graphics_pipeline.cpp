@@ -69,6 +69,36 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
+template <typename Descriptor, typename Cbufs>
+std::pair<u32, u32> ReadDrawTextureHandle(const GraphicsStageInfo& info, const Descriptor& desc,
+                                          u32 element, Tegra::MemoryManager& memory,
+                                          const Cbufs& cbufs, u64 alignment, bool via_header) {
+    const auto address = [&](u32 slot) -> GPUVAddr {
+        return slot < cbufs.size() && cbufs[slot].enabled ? cbufs[slot].address : GPUVAddr{};
+    };
+    if (desc.handle_program != ~0U) {
+        return VideoCommon::TexturePairOrNull(
+            VideoCommon::EvaluateTextureHandle(info, desc.handle_program, memory, address,
+                                               alignment, element),
+            via_header);
+    }
+    ASSERT(cbufs[desc.cbuf_index].enabled);
+    const u32 offset = desc.cbuf_offset + (element << desc.size_shift);
+    const GPUVAddr first = cbufs[desc.cbuf_index].address + offset;
+    if constexpr (std::is_same_v<Descriptor, Shader::TextureDescriptor> ||
+                  std::is_same_v<Descriptor, Shader::TextureBufferDescriptor>) {
+        if (desc.has_secondary) {
+            ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
+            const GPUVAddr second =
+                cbufs[desc.secondary_cbuf_index].address + desc.secondary_cbuf_offset;
+            return TexturePair((memory.Read<u32>(first) << desc.shift_left) |
+                                   (memory.Read<u32>(second) << desc.secondary_shift_left),
+                               via_header);
+        }
+    }
+    return TexturePair(memory.Read<u32>(first), via_header);
+}
+
 // The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
 VkShaderStageFlagBits StageFlag(const GraphicsStageInfo& info, VkShaderStageFlagBits slot_stage) {
     if (info.is_task) {
@@ -500,7 +530,7 @@ GraphicsPipeline::GraphicsPipeline(
         const GraphicsStageInfo& info = *stage_infos[stage];
         u32& handles = handle_constant_buffers[stage];
         for (const auto& desc : info.texture_buffer_descriptors) {
-            if (desc.handle_program != ~0U) {
+            if (desc.handle_program != ~0U && !VideoCommon::Nx2FastDraw::g_draw_delta) {
                 block(DeltaBlocker::ComputedHandles);
             }
             handles |= 1U << desc.cbuf_index;
@@ -509,13 +539,13 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
         for (const auto& desc : info.image_buffer_descriptors) {
-            if (desc.handle_program != ~0U) {
+            if (desc.handle_program != ~0U && !VideoCommon::Nx2FastDraw::g_draw_delta) {
                 block(DeltaBlocker::ComputedHandles);
             }
             handles |= 1U << desc.cbuf_index;
         }
         for (const auto& desc : info.texture_descriptors) {
-            if (desc.handle_program != ~0U) {
+            if (desc.handle_program != ~0U && !VideoCommon::Nx2FastDraw::g_draw_delta) {
                 block(DeltaBlocker::ComputedHandles);
             }
             handles |= 1U << desc.cbuf_index;
@@ -524,7 +554,7 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
         for (const auto& desc : info.image_descriptors) {
-            if (desc.handle_program != ~0U) {
+            if (desc.handle_program != ~0U && !VideoCommon::Nx2FastDraw::g_draw_delta) {
                 block(DeltaBlocker::ComputedHandles);
             }
             handles |= 1U << desc.cbuf_index;
@@ -732,6 +762,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
 
     const bool use_memo{texture_memo_eligible && !RecordingSampledTextures()};
+    if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+        draw_delta_handles.clear();
+    }
     const bool verify_memo{use_memo && TextureMemoVerify()};
     boost::container::small_vector<GPUVAddr, 32> handle_addresses;
     boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
@@ -788,6 +821,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     const bool resolve_in_full{!memo_hit || verify_memo};
+    size_t memo_entry_index{};
 
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const GraphicsStageInfo& info{*stage_infos[stage]};
@@ -838,6 +872,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
+                if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+                    draw_delta_handles.emplace_back(handle.first, ~0U);
+                }
                 views.push_back({
                     .index = handle.first,
                     .blacklist = blacklist,
@@ -872,6 +909,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                             const auto handle{
                                 VideoCommon::TexturePairOrNull(raw, via_header_index)};
                             views.push_back({handle.first});
+                            if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+                                draw_delta_handles.push_back(handle);
+                            }
                             if (handle.second != last_sampler_index) {
                                 sampler = texture_cache.GetSamplerId(handle.second, false);
                                 last_sampler_index = handle.second;
@@ -894,6 +934,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                           ? VideoCommon::NULL_TEXTURE_HANDLE
                                           : read_handle(desc, index)};
                     views.push_back({handle.first});
+                    if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+                        draw_delta_handles.push_back(handle);
+                    }
 
                     VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                     samplers.push_back(sampler);
@@ -904,6 +947,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     }
                 }
                 ++texture;
+            }
+        } else if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    ASSERT(memo_entry_index < texture_memo.entries.size());
+                    const auto& entry = texture_memo.entries[memo_entry_index++];
+                    draw_delta_handles.push_back(TexturePair(entry.raw, via_header_index));
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -1008,6 +1059,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     const bool captured_delta =
         std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None;
+    const bool verify_image_entries = VideoCommon::Nx2FastDraw::g_draw_delta && captured_delta &&
+                                      verify_delta && kept_images_valid &&
+                                      kept_scale_epoch == texture_cache.ScaleEpoch();
+    std::vector<DescriptorUpdateEntry> previous_image_entries;
+    const auto previous_image_ranges = kept_image_ranges;
+    const auto previous_rescaling = kept_rescaling;
+    if (verify_image_entries) {
+        previous_image_entries = kept_image_entries;
+    }
     if (captured_delta) {
         const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
                                   const VideoCommon::ImageViewInOut& rhs) {
@@ -1021,6 +1081,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
         configured_stages = Spec::enabled_stages;
+        if (VideoCommon::Nx2FastDraw::g_draw_delta) {
+            texture_cache.CaptureDrawDeltaTextures(draw_delta_textures, draw_delta_handles);
+        }
         delta_views_valid = true;
         kept_images_valid = false;
     }
@@ -1167,6 +1230,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         kept_rescaling = rescaling.Data();
         kept_scale_epoch = texture_cache.ScaleEpoch();
         kept_images_valid = true;
+        if (verify_image_entries) {
+            const auto same_image = [](const DescriptorUpdateEntry& lhs,
+                                       const DescriptorUpdateEntry& rhs) {
+                return lhs.image.sampler == rhs.image.sampler &&
+                       lhs.image.imageView == rhs.image.imageView &&
+                       lhs.image.imageLayout == rhs.image.imageLayout;
+            };
+            delta_mismatch |=
+                previous_image_ranges != kept_image_ranges ||
+                previous_rescaling != kept_rescaling ||
+                !std::ranges::equal(previous_image_entries, kept_image_entries, same_image);
+        }
     }
     if (mesh_emulation) {
         if (!mesh_output_buffer) {
@@ -1205,6 +1280,56 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+VideoCommon::DrawDeltaTextureResult GraphicsPipeline::CheckDrawDeltaTextures() {
+    draw_delta_handles.clear();
+    const bool via_header =
+        maxwell3d->regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!configured_stages[stage]) {
+            continue;
+        }
+        const auto& info = *stage_infos[stage];
+        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        const auto append = [&](const auto& descriptors, bool sampled) {
+            for (const auto& desc : descriptors) {
+                const auto output = [&](u32, std::pair<u32, u32> handle) {
+                    draw_delta_handles.emplace_back(handle.first, sampled ? handle.second : ~0U);
+                };
+                if (sampled && desc.count > 1 && desc.handle_program != ~0U) {
+                    const auto address = [&](u32 slot) -> GPUVAddr {
+                        return slot < cbufs.size() && cbufs[slot].enabled ? cbufs[slot].address
+                                                                          : GPUVAddr{};
+                    };
+                    VideoCommon::EvaluateTextureHandles(
+                        info, desc.handle_program, *gpu_memory, address,
+                        device.GetStorageBufferAlignment(), desc.count,
+                        [&](u32 element, std::optional<u32> raw) {
+                            output(element, VideoCommon::TexturePairOrNull(raw, via_header));
+                        });
+                } else {
+                    for (u32 element = 0; element < desc.count; ++element) {
+                        bool null_handle{};
+                        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(desc)>,
+                                                     Shader::TextureDescriptor>) {
+                            null_handle = VideoCommon::HandleMustBeNull(info, desc, element);
+                        }
+                        output(element, null_handle
+                                            ? VideoCommon::NULL_TEXTURE_HANDLE
+                                            : ReadDrawTextureHandle(
+                                                  info, desc, element, *gpu_memory, cbufs,
+                                                  device.GetStorageBufferAlignment(), via_header));
+                    }
+                }
+            }
+        };
+        append(info.texture_buffer_descriptors, false);
+        append(info.image_buffer_descriptors, false);
+        append(info.texture_descriptors, true);
+        append(info.image_descriptors, false);
+    }
+    return texture_cache.MatchDrawDeltaTextures(draw_delta_textures, draw_delta_handles);
 }
 
 bool GraphicsPipeline::DeltaImagesChange() const noexcept {

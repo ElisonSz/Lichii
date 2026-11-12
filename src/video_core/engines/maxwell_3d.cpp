@@ -410,7 +410,9 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     const bool query_method = method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-                              method == MAXWELL3D_REG_INDEX(render_enable.mode);
+                              method == MAXWELL3D_REG_INDEX(render_enable.mode) ||
+                              (VideoCommon::Nx2FastDraw::g_draw_delta &&
+                               method == MAXWELL3D_REG_INDEX(report_semaphore.query));
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
         !(VideoCommon::Nx2FastDraw::Enabled() && query_method && NoteFastDrawState(method))) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);

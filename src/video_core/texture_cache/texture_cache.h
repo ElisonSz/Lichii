@@ -1294,6 +1294,84 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
 }
 
 template <class P>
+void TextureCache<P>::CaptureDrawDeltaTextures(DrawDeltaSnapshot& snapshot,
+                                               std::span<const DrawDeltaSnapshot::Handle> handles) {
+    const auto& images = channel_state->graphics_image_table;
+    const auto& samplers = channel_state->graphics_sampler_table;
+    snapshot.Capture(
+        handles, images.changes, samplers.changes,
+        [&](u32 index) -> std::optional<TICEntry> {
+            index = Tegra::Texture::TextureHeaderIndex(index, images.current_limit,
+                                                       gpu_memory->UsesNativeTiling());
+            if (index > images.current_limit) {
+                return TICEntry{};
+            }
+            if (images.invalidated ||
+                (images.read_descriptors[index / 64] & (1ULL << (index % 64))) == 0) {
+                return std::nullopt;
+            }
+            return images.descriptors[index];
+        },
+        [&](u32 index) -> std::optional<TSCEntry> {
+            if (index > samplers.current_limit) {
+                return TSCEntry{};
+            }
+            if (samplers.invalidated ||
+                (samplers.read_descriptors[index / 64] & (1ULL << (index % 64))) == 0) {
+                return std::nullopt;
+            }
+            return samplers.descriptors[index];
+        });
+}
+
+template <class P>
+DrawDeltaTextureResult TextureCache<P>::MatchDrawDeltaTextures(
+    const DrawDeltaSnapshot& snapshot, std::span<const DrawDeltaSnapshot::Handle> handles) {
+    SynchronizeDescriptors(false);
+    const auto& images = channel_state->graphics_image_table;
+    const auto& samplers = channel_state->graphics_sampler_table;
+    // Read without modifying the tables: a mismatch must leave Read's is_new result intact for
+    // the full resolve, which replaces the corresponding bound view/sampler ID.
+    const auto read = [&](GPUVAddr address, auto& entry) {
+        const bool one_page =
+            (address & Core::Memory::YUZU_PAGEMASK) + sizeof(entry) <= Core::Memory::YUZU_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory->GetPointer(address) : nullptr) {
+            std::memcpy(&entry, host, sizeof(entry));
+        } else {
+            gpu_memory->ReadBlockUnsafe(address, &entry, sizeof(entry));
+        }
+    };
+    return snapshot.Match(
+        handles, images.changes, samplers.changes,
+        [&](u32 index) -> std::optional<TICEntry> {
+            index = Tegra::Texture::TextureHeaderIndex(index, images.current_limit,
+                                                       gpu_memory->UsesNativeTiling());
+            if (index > images.current_limit) {
+                return TICEntry{};
+            }
+            const GPUVAddr address = images.current_gpu_addr + u64{index} * sizeof(TICEntry);
+            if (!gpu_memory->IsFullyMappedRange(address, sizeof(TICEntry))) {
+                return std::nullopt;
+            }
+            TICEntry entry{};
+            read(address, entry);
+            return entry;
+        },
+        [&](u32 index) -> std::optional<TSCEntry> {
+            if (index > samplers.current_limit) {
+                return TSCEntry{};
+            }
+            const GPUVAddr address = samplers.current_gpu_addr + u64{index} * sizeof(TSCEntry);
+            if (!gpu_memory->IsFullyMappedRange(address, sizeof(TSCEntry))) {
+                return std::nullopt;
+            }
+            TSCEntry entry{};
+            read(address, entry);
+            return entry;
+        });
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;

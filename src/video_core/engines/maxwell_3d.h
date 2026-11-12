@@ -3298,11 +3298,26 @@ private:
     /// pipeline and reapplies vertex input; query methods still execute their side effects.
     bool NoteFastDrawState(u32 method) {
         namespace FastDraw = VideoCommon::Nx2FastDraw;
+        if (FastDraw::g_draw_delta) {
+            constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
+            constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
+            // These registers configure query handlers, never graphics pipeline configuration.
+            // The handlers still run; actual submits, pass endings and fence releases break reuse.
+            if ((method >= report &&
+                 method < report + sizeof(Regs::ReportSemaphore) / sizeof(u32)) ||
+                (method >= condition &&
+                 method < condition + sizeof(Regs::RenderEnable) / sizeof(u32)) ||
+                method == MAXWELL3D_REG_INDEX(render_enable_override) ||
+                method == MAXWELL3D_REG_INDEX(clear_report_value)) {
+                FastDraw::g_delta.queries = true;
+                return true;
+            }
+        }
         if (method == MAXWELL3D_REG_INDEX(vertex_id_base)) {
             if (FastDraw::DrawCostStatsEnabled()) {
                 FastDraw::g_delta.match_cases |= 1U;
             }
-            if (FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
+            if (FastDraw::g_draw_delta || FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
                 FastDraw::g_delta.vertex_id = true;
                 return true;
             }
@@ -3317,7 +3332,8 @@ private:
             if (FastDraw::DrawCostStatsEnabled()) {
                 FastDraw::g_delta.match_cases |= 2U;
             }
-            if (FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
+            if (FastDraw::g_draw_delta ||
+                FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
                 FastDraw::g_delta.vertex_layout = true;
                 return true;
             }

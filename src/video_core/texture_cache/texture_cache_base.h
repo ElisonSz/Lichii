@@ -26,19 +26,19 @@
 #include <boost/container/static_vector.hpp>
 #include <queue>
 
+#include <ranges>
 #include "common/common_types.h"
-#include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
-#include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
-#include "video_core/texture_cache/pending_download.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
@@ -46,6 +46,7 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/pending_download.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
@@ -364,6 +365,14 @@ public:
     /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
     void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
                          std::span<const ImageViewInOut> views, std::span<const SamplerId> samplers);
+
+    using DrawDeltaSnapshot = DrawDeltaTextures<TICEntry, TSCEntry>;
+    /// Capture the table bytes used by the full resolve, or compare current guest bytes with them.
+    /// Called under the texture cache mutex; descriptor-table epochs protect deleted view IDs.
+    void CaptureDrawDeltaTextures(DrawDeltaSnapshot& snapshot,
+                                  std::span<const DrawDeltaSnapshot::Handle> handles);
+    [[nodiscard]] DrawDeltaTextureResult MatchDrawDeltaTextures(
+        const DrawDeltaSnapshot& snapshot, std::span<const DrawDeltaSnapshot::Handle> handles);
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
