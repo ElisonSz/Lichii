@@ -3092,16 +3092,21 @@ size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
 
 vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
     const auto found = images.find(key);
-    // The oldest of a list is the first the GPU is past.
-    if (found == images.end() || !scheduler.IsFree(found->second.front().tick)) {
+    if (found == images.end()) {
         ++stats.misses;
         return vk::Image{};
     }
     std::vector<Entry>& list = found->second;
-    vk::Image image = std::move(list.front().image);
-    bytes -= list.front().bytes;
+    const auto entry = std::ranges::find_if(
+        list, [&scheduler](const Entry& kept) { return scheduler.IsFree(kept.tick); });
+    if (entry == list.end()) {
+        ++stats.misses;
+        return vk::Image{};
+    }
+    vk::Image image = std::move(entry->image);
+    bytes -= entry->bytes;
     --count;
-    list.erase(list.begin());
+    list.erase(entry);
     if (list.empty()) {
         images.erase(found);
     }
@@ -3152,15 +3157,18 @@ vk::Image TextureCacheRuntime::TakeHostImage(const HostImagePool::Key& key) {
     return host_image_pool.Take(key, scheduler);
 }
 
-void TextureCacheRuntime::KeepHostImage(const HostImagePool::Key& key, vk::Image& image) {
+void TextureCacheRuntime::KeepHostImage(const HostImagePool::Key& key, vk::Image& image,
+                                        std::optional<u64> last_use) {
     if (!VideoCommon::StaleTargets::pool_images) {
         return;
     }
-    // One frame's worth of a game that remakes its targets every frame is a few hundred MiB.
-    const u64 limit = (std::min)(u64{1} << 30, device.GetDeviceLocalMemory() / 16);
-    // The commands that used the image were recorded by now: the pool hands it out once the GPU
-    // ran them, whatever order the next user's commands would run in.
-    host_image_pool.Keep(key, image, scheduler.CurrentTick(), limit);
+    // One frame's worth of a game that remakes its targets every frame is a few hundred MiB,
+    // and it takes a frame or two until the GPU is past a deleted image.
+    const u64 limit = (std::min)(u64{1} << 30, device.GetDeviceLocalMemory() / 8);
+    // The pool hands the image out once the GPU ran the last commands recorded on it, whatever
+    // order the next user's commands would run in. An image the cache did not retire may have
+    // been used up to now.
+    host_image_pool.Keep(key, image, last_use.value_or(scheduler.CurrentTick()), limit);
 }
 
 void TextureCacheRuntime::TickFrame() {
@@ -3332,7 +3340,7 @@ Image::~Image() {
     // A moved-from image has no handle left. Views of the image are destroyed with this object
     // or by the cache; the host image itself can serve the next image of its shape.
     if (runtime != nullptr && pool_key && original_image && !original_image.IsUnbacked()) {
-        runtime->KeepHostImage(*pool_key, original_image);
+        runtime->KeepHostImage(*pool_key, original_image, retire_tick);
     }
 }
 

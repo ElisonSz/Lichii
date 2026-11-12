@@ -147,7 +147,7 @@ private:
         [[nodiscard]] size_t operator()(const Key& key) const noexcept;
     };
 
-    std::unordered_map<Key, std::vector<Entry>, KeyHash> images; ///< Oldest first in each list
+    std::unordered_map<Key, std::vector<Entry>, KeyHash> images;
     u64 bytes{};
     size_t count{};
     Stats stats;
@@ -184,15 +184,17 @@ public:
     /// A kept host image made as `key`, or none (HostImagePool).
     [[nodiscard]] vk::Image TakeHostImage(const HostImagePool::Key& key);
 
-    /// Offers the host image of a cache image that is being destroyed to the pool.
-    void KeepHostImage(const HostImagePool::Key& key, vk::Image& image);
+    /// Offers the host image of a cache image that is being destroyed to the pool. `last_use`:
+    /// the tick after which no command was recorded on it, if the cache said (Image::RetiredAt).
+    void KeepHostImage(const HostImagePool::Key& key, vk::Image& image,
+                       std::optional<u64> last_use);
 
     /// Device memory of the kept host images: free to the cache, which deducts it from its use.
     [[nodiscard]] u64 HostImagePoolBytes() const noexcept {
         return host_image_pool.Bytes();
     }
 
-    /// The cache is at its memory threshold, or an image did not fit: the kept images go.
+    /// The cache is at its critical threshold, or an image did not fit: the kept images go.
     void ReleaseHostImagePool() {
         host_image_pool.Release();
     }
@@ -601,6 +603,12 @@ public:
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
 
+    /// The cache deleted the image: no command is recorded on it after `tick`. Its host image
+    /// can serve another image once the GPU is past that tick (HostImagePool).
+    void RetiredAt(u64 tick) noexcept {
+        retire_tick = tick;
+    }
+
     u32 HostMipLevels() const noexcept;
 
     [[nodiscard]] u32 HostFormat() const noexcept;
@@ -817,6 +825,7 @@ private:
     /// What original_image was made as, if the pool may keep it (HostImagePool). Declared before
     /// it: making the image fills this in.
     std::optional<HostImagePool::Key> pool_key;
+    std::optional<u64> retire_tick; ///< Set by RetiredAt
     vk::Image original_image;
     vk::Image scaled_image;
 

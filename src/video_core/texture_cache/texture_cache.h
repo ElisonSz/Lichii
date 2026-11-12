@@ -860,9 +860,10 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if constexpr (requires { runtime.ReleaseHostImagePool(); }) {
-        // Host images kept for reuse are not counted as used: once the collector has work, or an
-        // image did not fit, the driver gets their memory back first.
-        if (out_of_memory || total_used_memory >= expected_memory) {
+        // Host images kept for reuse are not counted as used. The cache sits at its expected
+        // threshold for as long as it has aged images to drop, so that is no reason to give
+        // them up: the critical threshold, or an image that did not fit, is.
+        if (out_of_memory || total_used_memory >= critical_memory) {
             runtime.ReleaseHostImagePool();
         }
     }
@@ -4771,6 +4772,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             gpu_sentenced_images.push_back(
                 {runtime.CurrentTick(), freed_bytes, std::move(slot_images[image_id])});
             gpu_sentenced_bytes += freed_bytes;
+            if constexpr (requires(Image& retired) { retired.RetiredAt(u64{}); }) {
+                // Nothing records a command on the image from here on: once the GPU is past
+                // this tick its host image can serve another (HostImagePool).
+                GpuSentencedImage& sentenced = gpu_sentenced_images.back();
+                sentenced.image.RetiredAt(sentenced.tick);
+            }
         } else {
             sentenced_images.Push(std::move(slot_images[image_id]));
             sentenced_image_bytes[sentenced_image_index] += freed_bytes;
