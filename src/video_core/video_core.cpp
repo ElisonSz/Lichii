@@ -16,6 +16,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/memtrack_translation.h"
 #include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -86,6 +87,15 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
+    VideoCommon::MemTrack::ReadSwitch();
+    if (VideoCommon::MemTrack::g_word) {
+        LOG_INFO(HW_GPU, "Nx2MemTrack single-page CPU marks enabled");
+    }
+    if (VideoCommon::MemTrack::g_translate) {
+        LOG_INFO(HW_GPU, "Nx2MemTrack translation cache enabled: entries={} verify={} stats={}",
+                 VideoCommon::MemTrack::TranslationCache::NumEntries,
+                 VideoCommon::MemTrack::g_verify, VideoCommon::MemTrack::g_stats);
+    }
     Tegra::Nx2ListIndirect::ReadSwitch();
     VideoCommon::Nx2DrainCheck::ReadSwitch();
     Tegra::Nx2ListIndirect::Stats::ReadSwitch();

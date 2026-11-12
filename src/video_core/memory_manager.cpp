@@ -11,16 +11,18 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
-#include "video_core/nx2.h"
-#include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memtrack_translation.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
@@ -126,6 +128,17 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
                   gpu_addr, size, address_space_size);
         return gpu_addr;
     }
+    // Renderer callbacks below can translate while the table is being changed. Such reads must
+    // walk the current table and must never populate the cache with a partially updated mapping.
+    const bool track_translation = VideoCommon::MemTrack::g_translate;
+    if (track_translation) {
+        translation_updates.fetch_add(1, std::memory_order_acq_rel);
+    }
+    SCOPE_EXIT {
+        if (track_translation) {
+            translation_updates.fetch_sub(1, std::memory_order_release);
+        }
+    };
     [[maybe_unused]] u64 remaining_size{size};
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
@@ -178,6 +191,17 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
                   gpu_addr, size, address_space_size);
         return gpu_addr;
     }
+    // Renderer callbacks below can translate while the table is being changed. Such reads must
+    // walk the current table and must never populate the cache with a partially updated mapping.
+    const bool track_translation = VideoCommon::MemTrack::g_translate;
+    if (track_translation) {
+        translation_updates.fetch_add(1, std::memory_order_acq_rel);
+    }
+    SCOPE_EXIT {
+        if (track_translation) {
+            translation_updates.fetch_sub(1, std::memory_order_release);
+        }
+    };
     [[maybe_unused]] u64 remaining_size{size};
     GPUVAddr modified_start{};
     u64 modified_size{};
@@ -266,6 +290,61 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+    if (VideoCommon::MemTrack::g_translate) {
+        return GpuToCpuAddressCached(gpu_addr);
+    }
+    return GpuToCpuAddressUncached(gpu_addr);
+}
+
+std::optional<DAddr> MemoryManager::GpuToCpuAddressCached(GPUVAddr gpu_addr) const {
+    if (translation_updates.load(std::memory_order_acquire) != 0 ||
+        !IsWithinGPUAddressRange(gpu_addr)) {
+        return GpuToCpuAddressUncached(gpu_addr);
+    }
+    const u64 serial = MapSerial();
+    thread_local VideoCommon::MemTrack::TranslationCache cache;
+    bool hit{};
+    // Stay within both GPU page sizes and a device page, so a successful translation proves
+    // the whole cached page is in the device address space (the original checks each address).
+    const auto result = cache.Translate(
+        unique_identifier, serial, gpu_addr, (std::min)({page_bits, big_page_bits, cpu_page_bits}),
+        [this](GPUVAddr address) { return GpuToCpuAddressUncached(address); }, hit);
+    bool mismatch{};
+    std::optional<DAddr> expected;
+    if (VideoCommon::MemTrack::g_verify) {
+        expected = GpuToCpuAddressUncached(gpu_addr);
+        mismatch = result != expected;
+        if (mismatch) {
+            cache.Clear();
+            LOG_ERROR(HW_GPU,
+                      "Nx2MemTrack translation mismatch: owner={} serial={} gpu={:#x} cached={:#x} "
+                      "mapped={} walk={:#x} mapped={}",
+                      unique_identifier, serial, gpu_addr, result.value_or(0), result.has_value(),
+                      expected.value_or(0), expected.has_value());
+        }
+    }
+    if (VideoCommon::MemTrack::g_stats) {
+        struct Stats {
+            u64 calls{};
+            u64 hits{};
+            u64 mismatches{};
+        };
+        thread_local Stats stats;
+        ++stats.calls;
+        stats.hits += hit ? 1U : 0U;
+        stats.mismatches += mismatch ? 1U : 0U;
+        if ((stats.calls & ((u64{1} << 20) - 1)) == 0) {
+            LOG_INFO(HW_GPU,
+                     "Nx2MemTrack translations: calls={} hits={} misses={} mismatches={} verify={}",
+                     stats.calls, stats.hits, stats.calls - stats.hits, stats.mismatches,
+                     VideoCommon::MemTrack::g_verify);
+        }
+    }
+    // A verification run keeps rendering correct: the walk's answer wins, the log shows the miss.
+    return mismatch ? expected : result;
+}
+
+std::optional<DAddr> MemoryManager::GpuToCpuAddressUncached(GPUVAddr gpu_addr) const {
     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         return std::nullopt;
     }
@@ -1007,7 +1086,47 @@ MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) cons
 }
 
 template <bool is_gpu_address>
-void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
+void MemoryManager::GetSubmappedRangeImpl(
+    GPUVAddr gpu_addr, std::size_t size,
+    boost::container::small_vector<
+        std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
+    const {
+    if (VideoCommon::MemTrack::g_translate) {
+        const u64 translation_bits = (std::min)({page_bits, big_page_bits, cpu_page_bits});
+        const u64 translation_mask = (u64{1} << translation_bits) - 1;
+        if (size != 0 && IsWithinGPUAddressRange(gpu_addr) &&
+            size <= address_space_size - gpu_addr &&
+            size - 1 <= translation_mask - (gpu_addr & translation_mask) &&
+            GetEntry(gpu_addr, true) != EntryType::Reserved) {
+            // GpuToCpuAddress falls back to small pages under Reserved big pages, whereas this
+            // walk skips them. Keep that distinction, and never merge across separate calls.
+            if (const auto device = GpuToCpuAddressCached(gpu_addr)) {
+                const auto address = is_gpu_address ? gpu_addr : *device;
+                if (VideoCommon::MemTrack::g_verify) {
+                    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> expected;
+                    GetSubmappedRangeUncached<is_gpu_address>(gpu_addr, size, expected);
+                    if (expected.size() != 1 || expected.front() != std::pair{address, size}) {
+                        LOG_ERROR(HW_GPU,
+                                  "Nx2MemTrack submapped mismatch: gpu={:#x} size={:#x} "
+                                  "address={:#x} gpu_address={}",
+                                  gpu_addr, size, address, is_gpu_address);
+                        result.insert(result.end(), expected.begin(), expected.end());
+                        return;
+                    }
+                }
+                result.emplace_back(address, size);
+                return;
+            }
+        }
+    }
+    GetSubmappedRangeUncached<is_gpu_address>(gpu_addr, size, result);
+}
+
+template <bool is_gpu_address>
+void MemoryManager::GetSubmappedRangeUncached(
+    GPUVAddr gpu_addr, std::size_t size,
+    boost::container::small_vector<
+        std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
     const {
     std::optional<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>> last_segment{};
     std::optional<DAddr> old_page_addr{};

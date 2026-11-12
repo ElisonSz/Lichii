@@ -112,6 +112,7 @@ add_library(video_core STATIC
     gpu_thread.h
     guest_memory.h
     invalidation_accumulator.h
+    memtrack_translation.h
     memory_manager.cpp
     memory_manager.h
     page_filter.h

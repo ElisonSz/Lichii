@@ -20,6 +20,7 @@
 #include "common/div_ceil.h"
 #include "common/logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memtrack_translation.h"
 #include "video_core/nx2_perf.h"
 
 namespace VideoCommon {
@@ -125,6 +126,33 @@ struct WordManager {
     /// @param dirty_addr    Base address to mark or unmark as modified
     /// @param size          Size in bytes to mark or unmark as modified
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
+        if (MemTrack::g_word) {
+            // CPU invalidations commonly touch only a few constant-buffer bytes. One page has
+            // at most one protection transition, so no range vector/sort/coalesce is needed.
+            const u64 local = dirty_addr - cpu_addr;
+            if (type == Type::CPU && enable && size != 0 && local < size_bytes &&
+                (cpu_addr & (BYTES_PER_PAGE - 1)) == 0 && size <= size_bytes - local &&
+                size <= BYTES_PER_PAGE - (local & (BYTES_PER_PAGE - 1))) {
+                const auto [index, page] = GetWordPage(local);
+                const u64 mask = u64{1} << page;
+                auto cpu_words = Span(Type::CPU);
+                auto untracked_words = Span(Type::Untracked);
+                auto cached_words = Span(Type::CachedCPU);
+                const bool changed = (untracked_words[index] & mask) == 0;
+                cpu_words[index] |= mask;
+                untracked_words[index] |= mask;
+                cached_words[index] &= ~mask;
+                NoteCleanWord(index);
+                if (changed) {
+                    const std::pair<VAddr, size_t> range{
+                        Common::AlignDown(dirty_addr, BYTES_PER_PAGE),
+                        static_cast<size_t>(BYTES_PER_PAGE)};
+                    tracker->UpdatePagesCachedBatch(
+                        std::span<const std::pair<VAddr, size_t>>{&range, 1}, -1);
+                }
+                return;
+            }
+        }
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);

@@ -187,6 +187,8 @@ add_executable(tests
     video_core/memory_tracker.cpp
     video_core/invalidation_accumulator.cpp
     video_core/memory_manager_runs.cpp
+    video_core/memtrack_translation.cpp
+    video_core/memtrack_word.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp

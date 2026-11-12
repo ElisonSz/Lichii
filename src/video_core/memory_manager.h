@@ -214,6 +214,13 @@ public:
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
 private:
+    [[nodiscard]] std::optional<DAddr> GpuToCpuAddressUncached(GPUVAddr gpu_addr) const;
+    [[nodiscard]] std::optional<DAddr> GpuToCpuAddressCached(GPUVAddr gpu_addr) const;
+
+    // Renderer callbacks can reenter translation, or even map another range. Keep them uncached
+    // until every mapping operation has completed; map_serial then expires the thread's cache.
+    std::atomic<u32> translation_updates{};
+
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
@@ -251,6 +258,13 @@ private:
     void GetSubmappedRangeImpl(
         GPUVAddr gpu_addr, std::size_t size,
         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
+
+    template <bool is_gpu_address>
+    void GetSubmappedRangeUncached(
+        GPUVAddr gpu_addr, std::size_t size,
+        boost::container::small_vector<
+            std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
+            result) const;
 
     std::atomic<GPUVAddr> native_syncpoint_shim{};
     Core::System& system;
