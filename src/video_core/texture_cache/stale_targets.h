@@ -26,6 +26,9 @@ inline bool verify = false;
 /// Frames a bad-overlap render target stays unused before RetireStaleTargets drops it: the age
 /// at which the collector deletes one at its critical threshold. 0 turns the pass off.
 inline u64 retire_age = 10;
+/// The Vulkan runtime keeps the host images of deleted cache images for the next image of their
+/// shape (HostImagePool). EDEN_NX2_IMAGE_POOL=0 turns that off.
+inline bool pool_images = true;
 inline void ReadSwitch() {
     const char* const keep = std::getenv("EDEN_NX2_KEEP_STALE_TARGETS");
     enabled = keep == nullptr || keep[0] != '1';
@@ -33,6 +36,8 @@ inline void ReadSwitch() {
     verify = check != nullptr && check[0] == '1';
     const char* const age = std::getenv("EDEN_NX2_STALE_TARGET_AGE");
     retire_age = age != nullptr ? std::strtoull(age, nullptr, 10) : 10;
+    const char* const pool = std::getenv("EDEN_NX2_IMAGE_POOL");
+    pool_images = pool == nullptr || pool[0] != '0';
 }
 
 /// Why an older target a whole clear overlapped stays, for the memory trace.

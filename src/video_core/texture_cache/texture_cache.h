@@ -368,6 +368,15 @@ void TextureCache<P>::CollectStaleReferences() {
 }
 
 template <class P>
+void TextureCache<P>::DeductPooledImages() {
+    if constexpr (requires { runtime.HostImagePoolBytes(); }) {
+        // The runtime keeps the host images of deleted images for the next of their shape: the
+        // driver counts their memory, the collector must not.
+        total_used_memory -= (std::min)(total_used_memory, u64{runtime.HostImagePoolBytes()});
+    }
+}
+
+template <class P>
 void TextureCache<P>::RetireStaleTargets() {
     const u64 age = StaleTargets::retire_age;
     if (!StaleTargets::enabled || age == 0 || frame_tick <= age ||
@@ -710,6 +719,7 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        DeductPooledImages();
     }
     // EDEN_NX2_MEM_TRACE=1: every 2 s, what the cache holds next to what the process and the
     // driver report (memory climbs).
@@ -845,7 +855,15 @@ void TextureCache<P>::TickFrame() {
                     total_used_memory -= (std::min)(total_used_memory, bytes);
                 }
                 total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+                DeductPooledImages();
             }
+        }
+    }
+    if constexpr (requires { runtime.ReleaseHostImagePool(); }) {
+        // Host images kept for reuse are not counted as used: once the collector has work, or an
+        // image did not fit, the driver gets their memory back first.
+        if (out_of_memory || total_used_memory >= expected_memory) {
+            runtime.ReleaseHostImagePool();
         }
     }
     RetireStaleTargets();

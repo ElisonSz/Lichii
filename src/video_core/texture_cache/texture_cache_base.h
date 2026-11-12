@@ -418,6 +418,9 @@ public:
     /// Drops the render targets other images were made over and nothing has used for
     /// StaleTargets::retire_age frames, every frame and whatever the memory use.
     void RetireStaleTargets();
+    /// Takes the device memory of the host images the runtime keeps for reuse out of
+    /// total_used_memory.
+    void DeductPooledImages();
     bool StaleTargetReferenced(ImageId id) const;
     void MarkStaleTransfer(ImageBase& image);
     ::Common::unordered_set<ImageId> stale_references;

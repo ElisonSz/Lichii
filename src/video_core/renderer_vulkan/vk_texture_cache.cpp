@@ -18,6 +18,10 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <bit>
+#include <chrono>
+#include <cstdint>
+#include <initializer_list>
+#include <iterator>
 #include <numeric>
 #include "common/alignment.h"
 #include "common/bit_util.h"
@@ -48,6 +52,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -531,11 +536,34 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return image_ci;
 }
 
+/// TEST (EDEN_NX2_MEM_TRACE): counts one host object and the time it took to make.
+class HostObjectTimer {
+public:
+    explicit HostObjectTimer(u64& count_, u64& ns_)
+        : count{count_}, ns{ns_}, start{std::chrono::steady_clock::now()} {}
+    ~HostObjectTimer() {
+        ++count;
+        ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count());
+    }
+    HostObjectTimer(const HostObjectTimer&) = delete;
+    HostObjectTimer& operator=(const HostObjectTimer&) = delete;
+
+private:
+    u64& count;
+    u64& ns;
+    std::chrono::steady_clock::time_point start;
+};
+
+/// `pool`: the runtime whose HostImagePool may supply the image, with `pool_key` set to what the
+/// image was made as if the pool may keep it afterwards.
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false, TextureCacheRuntime* pool = nullptr,
+                                  std::optional<HostImagePool::Key>* pool_key = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -568,7 +596,42 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+    // Images asked for without memory stay out of the pool even when they got memory after all.
+    const bool pooled = pool != nullptr && pool_key != nullptr && !unbacked && !aliased &&
+                        VideoCommon::StaleTargets::pool_images;
+    if (pooled) {
+        *pool_key = HostImagePool::Key{
+            .flags = image_ci.flags,
+            .type = image_ci.imageType,
+            .format = image_ci.format,
+            .width = image_ci.extent.width,
+            .height = image_ci.extent.height,
+            .depth = image_ci.extent.depth,
+            .levels = image_ci.mipLevels,
+            .layers = image_ci.arrayLayers,
+            .samples = image_ci.samples,
+            .usage = image_ci.usage,
+            .view_formats = view_formats.data(),
+            .view_format_count = view_formats.size(),
+        };
+        if (vk::Image kept = pool->TakeHostImage(**pool_key)) {
+            return kept;
+        }
+    }
+    const auto make = [&] {
+        return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+    };
+    if (pool == nullptr) {
+        return make();
+    }
+    const HostObjectTimer timer{pool->host_object_stats.images, pool->host_object_stats.image_ns};
+    vk::Image image = make();
+    if (!image && pool->HostImagePoolBytes() != 0) {
+        // No memory left while the pool holds some: give it back and try once more.
+        pool->ReleaseHostImagePool();
+        image = make();
+    }
+    return image;
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -3014,6 +3077,92 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
+    u64 hash = 0xCBF29CE484222325ULL;
+    for (const u64 part :
+         {u64{key.flags}, static_cast<u64>(key.type), static_cast<u64>(key.format),
+          u64{key.width}, u64{key.height}, u64{key.depth}, u64{key.levels}, u64{key.layers},
+          static_cast<u64>(key.samples), u64{key.usage},
+          static_cast<u64>(reinterpret_cast<uintptr_t>(key.view_formats)),
+          static_cast<u64>(key.view_format_count)}) {
+        hash = (hash ^ part) * 0x100000001B3ULL;
+    }
+    return static_cast<size_t>(hash ^ (hash >> 32));
+}
+
+vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
+    const auto found = images.find(key);
+    // The oldest of a list is the first the GPU is past.
+    if (found == images.end() || !scheduler.IsFree(found->second.front().tick)) {
+        ++stats.misses;
+        return vk::Image{};
+    }
+    std::vector<Entry>& list = found->second;
+    vk::Image image = std::move(list.front().image);
+    bytes -= list.front().bytes;
+    --count;
+    list.erase(list.begin());
+    if (list.empty()) {
+        images.erase(found);
+    }
+    ++stats.hits;
+    return image;
+}
+
+void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit) {
+    const u64 size = image.GetMemoryBlock().size;
+    if (size == 0 || bytes + size > limit || count >= MaxImages) {
+        ++stats.refused;
+        return;
+    }
+    images[key].push_back(Entry{
+        .image = std::move(image),
+        .tick = tick,
+        .bytes = size,
+        .unused_frames = 0,
+    });
+    bytes += size;
+    ++count;
+    ++stats.kept;
+}
+
+void HostImagePool::Tick() {
+    for (auto list = images.begin(); list != images.end();) {
+        std::erase_if(list->second, [this](Entry& entry) {
+            if (++entry.unused_frames <= MaxUnusedFrames) {
+                return false;
+            }
+            bytes -= entry.bytes;
+            --count;
+            ++stats.expired;
+            return true;
+        });
+        list = list->second.empty() ? images.erase(list) : std::next(list);
+    }
+}
+
+void HostImagePool::Release() {
+    stats.released += count;
+    images.clear();
+    bytes = 0;
+    count = 0;
+}
+
+vk::Image TextureCacheRuntime::TakeHostImage(const HostImagePool::Key& key) {
+    return host_image_pool.Take(key, scheduler);
+}
+
+void TextureCacheRuntime::KeepHostImage(const HostImagePool::Key& key, vk::Image& image) {
+    if (!VideoCommon::StaleTargets::pool_images) {
+        return;
+    }
+    // One frame's worth of a game that remakes its targets every frame is a few hundred MiB.
+    const u64 limit = (std::min)(u64{1} << 30, device.GetDeviceLocalMemory() / 16);
+    // The commands that used the image were recorded by now: the pool hands it out once the GPU
+    // ran them, whatever order the next user's commands would run in.
+    host_image_pool.Keep(key, image, scheduler.CurrentTick(), limit);
+}
+
 void TextureCacheRuntime::TickFrame() {
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
@@ -3056,6 +3205,23 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
         return scheduler.IsFree(pending.first);
     });
+    host_image_pool.Tick();
+    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    if (const auto now = std::chrono::steady_clock::now();
+        mem_trace && now - host_object_report >= std::chrono::seconds{2}) {
+        host_object_report = now;
+        const HostObjectStats made = std::exchange(host_object_stats, HostObjectStats{});
+        const HostImagePool::Stats pool = host_image_pool.TakeStats();
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: host images made {} in {} us, views {} in {} us, framebuffers {} "
+                 "in {} us; image pool {}: hits {} misses {} kept {} refused {} expired {} "
+                 "released {}; holds {} images, {} MiB",
+                 made.images, made.image_ns / 1000, made.views, made.view_ns / 1000,
+                 made.framebuffers, made.framebuffer_ns / 1000,
+                 VideoCommon::StaleTargets::pool_images, pool.hits, pool.misses, pool.kept,
+                 pool.refused, pool.expired, pool.released, host_image_pool.Count(),
+                 host_image_pool.Bytes() >> 20);
+    }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -3076,7 +3242,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, &runtime_, &pool_key)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -3162,6 +3328,11 @@ Image::~Image() {
         if (scaled_image) {
             runtime->EraseResolveShadow(*scaled_image);
         }
+    }
+    // A moved-from image has no handle left. Views of the image are destroyed with this object
+    // or by the cache; the host image itself can serve the next image of its shape.
+    if (runtime != nullptr && pool_key && original_image && !original_image.IsUnbacked()) {
+        runtime->KeepHostImage(*pool_key, original_image);
     }
 }
 
@@ -4406,6 +4577,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
       device{&runtime.device}, image_handle{image.Handle()},
       samples(ConvertSampleCount(image.info.num_samples)) {
     using Shader::TextureType;
+    const HostObjectTimer timer{runtime.host_object_stats.views, runtime.host_object_stats.view_ns};
     if (image.host_level_offset == 0)
         range = HostRange(image, range);
 
@@ -5006,6 +5178,8 @@ Framebuffer::~Framebuffer() = default;
 void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     std::span<ImageView*, NUM_RT> color_buffers,
                                     ImageView* depth_buffer, bool is_rescaled_) {
+    const HostObjectTimer timer{runtime.host_object_stats.framebuffers,
+                                runtime.host_object_stats.framebuffer_ns};
     boost::container::small_vector<VkImageView, NUM_RT * 2 + 2> attachments;
     RenderPassKey renderpass_key{};
     // A framebuffer can't have more layers than any of its attachments: one with more layers

@@ -11,6 +11,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -75,6 +78,81 @@ struct ByteAddressedRange {
     return VkExtent2D{width / 2, height};
 }
 
+/// Host images of deleted cache images, kept for the next image made with the same create info.
+/// A game that places its render targets at new addresses every frame has the cache make and
+/// delete dozens of images a frame, each a vkCreateImage with an allocation and their release.
+/// A kept image holds what its last user left in it, which is as undefined as a new image's
+/// contents: the cache uploads, clears or zeroes every image before it is read.
+class HostImagePool {
+public:
+    struct Key {
+        VkImageCreateFlags flags;
+        VkImageType type;
+        VkFormat format;
+        u32 width;
+        u32 height;
+        u32 depth;
+        u32 levels;
+        u32 layers;
+        VkSampleCountFlagBits samples;
+        VkImageUsageFlags usage;
+        const VkFormat* view_formats; ///< The view format list's storage, one per guest format
+        size_t view_format_count;
+
+        [[nodiscard]] bool operator==(const Key&) const noexcept = default;
+    };
+    struct Stats {
+        u64 hits{};
+        u64 misses{};
+        u64 kept{};
+        u64 refused{};
+        u64 expired{};
+        u64 released{};
+    };
+
+    /// A kept image made as `key` that the GPU no longer uses, or none.
+    [[nodiscard]] vk::Image Take(const Key& key, const Scheduler& scheduler);
+
+    /// Keeps `image`, whose last commands were recorded by `tick`, while the pool holds less
+    /// than `limit` bytes. Leaves it to its owner otherwise.
+    void Keep(const Key& key, vk::Image& image, u64 tick, u64 limit);
+
+    /// Once a frame: images nothing asked for in MaxUnusedFrames frames are destroyed.
+    void Tick();
+
+    /// Destroys every kept image: the device needs the memory.
+    void Release();
+
+    [[nodiscard]] u64 Bytes() const noexcept {
+        return bytes;
+    }
+    [[nodiscard]] size_t Count() const noexcept {
+        return count;
+    }
+    [[nodiscard]] Stats TakeStats() noexcept {
+        return std::exchange(stats, Stats{});
+    }
+
+private:
+    static constexpr u32 MaxUnusedFrames = 60;
+    static constexpr size_t MaxImages = 2048;
+
+    struct Entry {
+        vk::Image image;
+        u64 tick;
+        u64 bytes;
+        u32 unused_frames;
+    };
+    struct KeyHash {
+        [[nodiscard]] size_t operator()(const Key& key) const noexcept;
+    };
+
+    std::unordered_map<Key, std::vector<Entry>, KeyHash> images; ///< Oldest first in each list
+    u64 bytes{};
+    size_t count{};
+    Stats stats;
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -102,6 +180,33 @@ public:
     u64 GetDeviceMemoryUsage() const;
 
     void ReclaimOptionalSnapshots();
+
+    /// A kept host image made as `key`, or none (HostImagePool).
+    [[nodiscard]] vk::Image TakeHostImage(const HostImagePool::Key& key);
+
+    /// Offers the host image of a cache image that is being destroyed to the pool.
+    void KeepHostImage(const HostImagePool::Key& key, vk::Image& image);
+
+    /// Device memory of the kept host images: free to the cache, which deducts it from its use.
+    [[nodiscard]] u64 HostImagePoolBytes() const noexcept {
+        return host_image_pool.Bytes();
+    }
+
+    /// The cache is at its memory threshold, or an image did not fit: the kept images go.
+    void ReleaseHostImagePool() {
+        host_image_pool.Release();
+    }
+
+    /// TEST (EDEN_NX2_MEM_TRACE): host objects made, and the time that took.
+    struct HostObjectStats {
+        u64 images{};
+        u64 image_ns{};
+        u64 views{};
+        u64 view_ns{};
+        u64 framebuffers{};
+        u64 framebuffer_ns{};
+    };
+    HostObjectStats host_object_stats;
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
@@ -348,6 +453,8 @@ public:
     };
 
     std::vector<MsaaScratchImage> msaa_scratch_images;
+    HostImagePool host_image_pool;
+    std::chrono::steady_clock::time_point host_object_report{};
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
 
@@ -707,6 +814,9 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    /// What original_image was made as, if the pool may keep it (HostImagePool). Declared before
+    /// it: making the image fills this in.
+    std::optional<HostImagePool::Key> pool_key;
     vk::Image original_image;
     vk::Image scaled_image;
 
