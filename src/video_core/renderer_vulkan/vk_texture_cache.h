@@ -222,6 +222,10 @@ public:
     struct HostObjectStats {
         u64 images{};
         u64 image_ns{};
+        u64 own_memory{}; ///< Of the images: a driver allocation of their own
+        u64 own_memory_ns{};
+        u64 target_pool{}; ///< Of the images: in the render target pool's blocks
+        u64 target_pool_ns{};
         u64 views{};
         u64 view_ns{};
         u64 framebuffers{};

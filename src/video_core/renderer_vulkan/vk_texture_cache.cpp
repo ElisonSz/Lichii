@@ -536,6 +536,10 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return image_ci;
 }
 
+/// Smallest image that takes its memory from the render target pool: smaller ones fit the
+/// default blocks several at a time.
+constexpr u64 RenderTargetPoolMinBytes = 4ULL << 20;
+
 /// TEST (EDEN_NX2_MEM_TRACE): counts one host object and the time it took to make.
 class HostObjectTimer {
 public:
@@ -618,18 +622,47 @@ private:
             return kept;
         }
     }
+    // A large image with one level is a render target, and a game that sizes its shadow maps by
+    // the view makes a dozen a frame in sizes it never repeats: no kept image fits those, and
+    // over 8 MiB each would be a driver allocation of its own (16 MiB default blocks).
+    const u64 texel_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
+                            VideoCore::Surface::BytesPerBlock(info.format);
+    const bool render_target =
+        pool != nullptr && may_fail && VideoCommon::StaleTargets::target_memory_pool &&
+        image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 && image_ci.extent.depth == 1 &&
+        image_ci.samples == VK_SAMPLE_COUNT_1_BIT &&
+        VideoCore::Surface::DefaultBlockWidth(info.format) == 1 &&
+        texel_bytes >= RenderTargetPoolMinBytes &&
+        texel_bytes <= Device::RenderTargetPoolBlockSize / 2;
     const auto make = [&] {
-        return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+        return may_fail ? allocator.TryCreateImage(image_ci, false, render_target)
+                        : allocator.CreateImage(image_ci);
     };
     if (pool == nullptr) {
         return make();
     }
-    const HostObjectTimer timer{pool->host_object_stats.images, pool->host_object_stats.image_ns};
+    const auto start = std::chrono::steady_clock::now();
     vk::Image image = make();
     if (!image && pool->HostImagePoolBytes() != 0) {
         // No memory left while the pool holds some: give it back and try once more.
         pool->ReleaseHostImagePool();
         image = make();
+    }
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+    TextureCacheRuntime::HostObjectStats& made = pool->host_object_stats;
+    ++made.images;
+    made.image_ns += ns;
+    if (image) {
+        const vk::Image::MemoryBlock block = image.GetMemoryBlock();
+        if (block.block == 0) {
+            ++made.own_memory;
+            made.own_memory_ns += ns;
+        } else if (block.block_size == Device::RenderTargetPoolBlockSize) {
+            ++made.target_pool;
+            made.target_pool_ns += ns;
+        }
     }
     return image;
 }
@@ -3321,10 +3354,12 @@ void TextureCacheRuntime::TickFrame() {
         const HostObjectStats made = std::exchange(host_object_stats, HostObjectStats{});
         const HostImagePool::Stats pool = host_image_pool.TakeStats();
         LOG_INFO(Render_Vulkan,
-                 "Memory trace: host images made {} in {} us, views {} in {} us, framebuffers {} "
+                 "Memory trace: host images made {} in {} us (own memory {} in {} us, target pool "
+                 "{} in {} us), views {} in {} us, framebuffers {} "
                  "in {} us; image pool {}: hits {} misses {} kept {} refused {} evicted {} "
                  "expired {} released {}; holds {} images, {} MiB",
-                 made.images, made.image_ns / 1000, made.views, made.view_ns / 1000,
+                 made.images, made.image_ns / 1000, made.own_memory, made.own_memory_ns / 1000,
+                 made.target_pool, made.target_pool_ns / 1000, made.views, made.view_ns / 1000,
                  made.framebuffers, made.framebuffer_ns / 1000,
                  VideoCommon::StaleTargets::pool_images, pool.hits, pool.misses, pool.kept,
                  pool.refused, pool.evicted, pool.expired, pool.released, host_image_pool.Count(),

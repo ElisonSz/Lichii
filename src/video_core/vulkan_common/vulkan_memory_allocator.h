@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <map>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -111,7 +113,10 @@ namespace Vulkan {
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
-        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// `render_target`: a large single-level image, placed in the render target pool's
+        /// blocks when it fits there (Device::SeparatePool::RenderTargets).
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                                 bool render_target = false) const;
 
         /// Optional resources: one budget-respecting attempt, no pressure/failure signals or
         /// mandatory-resource fallbacks. Only allocation OOM returns null; other errors propagate.
@@ -124,6 +129,10 @@ namespace Vulkan {
         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
 
         /// Device memory to bind to part of a sparse resource. Null when there is none left.
+        /// An image in the render target pool's blocks; false when there is no pool for its
+        /// memory type or it did not fit, and the caller allocates it the usual way.
+        bool CreateImageInRenderTargetPool(const VkImageCreateInfo& ci, vk::Image& image) const;
+
         /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
         bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
                                         const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
@@ -192,6 +201,9 @@ namespace Vulkan {
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;
+        /// Memory type of device-local images by type, format, samples, usage and flags
+        /// (CreateImageInRenderTargetPool).
+        mutable std::map<std::array<u32, 5>, u32> image_memory_types;
     };
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.

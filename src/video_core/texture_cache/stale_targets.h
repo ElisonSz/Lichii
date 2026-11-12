@@ -29,6 +29,9 @@ inline u64 retire_age = 10;
 /// The Vulkan runtime keeps the host images of deleted cache images for the next image of their
 /// shape (HostImagePool). EDEN_NX2_IMAGE_POOL=0 turns that off.
 inline bool pool_images = true;
+/// Large single-level images take their memory from the render target pool's blocks instead of
+/// a driver allocation each (Vulkan::Device::SeparatePool). EDEN_NX2_TARGET_POOL=0 turns it off.
+inline bool target_memory_pool = true;
 inline void ReadSwitch() {
     const char* const keep = std::getenv("EDEN_NX2_KEEP_STALE_TARGETS");
     enabled = keep == nullptr || keep[0] != '1';
@@ -38,6 +41,8 @@ inline void ReadSwitch() {
     retire_age = age != nullptr ? std::strtoull(age, nullptr, 10) : 10;
     const char* const pool = std::getenv("EDEN_NX2_IMAGE_POOL");
     pool_images = pool == nullptr || pool[0] != '0';
+    const char* const target_pool = std::getenv("EDEN_NX2_TARGET_POOL");
+    target_memory_pool = target_pool == nullptr || target_pool[0] != '0';
 }
 
 /// Why an older target a whole clear overlapped stays, for the memory trace.
