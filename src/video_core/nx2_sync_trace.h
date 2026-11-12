@@ -460,18 +460,20 @@ inline void MaybeReport() {
         }
         seconds = static_cast<double>(stamp - state.since) / 1e9;
         state.since = stamp;
-        // Attribute only when the representative report has resolved (or expired).
-        for (auto it = state.closed_idle.begin(); it != state.closed_idle.end();) {
-            const auto& report = *it->report;
-            if (report.at[L] != 0 || report.discarded || stamp - report.at[R] > 30'000'000'000LL) {
-                ++state.window.idle.pending_count;
-                state.window.idle.pending_ns += it->end - it->start;
-                AttributeIdle(*it);
-                it = state.closed_idle.erase(it);
-            } else {
-                ++it;
+        // Attribute only when the representative report has resolved (or expired). One pass:
+        // erasing spans one at a time moved the rest each time, seconds under this lock in
+        // Castle Town (tens of thousands of spans), and the back waited on it.
+        std::erase_if(state.closed_idle, [stamp](const IdleSpan& span) {
+            const Report& report = *span.report;
+            if (report.at[L] == 0 && !report.discarded &&
+                stamp - report.at[R] <= 30'000'000'000LL) {
+                return false;
             }
-        }
+            ++state.window.idle.pending_count;
+            state.window.idle.pending_ns += span.end - span.start;
+            AttributeIdle(span);
+            return true;
+        });
         // Keep unfinished reports across windows, but bound stale state after shutdown/unmaps.
         for (auto it = state.reports.begin(); it != state.reports.end();) {
             const auto& report = *it->second;
