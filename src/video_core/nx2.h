@@ -18,6 +18,7 @@
 
 #include "common/bit_util.h"
 #include "common/common_types.h"
+#include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_sem_recorder.h"
 #include "video_core/nx2_sync_trace.h"
 
@@ -599,26 +600,35 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (Slot& slot : slots) {
-            if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
-                slot.address == device_address && Matches(slot, value)) {
-                VideoCommon::SemRecorder::Record("waiter-latch", device_address, value, slot.value,
-                                                 slot.operation);
-                const u8 previous = slot.latched.load(std::memory_order_relaxed);
-                if (VideoCommon::SyncTrace::enabled && previous == 0) {
-                    slot.sync_trace_id = sync_trace_id;
-                    if (sync_trace_id != 0) {
-                        VideoCommon::SyncTrace::Matched(
-                            sync_trace_id, slot.owner.load(std::memory_order_relaxed));
+        bool newly_latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (Slot& slot : slots) {
+                if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
+                    slot.address == device_address && Matches(slot, value)) {
+                    VideoCommon::SemRecorder::Record("waiter-latch", device_address, value,
+                                                     slot.value, slot.operation);
+                    const u8 previous = slot.latched.load(std::memory_order_relaxed);
+                    if (VideoCommon::SyncTrace::enabled && previous == 0) {
+                        slot.sync_trace_id = sync_trace_id;
+                        if (sync_trace_id != 0) {
+                            VideoCommon::SyncTrace::Matched(
+                                sync_trace_id, slot.owner.load(std::memory_order_relaxed));
+                        }
                     }
+                    // Keep the first source, and retain the release publication on every matching
+                    // write: the acquire sees the engine's preceding writes as before.
+                    slot.latched.store(previous != 0 ? previous
+                                                     : static_cast<u8>(static_cast<u8>(source) + 1),
+                                       std::memory_order_release);
+                    newly_latched |= previous == 0;
                 }
-                // Keep the first source, and retain the release publication on every matching
-                // write: the acquire sees the engine's preceding writes as before.
-                slot.latched.store(previous != 0 ? previous
-                                                 : static_cast<u8>(static_cast<u8>(source) + 1),
-                                   std::memory_order_release);
             }
+        }
+        // Never wake the front under the waiter-table lock; it may immediately remove its slot.
+        if (VideoCommon::FastWake::enabled && newly_latched &&
+            VideoCommon::FastWake::pending.Notify()) {
+            VideoCommon::FastWake::counters.latch_signals.fetch_add(1, std::memory_order_relaxed);
         }
     }
 

@@ -25,12 +25,13 @@
 #include "video_core/front_qmd.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
-#include "video_core/nx2_sync_trace.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_base.h"
 
 #include "video_core/wait_stats.h"
@@ -98,6 +99,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             VideoCommon::Nx2AcquireStats::MaybeReport();
             VideoCommon::Nx2AcquireDetails::Report();
             if (scheduler.HasPendingChannels()) {
+                // Take this before polling: a latch between the poll and sleep must not be lost.
+                const u64 pending_generation =
+                    VideoCommon::FastWake::enabled ? VideoCommon::FastWake::pending.Snapshot() : 0;
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;
                 {
@@ -131,6 +135,25 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (VideoCommon::FastWake::enabled) {
+                        auto& wake_counts = VideoCommon::FastWake::counters;
+                        wake_counts.pending_waits.fetch_add(1, std::memory_order_relaxed);
+                        // Keep Windows fallback polling near the old timer tick; real latches
+                        // and queued commands interrupt it rather than waiting for the timer.
+#ifdef _WIN32
+                        constexpr auto poll_timeout = std::chrono::microseconds{500};
+#else
+                        constexpr auto poll_timeout = std::chrono::microseconds{50};
+#endif
+                        const auto timeout = waited < std::chrono::seconds{2}
+                                                 ? poll_timeout
+                                                 : std::chrono::microseconds{1000};
+                        const auto result =
+                            VideoCommon::FastWake::pending.Wait(pending_generation, timeout);
+                        auto& counter = result == VideoCommon::FastWake::Signal::Result::Notified
+                                            ? wake_counts.pending_notified
+                                            : wake_counts.pending_timeouts;
+                        counter.fetch_add(1, std::memory_order_relaxed);
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32
                         // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
@@ -266,6 +289,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    if (VideoCommon::FastWake::enabled && VideoCommon::FastWake::pending.Notify()) {
+        VideoCommon::FastWake::counters.command_signals.fetch_add(1, std::memory_order_relaxed);
+    }
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
@@ -279,6 +305,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 void ThreadManager::NotifyShutdown() {
     if (thread.joinable()) {
         thread.request_stop();
+        if (VideoCommon::FastWake::enabled) {
+            VideoCommon::FastWake::pending.Notify();
+        }
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();

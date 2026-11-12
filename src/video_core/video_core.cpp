@@ -22,6 +22,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_perf.h"
@@ -69,8 +70,10 @@ void WaitForAsyncTeardown() {
 }
 
 /// @brief Creates an emulated GPU instance using the given system context.
-void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
+void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window,
+               Core::System& system) {
     Settings::UpdateRescalingInfo();
+    VideoCommon::FastWake::ReadSwitch();
     VideoCommon::SyncTrace::ReadSwitch();
     VideoCommon::StreamStats::ReadSwitch();
     VideoCommon::WaitStats::ReadSwitch();

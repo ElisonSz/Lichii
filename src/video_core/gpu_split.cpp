@@ -149,8 +149,7 @@ void GpuSplit::RequestTick() {
         state, state | TickRequested, std::memory_order_seq_cst, std::memory_order_relaxed));
     // Paired with the back's check after setting back_waiting: one side sees the other.
     if (back_waiting.load(std::memory_order_seq_cst)) {
-        wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        WakeBack();
     }
 }
 
@@ -201,8 +200,7 @@ void GpuSplit::Stop() {
         return;
     }
     back_thread.request_stop();
-    wake.fetch_add(1, std::memory_order_seq_cst);
-    wake.notify_one();
+    WakeBack();
     back_thread.join();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
@@ -369,8 +367,7 @@ void GpuSplit::Publish() {
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
-        wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        WakeBack();
     }
 }
 
@@ -684,6 +681,19 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         std::this_thread::yield();
         return;
     }
+    if (FastWake::enabled) {
+        front_waiting.store(true, std::memory_order_seq_cst);
+        const u64 seen = position_signal.Snapshot();
+        if (consumed.load(std::memory_order_seq_cst) < target) {
+            FastWake::counters.position_waits.fetch_add(1, std::memory_order_relaxed);
+            if (position_signal.Wait(seen, std::chrono::milliseconds{1}) ==
+                FastWake::Signal::Result::Timeout) {
+                FastWake::counters.position_timeouts.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        front_waiting.store(false, std::memory_order_seq_cst);
+        return;
+    }
     // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
@@ -919,8 +929,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
+            // A bounded sleep can time out with no new work. Do not repeat the spin budget
+            // after the idle hook has already made the back quiet.
+            const u32 spin_limit =
+                FastWake::enabled && back_quiet.load(std::memory_order_relaxed) ? 0U : 8192U;
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            for (u32 spins = 0; spins < spin_limit && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed) &&
                                 (tick_state.load(std::memory_order_relaxed) & TickRequested) == 0;
                  ++spins) {
@@ -954,6 +968,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // at `published`, so a publish in between ends the wait at once.
                 back_waiting.store(true, std::memory_order_seq_cst);
                 const u32 seen = wake.load(std::memory_order_seq_cst);
+                const u64 fast_seen = FastWake::enabled ? back_signal.Snapshot() : 0;
                 available = published.load(std::memory_order_seq_cst);
                 // Idle-hook and tick requests made since the hooks ran must prevent sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
@@ -963,7 +978,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     if (SyncTrace::enabled) {
                         SyncTrace::IdleFlag(true);
                     }
-                    wake.wait(seen, std::memory_order_seq_cst);
+                    if (FastWake::enabled) {
+                        FastWake::counters.back_waits.fetch_add(1, std::memory_order_relaxed);
+                        if (back_signal.Wait(fast_seen, std::chrono::milliseconds{1}) ==
+                            FastWake::Signal::Result::Timeout) {
+                            FastWake::counters.back_timeouts.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+                        }
+                    } else {
+                        wake.wait(seen, std::memory_order_seq_cst);
+                    }
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
@@ -1023,6 +1047,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     // it runs on the front after a settings stop, or #1058 releases it at final shutdown.
     tick_state.fetch_and(~(TickAccepting | TickRequested), std::memory_order_seq_cst);
     back_running.store(false, std::memory_order_seq_cst);
+    if (FastWake::enabled) {
+        position_signal.Notify();
+    }
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
 }

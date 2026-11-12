@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_sem_recorder.h"
 #include "video_core/nx2_sync_trace.h"
 
@@ -196,8 +197,7 @@ public:
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
-        wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        WakeBack();
     }
 
     /// Set before the GPU threads start, cleared after they have joined.
@@ -603,6 +603,7 @@ public:
 
 private:
     friend struct GpuSplitTestAccess;
+    friend struct FastWakeTestAccess;
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -710,6 +711,12 @@ private:
             return;
         }
         const u64 unpublished = write_position - published_local;
+        if (FastWake::enabled && unpublished != 0 &&
+            back_idle_at.load(std::memory_order_relaxed) == published_local) {
+            FastWake::counters.idle_publishes.fetch_add(1, std::memory_order_relaxed);
+            Publish();
+            return;
+        }
         if (unpublished >= publish_every) {
             Publish();
             return;
@@ -753,9 +760,26 @@ private:
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
+            if (FastWake::enabled) {
+                if (position_signal.Notify()) {
+                    FastWake::counters.position_signals.fetch_add(1, std::memory_order_relaxed);
+                }
+                return;
+            }
             front_wake.fetch_add(1, std::memory_order_seq_cst);
             front_wake.notify_one();
         }
+    }
+
+    void WakeBack() {
+        if (FastWake::enabled) {
+            if (back_signal.Notify()) {
+                FastWake::counters.back_signals.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
     }
 
     void BackLoop(std::stop_token stop_token);
@@ -891,9 +915,11 @@ private:
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
+    FastWake::Signal back_signal;
     /// The front sleeps in Backoff (#161: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
+    FastWake::Signal position_signal;
     /// The back's position when it last ran out of work, stored before it waits: while
     /// it equals published_local, the back waits for the words the front holds (Commit). Port of
     /// the publish part of 62db242b34 (jpkto, PR #805).

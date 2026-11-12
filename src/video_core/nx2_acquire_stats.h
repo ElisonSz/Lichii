@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -17,6 +18,7 @@
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_wake.h"
 
 // All accounting belongs to the front. The latch publishes its source in its existing atomic;
 // neither the back nor a fence callback touches these counters or takes an accounting lock.
@@ -288,7 +290,36 @@ inline std::string TimingText(const Timing& time) {
                        time.over_1ms);
 }
 
+inline void ReportFastWake() {
+    if (!FastWake::enabled) {
+        return;
+    }
+    static auto last_report = Clock::now();
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last_report = now;
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    auto& counts = FastWake::counters;
+    LOG_INFO(HW_GPU,
+             "Fast wake {:.3f}s: latch_signals={} command_signals={} pending_waits={} "
+             "pending_notified={} "
+             "pending_timeouts={} position_signals={} position_waits={} position_timeouts={} "
+             "idle_publishes={} back_signals={} back_waits={} back_timeouts={}",
+             seconds, take(counts.latch_signals), take(counts.command_signals),
+             take(counts.pending_waits), take(counts.pending_notified),
+             take(counts.pending_timeouts), take(counts.position_signals),
+             take(counts.position_waits), take(counts.position_timeouts),
+             take(counts.idle_publishes), take(counts.back_signals), take(counts.back_waits),
+             take(counts.back_timeouts));
+}
+
 inline void Report() {
+    ReportFastWake();
     if (!g_enabled) {
         return;
     }
