@@ -29,8 +29,8 @@ inline u64 retire_age = 10;
 /// The Vulkan runtime keeps the host images of deleted cache images for the next image of their
 /// shape (HostImagePool). EDEN_NX2_IMAGE_POOL=0 turns that off.
 inline bool pool_images = true;
-/// Large single-level images created for render-target binding use the target pool's blocks
-/// (Vulkan::Device::SeparatePool). EDEN_NX2_TARGET_POOL=0 turns it off.
+/// Large single-level images take their memory from the render target pool's blocks instead of
+/// a driver allocation each (Vulkan::Device::SeparatePool). EDEN_NX2_TARGET_POOL=0 turns it off.
 inline bool target_memory_pool = true;
 inline void ReadSwitch() {
     const char* const keep = std::getenv("EDEN_NX2_KEEP_STALE_TARGETS");

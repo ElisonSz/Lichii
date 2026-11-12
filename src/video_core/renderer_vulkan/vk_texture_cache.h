@@ -98,7 +98,6 @@ public:
         VkImageUsageFlags usage;
         const VkFormat* view_formats; ///< The view format list's storage, one per guest format
         size_t view_format_count;
-        bool render_target_origin; ///< Keep target-pool blocks out of sampled-texture reuse.
 
         [[nodiscard]] bool operator==(const Key&) const noexcept = default;
     };
@@ -250,7 +249,6 @@ public:
         u64 framebuffers{};
         u64 framebuffer_ns{};
         u64 pool_pressure_releases{};
-        u64 target_refused_origin{};
     };
     HostObjectStats host_object_stats;
     bool host_memory_trace{};
@@ -637,7 +635,7 @@ private:
 class Image : public VideoCommon::ImageBase {
 public:
     explicit Image(TextureCacheRuntime&, const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
-                   VAddr cpu_addr, bool render_target_origin = false);
+                   VAddr cpu_addr);
     explicit Image(const VideoCommon::NullImageParams&);
 
     ~Image();

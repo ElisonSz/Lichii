@@ -3704,17 +3704,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const bool render_target_origin = std::string_view{trace_origin} == "render-target" ||
-                                      std::string_view{trace_origin} == "clear-target";
     const ImageId new_image_id = [&] {
         const StreamStats::Scope create_scope{StreamStats::Counter::CreateNs};
-        if constexpr (requires {
-                          Image(runtime, new_info, gpu_addr, cpu_addr, render_target_origin);
-                      }) {
-            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr, render_target_origin);
-        } else {
-            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
-        }
+        return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     }();
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
@@ -3752,7 +3744,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     Image& new_image = slot_images[new_image_id];
 
-    TextureCacheOperations::Created(*this, new_image, render_target_origin);
+    TextureCacheOperations::Created(*this, new_image,
+                                    std::string_view{trace_origin} == "render-target" ||
+                                        std::string_view{trace_origin} == "clear-target");
     new_image.allocation_tick = frame_tick;
     if (mem_trace_enabled) {
         ++trace_created;

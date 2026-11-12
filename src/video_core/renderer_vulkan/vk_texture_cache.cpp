@@ -575,8 +575,7 @@ private:
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
                                   bool may_fail = false, TextureCacheRuntime* pool = nullptr,
-                                  std::optional<HostImagePool::Key>* pool_key = nullptr,
-                                  bool render_target_origin = false) {
+                                  std::optional<HostImagePool::Key>* pool_key = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -626,26 +625,23 @@ private:
             .usage = image_ci.usage,
             .view_formats = view_formats.data(),
             .view_format_count = view_formats.size(),
-            .render_target_origin = render_target_origin,
         };
         if (vk::Image kept = pool->TakeHostImage(**pool_key)) {
             return kept;
         }
     }
-    // Only render-target creations share the large blocks, to avoid pinning them with textures.
+    // A game that sizes its shadow maps by the view makes a dozen large single-level images a
+    // frame, each target with the texture that samples it, in sizes it never repeats: no kept
+    // image fits those, and over 8 MiB each would be a driver allocation of its own.
     const u64 texel_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
                             VideoCore::Surface::BytesPerBlock(info.format);
-    const bool target_pool_shape =
+    const bool render_target =
         pool != nullptr && may_fail && VideoCommon::StaleTargets::target_memory_pool &&
         image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 && image_ci.extent.depth == 1 &&
         image_ci.samples == VK_SAMPLE_COUNT_1_BIT &&
         VideoCore::Surface::DefaultBlockWidth(info.format) == 1 &&
         texel_bytes >= RenderTargetPoolMinBytes &&
         texel_bytes <= Device::RenderTargetPoolBlockSize / 2;
-    const bool render_target = target_pool_shape && render_target_origin;
-    if (target_pool_shape && !render_target_origin) {
-        ++pool->host_object_stats.target_refused_origin;
-    }
     const auto make = [&] {
         return may_fail ? allocator.TryCreateImage(image_ci, false, render_target)
                         : allocator.CreateImage(image_ci);
@@ -3143,7 +3139,7 @@ size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
           u64{key.width}, u64{key.height}, u64{key.depth}, u64{key.levels}, u64{key.layers},
           static_cast<u64>(key.samples), u64{key.usage},
           static_cast<u64>(reinterpret_cast<uintptr_t>(key.view_formats)),
-          static_cast<u64>(key.view_format_count), u64{key.render_target_origin}}) {
+          static_cast<u64>(key.view_format_count)}) {
         hash = (hash ^ part) * 0x100000001B3ULL;
     }
     return static_cast<size_t>(hash ^ (hash >> 32));
@@ -3342,14 +3338,12 @@ void HostImagePool::ReportShapes() {
         ++(asked ? listed : unasked);
         LOG_INFO(Render_Vulkan,
                  "Memory trace: pool shape format {} {}x{}x{} levels {} layers {} samples {} "
-                 "usage {:#x} flags {:#x} views {}@{} target-origin {}: "
-                 "hits {} misses {} kept {} refused {}; "
+                 "usage {:#x} flags {:#x} views {}@{}: hits {} misses {} kept {} refused {}; "
                  "holds {} images {} MiB",
                  static_cast<u32>(row.key.format), row.key.width, row.key.height, row.key.depth,
                  row.key.levels, row.key.layers, static_cast<u32>(row.key.samples),
                  static_cast<u32>(row.key.usage), static_cast<u32>(row.key.flags),
-                 row.key.view_format_count, fmt::ptr(row.key.view_formats),
-                 row.key.render_target_origin, row.shape.hits,
+                 row.key.view_format_count, fmt::ptr(row.key.view_formats), row.shape.hits,
                  row.shape.misses, row.shape.kept, row.shape.refused, row.held,
                  row.held_bytes >> 20);
     }
@@ -3438,17 +3432,17 @@ void TextureCacheRuntime::TickFrame() {
                  host_image_pool.Bytes() >> 20);
         LOG_INFO(Render_Vulkan,
                  "Memory trace: image pool pressure: pre-fallback releases {}, trimmed {} images "
-                 "{} bytes; refused non-local {}, pending {}; target pool refused origin {}; "
-                 "expired {} bytes, expiry debt {} bytes",
+                 "{} bytes; refused non-local {}, pending {}; expired {} bytes, expiry debt {} "
+                 "bytes",
                  made.pool_pressure_releases, pool.trimmed, pool.trimmed_bytes,
-                 pool.refused_nonlocal, pool.refused_pending, made.target_refused_origin,
+                 pool.refused_nonlocal, pool.refused_pending,
                  pool.expired_bytes, host_image_pool.ExpiryDebt());
         host_image_pool.ReportShapes();
     }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
-             VAddr cpu_addr_, bool render_target_origin)
+             VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
@@ -3465,7 +3459,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true, &runtime_, &pool_key, render_target_origin)),
+                               true, &runtime_, &pool_key)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
