@@ -213,7 +213,8 @@ TEST_CASE("BackX tick: a reset clears only the extent tracked since the last one
 
 TEST_CASE("BackX report: the page filter holds every page of the set",
           "[video_core][nx2_backx]") {
-    // A model of read_back_pages: at most 64 pages, the least recently added one evicted.
+    // A model of read_back_pages (64 pages here; the cache keeps up to 512 by default), a
+    // random member evicted.
     for (u64 seed = 1; seed <= 20; ++seed) {
         std::mt19937_64 rng{seed};
         BackX::PageSetFilter filter;

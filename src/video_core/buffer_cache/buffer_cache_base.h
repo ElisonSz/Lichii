@@ -1192,15 +1192,19 @@ private:
     struct EarlyLimits {
         /// Reads of a page's writes in a row before its writes get early downloads.
         u16 after_reads;
-        /// Writes in a row without a read that stop them.
+        /// Writes in a row without a read that stop them. A page the guest reads every few
+        /// frames keeps them: Ocarina of Time reads each of its read-back pages every 5 to 40
+        /// frames, and several dispatches write it in between.
         u16 max_unread_writes;
+        /// Learned pages; the one read longest ago makes room. Ocarina of Time reads back
+        /// ~220 pages over a few seconds.
         size_t max_pages;
         /// Early download bytes a frame, and early downloads not yet in guest memory: past them,
         /// reads flush on demand.
         u64 bytes_per_frame;
         u32 max_pending;
     };
-    /// The limits above: 2 reads, 4 unread writes, 64 pages, 1 MiB a frame and 32 pending, or
+    /// The limits above: 2 reads, 256 unread writes, 512 pages, 8 MiB a frame and 512 pending, or
     /// EDEN_NX2_EARLY_AFTER_READS, _UNREAD, _PAGES, _KIB and _PENDING (comparisons; read at first
     /// use, after the frontend loaded its switches). They only decide which downloads are
     /// recorded early, never what a read finds: a read that no early download covers flushes.
@@ -1220,10 +1224,10 @@ private:
             };
             const EarlyLimits result{
                 .after_reads = static_cast<u16>(read("EDEN_NX2_EARLY_AFTER_READS", 2, 1000)),
-                .max_unread_writes = static_cast<u16>(read("EDEN_NX2_EARLY_UNREAD", 4, 60000)),
-                .max_pages = static_cast<size_t>(read("EDEN_NX2_EARLY_PAGES", 64, 65536)),
-                .bytes_per_frame = read("EDEN_NX2_EARLY_KIB", 1024, 1ULL << 20) * 1024,
-                .max_pending = static_cast<u32>(read("EDEN_NX2_EARLY_PENDING", 32, 4096)),
+                .max_unread_writes = static_cast<u16>(read("EDEN_NX2_EARLY_UNREAD", 256, 60000)),
+                .max_pages = static_cast<size_t>(read("EDEN_NX2_EARLY_PAGES", 512, 65536)),
+                .bytes_per_frame = read("EDEN_NX2_EARLY_KIB", 8192, 1ULL << 20) * 1024,
+                .max_pending = static_cast<u32>(read("EDEN_NX2_EARLY_PENDING", 512, 4096)),
             };
             LOG_INFO(HW_GPU,
                      "Early read-back downloads: after {} reads, up to {} unread writes, {} pages, "
