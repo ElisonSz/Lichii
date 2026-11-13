@@ -56,8 +56,10 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <utility>
@@ -81,6 +83,17 @@ static int memfd_create(const char* name, unsigned int flags) {
 #endif
 
 namespace Common {
+
+namespace {
+/// Steady clock time of the last Map or Unmap (HostMemory::NanosecondsSinceMapChange).
+std::atomic<u64> g_last_map_change_ns{};
+
+[[nodiscard]] u64 SteadyNowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // Anonymous namespace
 
 u64 Nx2MapStats::PageFaultCount() {
 #ifdef _WIN32
@@ -1206,6 +1219,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    g_last_map_change_ns.store(SteadyNowNs(), std::memory_order_relaxed);
     const bool map_stats = Nx2MapStats::Enabled();
     const u64 begin_ns = map_stats ? Nx2MapStats::NowNs() : 0;
     impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
@@ -1225,6 +1239,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    g_last_map_change_ns.store(SteadyNowNs(), std::memory_order_relaxed);
     const bool map_stats = Nx2MapStats::Enabled();
     const u64 begin_ns = map_stats ? Nx2MapStats::NowNs() : 0;
     impl->Unmap(virtual_offset + virtual_base_offset, length);
@@ -1291,11 +1306,22 @@ u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
 }
 
+u64 HostMemory::NanosecondsSinceMapChange() noexcept {
+    const u64 last = g_last_map_change_ns.load(std::memory_order_relaxed);
+    return last == 0 ? (std::numeric_limits<u64>::max)() : SteadyNowNs() - last;
+}
+
 std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
 #ifdef _WIN32
     if (backing_base == nullptr) {
         return {0, 0};
     }
+    // A pass gives way to a guest that starts mapping or unmapping memory meanwhile: what it holds
+    // of the kernel's working-set lock (the query, the unlocks) each of those maps waits for.
+    const u64 started_ns = SteadyNowNs();
+    const auto mapping_started = [started_ns] {
+        return g_last_map_change_ns.load(std::memory_order_relaxed) > started_ns;
+    };
     std::vector<ULONG_PTR> entries(size_t{1} << 22);
     for (int attempt = 0;; ++attempt) {
         if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
@@ -1320,6 +1346,10 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         } else if (view_begin != 0 && page - view_begin < view_size) {
             view_pages.push_back(page);
         }
+    }
+    const size_t resident = (backing_pages.size() + view_pages.size()) * PageAlignment;
+    if (mapping_started()) {
+        return {resident, 0};
     }
     std::sort(backing_pages.begin(), backing_pages.end());
     // Pages are only ever read through the backing, which stays mapped and writable: a view page
@@ -1362,6 +1392,9 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             trim.push_back(backing_page);
         }
     }
+    if (mapping_started()) {
+        return {resident, 0};
+    }
     std::sort(trim.begin(), trim.end());
     trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
     // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
@@ -1382,7 +1415,7 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         unlock(trim[i], trim[j - 1] + PageAlignment);
         i = j;
     }
-    return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
+    return {resident, zero_bytes};
 #else
     return {0, 0};
 #endif

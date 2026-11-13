@@ -70,6 +70,10 @@ public:
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;
 
+    /// Nanoseconds since the last Map or Unmap of any HostMemory; the largest u64 before the first.
+    /// A guest streaming memory in or out maps and unmaps many times a second.
+    [[nodiscard]] static u64 NanosecondsSinceMapChange() noexcept;
+
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 
