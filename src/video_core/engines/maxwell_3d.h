@@ -3560,6 +3560,10 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// EDEN_NX2_MACRO_BATCH: the writes a macro call buffered, (method, value) pairs in order.
+    /// `check`: plain writes go to FrontWrite too, which must do what the loop would have done.
+    void FrontWriteBatch(VideoCommon::GpuSplit& split, FrontState& state,
+                         std::span<const u32> writes, bool check);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

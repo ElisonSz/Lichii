@@ -272,6 +272,44 @@ public:
         }
         NoteWrites(writes);
     }
+    /// The entry MacroWrite sends for a write (MacroWrites).
+    [[nodiscard]] static u64 MacroWriteEntry(u32 method, u32 argument) {
+        return static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
+               (u64{argument} << 32);
+    }
+    /// Writes made by a macro, `entries` from MacroWriteEntry, sent as that many MacroWrite calls
+    /// with Writes::Noted would send them (EDEN_NX2_MACRO_BATCH): the same words at the same
+    /// positions (one-word entries fill the ring up to its end, none wraps), each entry committed
+    /// as Commit does; the publish check runs once, after the last.
+    void MacroWrites(Tegra::Engines::EngineInterface* engine, std::span<const u64> entries) {
+        if (entries.empty()) {
+            return;
+        }
+        SelectEngine(engine);
+        for (size_t done = 0; done < entries.size();) {
+            const size_t count =
+                (std::min)(entries.size() - done, RingWords - (write_position & RingMask));
+            u64* const destination = Reserve(count);
+            std::memcpy(destination, entries.data() + done, count * sizeof(u64));
+            if (profile_publishes && write_position == published_local) {
+                NoteFirstUnpublished();
+            }
+            if (SyncTrace::enabled) {
+                for (size_t i = 0; i < count; ++i) {
+                    SyncTrace::Commit(write_position + i);
+                }
+            }
+            last_entry_start = write_position + count - 1;
+            write_position += count;
+            done += count;
+        }
+        PublishIfDue();
+        if (log_methods) {
+            for (const u64 entry : entries) {
+                LogMethod(engine, static_cast<u32>((entry >> 8) & 0xffff)); // TEST
+            }
+        }
+    }
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;

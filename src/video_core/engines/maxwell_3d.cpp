@@ -32,6 +32,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_macro.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1198,6 +1199,10 @@ struct Maxwell3D::FrontState {
     u64 back_last{};                 ///< The position after the last macro sent to the back
     std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
     u32 back_escapes_seen{};
+    /// EDEN_NX2_MACRO_FASTCALL: by start in the code of back_generation, 1 once FrontRunOnBack
+    /// decided the macro runs on the front (it stays there until the code changes).
+    std::vector<u8> front_only;
+    bool split_verify{}; ///< FrontVerifyEnabled(), read once
 };
 
 namespace {
@@ -1406,6 +1411,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        front->split_verify = FrontVerifyEnabled();
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
@@ -1696,13 +1702,23 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    namespace Macro = VideoCommon::Nx2Macro;
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
-    if (!FrontRunOnBack(system, split, fs, engine, start)) {
+    // EDEN_NX2_MACRO_FASTCALL: FrontRunOnBack would return false without doing anything: the code
+    // and the escapes are the ones it last saw, and it put this start on the front.
+    const bool front_only =
+        Macro::g_fastcall && fs.back_generation == engine.native_code_generation &&
+        fs.back_escapes.load(std::memory_order_relaxed) == fs.back_escapes_seen &&
+        start < fs.front_only.size() && fs.front_only[start] != 0;
+    if (front_only) {
+        Macro::Count(Macro::Counter::FastCalls);
+    }
+    if (front_only || !FrontRunOnBack(system, split, fs, engine, start)) {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
             channel != nullptr && !channel->words.empty()) {
@@ -1731,9 +1747,49 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         if (!engine.native_jit) {
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+        TuringMacroJit::Result result;
+        if (Macro::g_batch) {
+            // EDEN_NX2_MACRO_BATCH: the same writes and reads in the same order; the writes the
+            // JIT buffered come in batches, always before the next read or DMA read.
+            engine.native_jit->PrepareBatched(engine.native_code, engine.native_code_generation);
+            const std::span<u32> data_ram{native_data_ram};
+            if (Macro::SampleVerify()) [[unlikely]] {
+                Macro::CallCheck check{start, fs.parameters, data_ram};
+                result = engine.native_jit->ExecuteBatched(
+                    start, fs.parameters, data_ram,
+                    [&](u32 address) {
+                        const u32 value = read(address);
+                        check.NoteRead(address, value);
+                        return value;
+                    },
+                    [&](u32 address, u32 value) {
+                        check.NoteWrite(address, value);
+                        return emit(address, value);
+                    },
+                    [&](std::span<const u32> writes) {
+                        check.NoteWrites(writes);
+                        FrontWriteBatch(split, fs, writes, true);
+                    });
+                check.Compare(*engine.native_jit, engine.native_code, engine.native_code_generation,
+                              result, data_ram, method);
+            } else {
+                result = engine.native_jit->ExecuteBatched(
+                    start, fs.parameters, data_ram, read, emit, [&](std::span<const u32> writes) {
+                        FrontWriteBatch(split, fs, writes, false);
+                    });
+            }
+            if (Macro::g_stats || Macro::g_verify_every != 0) [[unlikely]] {
+                static u32 calls{};
+                Macro::Count(Macro::Counter::Calls);
+                if ((++calls & 4095) == 0) {
+                    Macro::Report();
+                }
+            }
+        } else {
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+            result = engine.native_jit->Execute(start, fs.parameters,
+                                                std::span<u32>{native_data_ram}, read, emit);
+        }
 #else
         const auto result =
             engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
@@ -1750,8 +1806,125 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
                     VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Caches);
     }
-    if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+    const bool split_verify = Macro::g_fastcall ? fs.split_verify : FrontVerifyEnabled();
+    if (split_verify && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
+    }
+}
+
+namespace {
+
+/// What FrontWrite does for a write a macro made to a register no method handler acts on and that
+/// the front owns (not executable, not back-owned): the value the back's register gets, the shadow
+/// RAM entry, and whether the write is sent (else it changes nothing there).
+struct PlainWrite {
+    u32 value;
+    u32 shadow;
+    bool send;
+};
+
+template <typename FrontStateT>
+[[nodiscard]] PlainWrite PlainWriteOutcome(const FrontStateT& fs, u32 method, u32 argument) {
+    using Control = Maxwell3D::Regs::ShadowRamControl;
+    u32 value = argument;
+    u32 shadow = fs.shadow[method];
+    bool shadow_kept = true;
+    if (fs.control == Control::Track || fs.control == Control::TrackWithFilter) {
+        shadow_kept = shadow == argument;
+        shadow = argument;
+    } else if (fs.control == Control::Replay) {
+        value = shadow;
+    }
+    return {value, shadow, !(fs.regs[method] == value && shadow_kept && fs.skip_same)};
+}
+
+} // Anonymous namespace
+
+void Maxwell3D::FrontWriteBatch(VideoCommon::GpuSplit& split, FrontState& fs,
+                                std::span<const u32> writes, bool check) {
+    namespace Macro = VideoCommon::Nx2Macro;
+    namespace Profile = VideoCommon::Nx2Profile;
+    const bool profiled = Profile::Enabled();
+    // The entries of plain writes not sent yet: they go out in one piece (GpuSplit::MacroWrites)
+    // before any other write is made, and at the end.
+    std::array<u64, 256> entries;
+    size_t pending = 0;
+    u64 sent = 0;
+    u64 same = 0;
+    u64 other = 0;
+    const auto send_pending = [&] {
+        if (pending == 0) {
+            return;
+        }
+        split.MacroWrites(this, std::span<const u64>{entries.data(), pending});
+        pending = 0;
+        fs.sink_pending = false;
+        // FrontNoteWrites for each of them: a draw may be pending, the caches may be written.
+        if (fs.draw_pending) {
+            split.NoteCacheWrite();
+        }
+    };
+    for (size_t i = 0; i + 1 < writes.size(); i += 2) {
+        // Below MacroRegistersStart, not an MME DMA read (TuringMacroJit::ExecuteBatched).
+        const u32 method = writes[i];
+        const u32 argument = writes[i + 1];
+        if (execution_mask[method] || fs.back_owned[method]) {
+            send_pending();
+            ++other;
+            FrontWrite(split, fs, method, argument, true, true);
+            continue;
+        }
+        // FrontWrite's steps for it: the shadow RAM, the same-value skip, the register, the
+        // entry (FrontNoteWrites: see send_pending).
+        const PlainWrite plain = PlainWriteOutcome(fs, method, argument);
+        if (check) [[unlikely]] {
+            const u64 position = split.Position();
+            const u32 before = fs.regs[method];
+            FrontWrite(split, fs, method, argument, true, true);
+            Macro::Count(Macro::Counter::WritesChecked);
+            const bool was_sent = split.Position() != position;
+            if (was_sent != plain.send || fs.regs[method] != (plain.send ? plain.value : before) ||
+                fs.shadow[method] != plain.shadow) {
+                Macro::Count(Macro::Counter::WriteMismatches);
+                static u32 logged{};
+                if (logged < 32) {
+                    ++logged;
+                    LOG_ERROR(HW_GPU,
+                              "Macro batch verify mismatch: write {:#x} = {:#x} (register was "
+                              "{:#x}, shadow mode {}): FrontWrite sent {} register {:#x} shadow "
+                              "{:#x}, the batch would send {} register {:#x} shadow {:#x}",
+                              method, argument, before, static_cast<u32>(fs.control), was_sent,
+                              fs.regs[method], fs.shadow[method], plain.send,
+                              plain.send ? plain.value : before, plain.shadow);
+                }
+            }
+            continue;
+        }
+        fs.shadow[method] = plain.shadow;
+        if (profiled) [[unlikely]] {
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            if (!plain.send) {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+        }
+        if (!plain.send) {
+            ++same;
+            continue;
+        }
+        ++sent;
+        fs.regs[method] = plain.value;
+        entries[pending++] = VideoCommon::GpuSplit::MacroWriteEntry(method, argument);
+        if (pending == entries.size()) {
+            send_pending();
+        }
+    }
+    send_pending();
+    if (Macro::g_stats || Macro::g_verify_every != 0) [[unlikely]] {
+        Macro::Count(Macro::Counter::Flushes);
+        Macro::Count(Macro::Counter::Buffered, writes.size() / 2);
+        Macro::Count(Macro::Counter::PlainSent, sent);
+        Macro::Count(Macro::Counter::PlainSame, same);
+        Macro::Count(Macro::Counter::OtherWrites, other);
     }
 }
 
@@ -1775,6 +1948,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         for (const auto& macro : fs.back_macros) {
             if (macro && macro->back && macro->escaped.load(std::memory_order_relaxed)) {
                 macro->back = false;
+                if (macro->start < fs.front_only.size()) {
+                    fs.front_only[macro->start] = 1;
+                }
                 fs.back_demoted.push_back(macro->start);
                 LOG_ERROR(HW_GPU,
                           "Split back macro at {:#x} wrote outside the registers its code "
@@ -1794,6 +1970,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         fs.back_macros.resize(engine.native_code.size() / 3);
         fs.back_generation = engine.native_code_generation;
         fs.back_code_copied = false;
+        if (VideoCommon::Nx2Macro::g_fastcall) {
+            fs.front_only.assign(fs.back_macros.size(), 0);
+        }
     } else if (fs.back_escapes.load(std::memory_order_relaxed) != fs.back_escapes_seen) {
         take_escapes();
     }
@@ -1838,6 +2017,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         }
     }
     if (!known->back) {
+        if (VideoCommon::Nx2Macro::g_fastcall && start < fs.front_only.size()) {
+            fs.front_only[start] = 1;
+        }
         return false;
     }
     if (!fs.back_engine) {

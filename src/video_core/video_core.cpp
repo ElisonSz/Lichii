@@ -27,6 +27,7 @@
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_macro.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_protect.h"
@@ -115,6 +116,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::ImageJoin::ReadSwitches();
     VideoCommon::Nx2Protect::ReadSwitch();
     VideoCommon::BackX::ReadSwitches();
+    VideoCommon::Nx2Macro::ReadSwitches();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;

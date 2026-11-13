@@ -35,6 +35,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_macro.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
@@ -2323,9 +2324,28 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
-    const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+    TuringMacroJit::Result result;
+    if (VideoCommon::Nx2Macro::g_batch) {
+        // EDEN_NX2_MACRO_BATCH: the JIT buffers the writes; each still runs `emit`, in order,
+        // before the next register read (`emit` changes neither the FIFO nor the data RAM).
+        namespace Macro = VideoCommon::Nx2Macro;
+        macro.native_jit->PrepareBatched(macro.native_code, macro.native_code_generation);
+        result = macro.native_jit->ExecuteBatched(
+            start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit,
+            [&](std::span<const u32> writes) {
+                Macro::Count(Macro::Counter::Flushes);
+                Macro::Count(Macro::Counter::Buffered, writes.size() / 2);
+                for (size_t i = 0; i + 1 < writes.size(); i += 2) {
+                    emit(writes[i], writes[i + 1]);
+                }
+            });
+        Macro::Count(Macro::Counter::ComputeCalls);
+    } else {
+        macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+        result = macro.native_jit->Execute(start, fs.parameters,
+                                           std::span<u32>{*macro.native_interpreter.active_dram},
+                                           read, emit);
+    }
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
