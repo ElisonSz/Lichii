@@ -8,6 +8,8 @@
 #include <functional>
 #include <mutex>
 #include <random>
+#include <deque>
+#include <map>
 #include <set>
 #include <thread>
 #include <utility>
@@ -43,6 +45,89 @@ private:
 u64 Counted(BackX::Counter counter) {
     return BackX::g_counters[static_cast<std::size_t>(counter)].load(std::memory_order_relaxed);
 }
+
+/// OPS: an operation that logs its id when it is destroyed (moved-from ones log nothing).
+class Tracer {
+public:
+    Tracer(int id_, std::vector<int>* log_) : id{id_}, log{log_} {}
+    Tracer(Tracer&& other) noexcept : id{other.id}, log{std::exchange(other.log, nullptr)} {}
+    Tracer& operator=(Tracer&&) = delete;
+    Tracer(const Tracer&) = delete;
+    Tracer& operator=(const Tracer&) = delete;
+    ~Tracer() {
+        if (log != nullptr) {
+            log->push_back(id);
+        }
+    }
+
+private:
+    int id;
+    std::vector<int>* log;
+};
+
+/// OPS: a released fence of the fence manager's batch, with its operation list.
+struct TracerEntry {
+    std::vector<Tracer> operations;
+};
+
+std::vector<TracerEntry> MakeTracerEntries(std::vector<int>& log, int entries, int per_entry) {
+    std::vector<TracerEntry> result(static_cast<std::size_t>(entries));
+    int id = 0;
+    for (TracerEntry& entry : result) {
+        entry.operations.reserve(static_cast<std::size_t>(per_entry));
+        for (int i = 0; i < per_entry; ++i) {
+            entry.operations.emplace_back(id++, &log);
+        }
+    }
+    return result;
+}
+
+/// OPS: a std::mutex that runs a hook each time it is given back, as if another thread had
+/// taken it in between.
+class HookMutex {
+public:
+    void lock() {
+        inner.lock();
+        held = true;
+        ++locks;
+    }
+    void unlock() {
+        held = false;
+        inner.unlock();
+        if (hook) {
+            hook();
+        }
+    }
+
+    std::mutex inner;
+    bool held = false;
+    std::size_t locks = 0;
+    std::function<void()> hook;
+};
+
+/// OPS: the query cache's registrations (newest location per address, under cache_mutex) and
+/// UnregisterPending's step for one completed query, as a model.
+struct QueryModel {
+    void Register(u64 address, u64 location) {
+        std::scoped_lock lock{mutex};
+        newest[address] = location;
+        address_of[location] = address;
+    }
+
+    /// With `mutex` held.
+    void Unregister(u64 location) {
+        const auto it = newest.find(address_of.at(location));
+        if (it != newest.end() && it->second == location) {
+            newest.erase(it);
+        }
+        freed.insert(location);
+    }
+
+    std::mutex mutex;
+    std::map<u64, u64> newest;
+    std::map<u64, u64> address_of;
+    std::set<u64> freed;
+};
 
 /// The 64-byte blocks of [address, address + size).
 void AddBlocks(std::set<u64>& blocks, u64 address, u64 size) {
@@ -489,4 +574,276 @@ TEST_CASE("BackX verify: mismatches are counted per check", "[video_core][nx2_ba
     REQUIRE(BackX::Mismatches(BackX::Check::Gather) - gather == 100);
     REQUIRE(BackX::Mismatches(BackX::Check::Report) - report == 1);
     REQUIRE(Counted(BackX::Counter::Mismatches) - total == 101);
+}
+
+TEST_CASE("BackX ops: a recycled list comes back empty with the storage it grew to",
+          "[video_core][nx2_backx]") {
+    BackX::ListRecycler<std::vector<int>, 4, 1024> recycler;
+    std::vector<int> list;
+    REQUIRE_FALSE(recycler.Take(list));
+    REQUIRE(list.capacity() == 0);
+
+    struct Entry {
+        std::vector<int> operations;
+    };
+    std::vector<Entry> entries(3);
+    std::vector<const int*> storage;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        entries[i].operations.assign(100 * (i + 1), 7);
+        storage.push_back(entries[i].operations.data());
+    }
+    const auto list_of = [](Entry& entry) -> std::vector<int>& { return entry.operations; };
+    recycler.Give(entries, list_of);
+    REQUIRE(recycler.Kept() == 3);
+    for (const Entry& entry : entries) {
+        REQUIRE(entry.operations.empty());
+    }
+    // The last list given comes back first, empty, with its storage.
+    for (std::size_t i = entries.size(); i-- > 0;) {
+        std::vector<int> taken;
+        REQUIRE(recycler.Take(taken));
+        REQUIRE(taken.empty());
+        REQUIRE(taken.capacity() >= 100 * (i + 1));
+        REQUIRE(taken.data() == storage[i]);
+    }
+    REQUIRE(recycler.Kept() == 0);
+    REQUIRE_FALSE(recycler.Take(list));
+}
+
+TEST_CASE("BackX ops: lists are emptied as destroying their entries would, and few are kept",
+          "[video_core][nx2_backx]") {
+    // The base: batch.clear() destroys the entries and so their operations.
+    std::vector<int> base_log;
+    {
+        std::vector<TracerEntry> entries = MakeTracerEntries(base_log, 6, 3);
+        entries.clear();
+    }
+    REQUIRE(base_log.size() == 18);
+
+    std::vector<int> log;
+    BackX::ListRecycler<std::vector<Tracer>, 4, 1024> recycler;
+    std::vector<TracerEntry> entries = MakeTracerEntries(log, 6, 3);
+    entries[1].operations.shrink_to_fit(); // still holds its three
+    entries.emplace_back();                // no storage: not kept
+    recycler.Give(entries,
+                  [](TracerEntry& entry) -> std::vector<Tracer>& { return entry.operations; });
+    REQUIRE(log == base_log);
+    REQUIRE(recycler.Kept() == 4);
+    // Entries past the fourth keep their (empty) lists for their own destruction.
+    REQUIRE(entries[4].operations.capacity() != 0);
+    REQUIRE(entries[5].operations.capacity() != 0);
+    entries.clear();
+    REQUIRE(log == base_log);
+
+    // A list without storage is not kept, and one grown past MaxCapacity is freed as before.
+    BackX::ListRecycler<std::vector<int>, 4, 64> small;
+    struct Entry {
+        std::vector<int> operations;
+    };
+    std::vector<Entry> lists(3);
+    lists[1].operations.reserve(65);
+    lists[2].operations.reserve(64);
+    small.Give(lists, [](Entry& entry) -> std::vector<int>& { return entry.operations; });
+    REQUIRE(small.Kept() == 1);
+    std::vector<int> taken;
+    REQUIRE(small.Take(taken));
+    REQUIRE(taken.capacity() == 64);
+}
+
+TEST_CASE("BackX ops: a filling thread and an emptying thread run every operation once in order",
+          "[video_core][nx2_backx]") {
+    using OperationList = std::vector<std::function<void()>>;
+    BackX::ListRecycler<OperationList, 16, 4096> recycler;
+    std::mutex queue_guard;
+    std::deque<OperationList> queue; // pending_operations
+    std::atomic<bool> done{false};
+    std::vector<u64> ran;
+    u64 reused = 0;
+    bool taken_not_empty = false; // Catch2 asserts on this thread only
+    constexpr u64 Operations = 200000;
+    std::thread filler([&] { // SignalFence
+        std::mt19937_64 rng{42};
+        OperationList list;
+        list.reserve(64);
+        for (u64 next = 0; next < Operations;) {
+            const u64 count = 1 + rng() % 200;
+            for (u64 i = 0; i < count && next < Operations; ++i, ++next) {
+                list.emplace_back([&ran, next] { ran.push_back(next); });
+            }
+            {
+                std::scoped_lock lock{queue_guard};
+                queue.emplace_back(std::move(list));
+            }
+            list.clear();
+            if (recycler.Take(list)) {
+                ++reused;
+                taken_not_empty |= !list.empty();
+            } else {
+                list.reserve(64);
+            }
+        }
+        done.store(true, std::memory_order_release);
+    });
+    struct Released {
+        OperationList operations;
+    };
+    std::vector<Released> batch; // ReleaseThreadFunc
+    while (true) {
+        const bool last = done.load(std::memory_order_acquire);
+        {
+            std::scoped_lock lock{queue_guard};
+            while (!queue.empty() && batch.size() < 8) {
+                batch.push_back({std::move(queue.front())});
+                queue.pop_front();
+            }
+        }
+        if (batch.empty()) {
+            if (last) {
+                break;
+            }
+            std::this_thread::yield();
+            continue;
+        }
+        for (Released& released : batch) {
+            for (auto& operation : released.operations) {
+                operation();
+            }
+        }
+        recycler.Give(batch,
+                      [](Released& released) -> OperationList& { return released.operations; });
+        batch.clear();
+    }
+    filler.join();
+    REQUIRE_FALSE(taken_not_empty);
+    REQUIRE(ran.size() == Operations);
+    for (u64 i = 0; i < Operations; ++i) {
+        REQUIRE(ran[i] == i);
+    }
+    REQUIRE(reused > 0);
+    REQUIRE(recycler.Kept() <= 16);
+}
+
+TEST_CASE("BackX ops: chunked passes visit every element once, in order, with the lock held",
+          "[video_core][nx2_backx]") {
+    for (const std::size_t size : {std::size_t{0}, std::size_t{1}, std::size_t{31}, std::size_t{32},
+                                   std::size_t{33}, std::size_t{100}, std::size_t{1000}}) {
+        std::vector<std::size_t> items(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            items[i] = i;
+        }
+        HookMutex mutex;
+        std::vector<std::size_t> visited;
+        std::vector<std::size_t> released_after; // elements done at each unlock
+        mutex.hook = [&] { released_after.push_back(visited.size()); };
+        const std::size_t holds =
+            BackX::ForEachLockedInChunks<32>(items, mutex, [&](std::size_t item) {
+                REQUIRE(mutex.held);
+                visited.push_back(item);
+            });
+        REQUIRE(visited == items);
+        REQUIRE(holds == (size + 31) / 32);
+        REQUIRE(mutex.locks == holds);
+        REQUIRE(released_after.size() == holds);
+        for (std::size_t i = 0; i < released_after.size(); ++i) {
+            REQUIRE(released_after[i] == (std::min)(size, (i + 1) * 32));
+        }
+    }
+}
+
+TEST_CASE("BackX ops: reports between unregister chunks leave each address as the base would",
+          "[video_core][nx2_backx]") {
+    for (u64 seed = 1; seed <= 20; ++seed) {
+        std::mt19937_64 rng{seed};
+        QueryModel model;
+        // Registered locations (1..400) over 64 addresses, so many are rewritten; about half
+        // completed and wait in pending_unregister.
+        std::vector<u64> pending;
+        for (u64 location = 1; location <= 400; ++location) {
+            model.Register(rng() % 64, location);
+            if (rng() % 2 == 0) {
+                pending.push_back(location);
+            }
+        }
+        const std::map<u64, u64> before = model.newest;
+        const std::set<u64> pending_set(pending.begin(), pending.end());
+        // Reports register new locations between chunks.
+        HookMutex mutex;
+        std::map<u64, u64> reported; // address -> last location a report registered
+        u64 next_location = 1000;
+        mutex.hook = [&] {
+            for (int i = 0; i < 3; ++i) {
+                const u64 address = rng() % 64;
+                std::scoped_lock lock{mutex.inner};
+                model.newest[address] = next_location;
+                model.address_of[next_location] = address;
+                reported[address] = next_location++;
+            }
+        };
+        BackX::ForEachLockedInChunks<32>(pending, mutex,
+                                         [&](u64 location) { model.Unregister(location); });
+        REQUIRE(model.freed == pending_set);
+        for (u64 address = 0; address < 64; ++address) {
+            const auto now = model.newest.find(address);
+            if (const auto it = reported.find(address); it != reported.end()) {
+                // A report's location stays: no completed query erases it.
+                REQUIRE(now != model.newest.end());
+                REQUIRE(now->second == it->second);
+                continue;
+            }
+            // Untouched by reports: the base's pass, whole.
+            const auto old = before.find(address);
+            if (old == before.end() || pending_set.contains(old->second)) {
+                REQUIRE(now == model.newest.end());
+            } else {
+                REQUIRE(now != model.newest.end());
+                REQUIRE(now->second == old->second);
+            }
+        }
+        // No freed query's location stays registered.
+        for (const auto& [address, location] : model.newest) {
+            REQUIRE_FALSE(model.freed.contains(location));
+        }
+    }
+}
+
+TEST_CASE("BackX ops: a report thread racing chunked passes never sees a freed location",
+          "[video_core][nx2_backx]") {
+    QueryModel model;
+    std::vector<u64> pending;
+    std::mt19937_64 rng{7};
+    for (u64 location = 1; location <= 20000; ++location) {
+        model.Register(rng() % 256, location);
+        if (rng() % 2 == 0) {
+            pending.push_back(location);
+        }
+    }
+    std::atomic<bool> done{false};
+    std::atomic<u64> reports{0};
+    bool freed_seen = false; // Catch2 asserts on this thread only
+    std::thread reporter([&] {
+        std::mt19937_64 report_rng{8};
+        for (u64 location = 100000; !done.load(std::memory_order_acquire); ++location) {
+            const u64 address = report_rng() % 256;
+            std::scoped_lock lock{model.mutex};
+            // CounterReport: the location it replaces must not be one already freed.
+            if (const auto it = model.newest.find(address); it != model.newest.end()) {
+                freed_seen |= model.freed.contains(it->second);
+            }
+            model.newest[address] = location;
+            model.address_of[location] = address;
+            reports.fetch_add(1, std::memory_order_release);
+        }
+    });
+    while (reports.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    BackX::ForEachLockedInChunks<32>(pending, model.mutex,
+                                     [&](u64 location) { model.Unregister(location); });
+    done.store(true, std::memory_order_release);
+    reporter.join();
+    REQUIRE_FALSE(freed_seen);
+    REQUIRE(model.freed.size() == pending.size());
+    for (const auto& [address, location] : model.newest) {
+        REQUIRE_FALSE(model.freed.contains(location));
+    }
 }

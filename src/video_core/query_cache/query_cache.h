@@ -25,6 +25,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_sync_trace.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -548,12 +549,11 @@ void QueryCacheBase<Traits>::UnregisterPending() {
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
     };
-    std::scoped_lock lock(cache_mutex);
-    for (QueryLocation loc : impl->pending_unregister) {
+    const auto unregister = [&](QueryLocation loc) {
         const auto [streamer_id, query_id] = loc.unpack();
         auto* streamer = impl->streamers[streamer_id];
         if (!streamer) [[unlikely]] {
-            continue;
+            return;
         }
         auto* query = streamer->GetQuery(query_id);
         auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
@@ -567,8 +567,27 @@ void QueryCacheBase<Traits>::UnregisterPending() {
             }
         }
         streamer->Free(query_id);
+    };
+    auto& pending = impl->pending_unregister;
+    if (VideoCommon::BackX::g_ops) [[unlikely]] {
+        // EDEN_NX2_BACKX_OPS: cache_mutex for 32 entries at a time; the GPU thread's reports
+        // (CounterReport) slept behind whole passes. Each entry is still looked up, compared with
+        // the newest location at its address and freed under the lock, so every entry's outcome
+        // is one the base gives with this pass before or after a report.
+        if (!pending.empty()) {
+            const size_t holds =
+                VideoCommon::BackX::ForEachLockedInChunks<32>(pending, cache_mutex, unregister);
+            VideoCommon::BackX::Count(VideoCommon::BackX::Counter::UnregisterPasses);
+            VideoCommon::BackX::Count(VideoCommon::BackX::Counter::UnregisterChunks, holds);
+        }
+        pending.clear();
+        return;
     }
-    impl->pending_unregister.clear();
+    std::scoped_lock lock(cache_mutex);
+    for (QueryLocation loc : pending) {
+        unregister(loc);
+    }
+    pending.clear();
 }
 
 template <typename Traits>

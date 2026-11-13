@@ -17,6 +17,7 @@
 #include "tests/core/system_test_context.h"
 #include "video_core/fence_manager.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace {
@@ -160,4 +161,51 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
         REQUIRE_FALSE(submission.wrong_owner);
     }
     REQUIRE(callback.load());
+}
+
+TEST_CASE("Fence operation lists run in order when EDEN_NX2_BACKX_OPS reuses them",
+          "[video_core][split_fence_wait]") {
+    namespace BackX = VideoCommon::BackX;
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    const bool previous_ops = BackX::g_ops;
+    const bool previous_stats = BackX::g_stats;
+    SCOPE_EXIT {
+        Settings::values.gpu_fence_behavior.SetValue(previous);
+        BackX::g_ops = previous_ops;
+        BackX::g_stats = previous_stats;
+    };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    BackX::g_ops = true;
+    BackX::g_stats = true;
+    const auto counted = [](BackX::Counter counter) {
+        return BackX::g_counters[static_cast<std::size_t>(counter)].load(std::memory_order_relaxed);
+    };
+    const u64 reused = counted(BackX::Counter::OpsReused);
+    const u64 allocated = counted(BackX::Counter::OpsAllocated);
+    std::vector<u32> callbacks;
+    {
+        FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+        for (u32 i = 0; i < 128; ++i) {
+            manager.SyncOperation([&, i] { callbacks.push_back(i * 2); });
+            manager.SignalFence([&, i] { callbacks.push_back(i * 2 + 1); });
+            REQUIRE(manager.submissions == i + 1);
+        }
+        manager.WaitPendingFences(true);
+        REQUIRE(manager.submissions == 130);
+        REQUIRE_FALSE(submission.timed_out.load());
+    }
+    REQUIRE(callbacks.size() == 256);
+    for (u32 i = 0; i < callbacks.size(); ++i) {
+        REQUIRE(callbacks[i] == i);
+    }
+    // Each of the 129 fences took an emptied list or a new one.
+    REQUIRE(counted(BackX::Counter::OpsReused) - reused + counted(BackX::Counter::OpsAllocated) -
+                allocated ==
+            129);
 }

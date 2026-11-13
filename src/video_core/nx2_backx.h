@@ -3,12 +3,15 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -53,6 +56,10 @@ inline bool g_apply{};
 /// back's idle hook. Only when or where a busy back holds fences back (track S's run-ahead): it
 /// adds submissions. 0 (off) by default.
 inline u32 g_submit_draws{};
+/// EDEN_NX2_BACKX_OPS=1: the fence manager reuses operation lists the fencing thread emptied
+/// instead of allocating one per fence, and the query cache's UnregisterPending gives
+/// cache_mutex back every 32 entries (the back's reports waited for whole passes).
+inline bool g_ops{};
 /// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
 /// then does what the base does.
 inline bool g_verify{};
@@ -77,6 +84,10 @@ enum class Counter : std::size_t {
     ApplyPasses,      ///< OnCacheInvalidations calls with each lock taken once
     ApplyRanges,      ///< collected writes they applied
     EarlySubmits,     ///< deferred fence flushes submitted after EDEN_NX2_BACKX_SUBMIT_DRAWS
+    OpsReused,        ///< operation lists reused instead of allocated
+    OpsAllocated,     ///< operation lists the free list could not give
+    UnregisterPasses, ///< UnregisterPending passes with entries
+    UnregisterChunks, ///< their cache_mutex holds
     Mismatches,       ///< verify: skips the base's check contradicted
     Count,
 };
@@ -156,6 +167,75 @@ private:
     std::array<std::atomic<u64>, NumWords> words{};
 };
 
+/// EDEN_NX2_BACKX_OPS: lists one thread empties and hands back for another to fill again, so the
+/// filling thread reuses their storage instead of allocating a list (and regrowing it) per use.
+/// Keeps at most MaxLists lists of at most MaxCapacity elements' storage.
+template <typename List, std::size_t MaxLists, std::size_t MaxCapacity>
+class ListRecycler {
+public:
+    ListRecycler() {
+        lists.reserve(MaxLists);
+    }
+
+    /// Swaps a kept list into `list`, which is empty; false, leaving `list` alone, when none is
+    /// kept.
+    [[nodiscard]] bool Take(List& list) {
+        std::scoped_lock lock{guard};
+        if (lists.empty()) {
+            return false;
+        }
+        list.swap(lists.back());
+        lists.pop_back();
+        return true;
+    }
+
+    /// Empties the list `list_of(entry)` of each of `entries` in their order, as destroying the
+    /// entries would, then keeps those lists' storage while fewer than MaxLists are kept.
+    template <typename Entries, typename ListOf>
+    void Give(Entries& entries, ListOf&& list_of) {
+        for (auto& entry : entries) {
+            list_of(entry).clear();
+        }
+        std::scoped_lock lock{guard};
+        for (auto& entry : entries) {
+            if (lists.size() >= MaxLists) {
+                return;
+            }
+            List& list = list_of(entry);
+            if (list.capacity() != 0 && list.capacity() <= MaxCapacity) {
+                lists.push_back(std::move(list));
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t Kept() {
+        std::scoped_lock lock{guard};
+        return lists.size();
+    }
+
+private:
+    std::mutex guard;
+    std::vector<List> lists;
+};
+
+/// EDEN_NX2_BACKX_OPS: calls `func` on the elements of `items` in order with `mutex` held, taking
+/// it anew for every Chunk elements, so that threads waiting for it get it in between. Returns how
+/// often it took the mutex.
+template <std::size_t Chunk, typename Items, typename Mutex, typename Func>
+std::size_t ForEachLockedInChunks(const Items& items, Mutex& mutex, Func&& func) {
+    static_assert(Chunk > 0);
+    std::size_t holds = 0;
+    for (std::size_t begin = 0; begin < items.size(); begin += Chunk) {
+        const std::size_t end = (std::min)(items.size(), begin + Chunk);
+        std::scoped_lock lock{mutex};
+        for (std::size_t i = begin; i < end; ++i) {
+            func(items[i]);
+        }
+        ++holds;
+    }
+    return holds;
+}
+
 [[nodiscard]] inline bool ReadFlag(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && value[0] == '1';
@@ -169,6 +249,7 @@ inline void ReadSwitches() {
     g_collect_split = ReadFlag("EDEN_NX2_BACKX_COLLECT_SPLIT");
     g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
     g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
+    g_ops = ReadFlag("EDEN_NX2_BACKX_OPS");
     g_submit_draws = 0;
     if (const char* value = std::getenv("EDEN_NX2_BACKX_SUBMIT_DRAWS")) {
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
@@ -178,12 +259,12 @@ inline void ReadSwitches() {
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
     g_gather_epochs = g_gather && g_verify;
     if (g_inline || g_report || g_gather || g_collect_split || g_tick || g_apply ||
-        g_submit_draws != 0 || g_verify || g_stats) {
+        g_submit_draws != 0 || g_ops || g_verify || g_stats) {
         LOG_INFO(HW_GPU,
                  "BackX: inline {} report {} gather {} collect split {} tick {} apply {} submit "
-                 "after {} draws verify {} stats {}",
+                 "after {} draws ops {} verify {} stats {}",
                  g_inline, g_report, g_gather, g_collect_split, g_tick, g_apply, g_submit_draws,
-                 g_verify, g_stats);
+                 g_ops, g_verify, g_stats);
     }
 }
 
@@ -237,6 +318,15 @@ inline void Report() {
              apply_ranges, apply_passes, early_submits, mismatches,
              Mismatches(Check::InlineGpuData), Mismatches(Check::InlineQuery),
              Mismatches(Check::Report), Mismatches(Check::Gather), Mismatches(Check::Tick));
+    // OPS counts only while switched on.
+    const u64 ops_reused = Take(Counter::OpsReused);
+    const u64 ops_allocated = Take(Counter::OpsAllocated);
+    const u64 unregister_passes = Take(Counter::UnregisterPasses);
+    const u64 unregister_chunks = Take(Counter::UnregisterChunks);
+    LOG_INFO(HW_GPU,
+             "BackX3 {:.1f} s: operation lists {} reused, {} allocated; unregister passes {} in {} "
+             "lock holds",
+             seconds, ops_reused, ops_allocated, unregister_passes, unregister_chunks);
 }
 
 } // namespace VideoCommon::BackX

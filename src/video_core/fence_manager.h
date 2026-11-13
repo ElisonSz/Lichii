@@ -28,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sync_trace.h"
@@ -131,7 +132,14 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
+            if (!BackX::g_ops) [[likely]] {
+                uncommitted_operations.reserve(64);
+            } else if (recycled_operations.Take(uncommitted_operations)) {
+                BackX::Count(BackX::Counter::OpsReused);
+            } else {
+                uncommitted_operations.reserve(64);
+                BackX::Count(BackX::Counter::OpsAllocated);
+            }
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -352,6 +360,13 @@ private:
                     delayed_destruction_ring.Push(std::move(released.fence));
                 }
             }
+            if (BackX::g_ops) [[unlikely]] {
+                // Where batch.clear() destroys them: the operations in order, then the emptied
+                // lists go back to SignalFence.
+                recycled_operations.Give(batch, [](Released& released) -> OperationList& {
+                    return released.operations;
+                });
+            }
             batch.clear();
         }
     }
@@ -484,6 +499,10 @@ private:
     std::mutex guard;
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
+    /// EDEN_NX2_BACKX_OPS: operation lists the fencing thread emptied, which SignalFence takes
+    /// (inside uncommitted_guard) instead of a new list; they keep the capacity they grew to, up to
+    /// 4096 operations.
+    BackX::ListRecycler<OperationList, 16, 4096> recycled_operations;
     std::condition_variable cv;
 
     std::jthread fence_thread;
