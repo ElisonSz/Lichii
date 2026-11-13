@@ -155,13 +155,15 @@ struct GPU::Impl {
     /// the base's gather is.
     void BackXInvalidateGPUCache() {
         namespace BackX = VideoCommon::BackX;
-        bool pending = false;
-        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
-            if (manager.MayHavePending()) {
-                pending = true;
-                break;
-            }
+        const auto managers = system.GetGPUDirtyMemoryManager();
+        if (BackX::g_verify) [[unlikely]] {
+            BackXVerifyInvalidateGPUCache(managers);
+            return;
         }
+        const bool pending =
+            std::ranges::any_of(managers, [](const Core::GPUDirtyMemoryManager& manager) {
+                return manager.MayHavePending();
+            });
         if (pending) {
             BackX::Count(BackX::Counter::GatherRun);
             if (!ApplyCollectedWrites()) {
@@ -170,8 +172,42 @@ struct GPU::Impl {
             return;
         }
         BackX::Count(BackX::Counter::GatherSkipped);
-        if (BackX::g_verify && ApplyCollectedWrites()) [[unlikely]] {
-            // Also counts a write collected between the check and this gather (rare).
+    }
+
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: the same decision, then the base's gather whatever it
+    /// was. Writes found after a skip are a race when a Collect ran between the check and the
+    /// gather (CollectEpoch odd before, or changed), as the base's gather taken first misses them;
+    /// otherwise the check missed writes there before it (a mismatch).
+    void BackXVerifyInvalidateGPUCache(std::span<Core::GPUDirtyMemoryManager> managers) {
+        namespace BackX = VideoCommon::BackX;
+        std::vector<u64> epochs;
+        epochs.reserve(managers.size());
+        for (const Core::GPUDirtyMemoryManager& manager : managers) {
+            epochs.push_back(manager.CollectEpoch());
+        }
+        const bool pending =
+            std::ranges::any_of(managers, [](const Core::GPUDirtyMemoryManager& manager) {
+                return manager.MayHavePending();
+            });
+        BackX::Count(pending ? BackX::Counter::GatherRun : BackX::Counter::GatherSkipped);
+        const bool found = ApplyCollectedWrites();
+        if (pending) {
+            if (!found) {
+                BackX::Count(BackX::Counter::GatherEmpty);
+            }
+            return;
+        }
+        if (!found) {
+            return;
+        }
+        bool collect_ran = false;
+        for (size_t i = 0; i < managers.size(); ++i) {
+            collect_ran =
+                collect_ran || (epochs[i] & 1) != 0 || managers[i].CollectEpoch() != epochs[i];
+        }
+        if (collect_ran) {
+            BackX::Count(BackX::Counter::GatherRaces);
+        } else {
             BackX::Mismatch("collected CPU write while no manager showed one", 0, 0);
         }
     }

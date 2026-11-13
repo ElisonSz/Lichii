@@ -4259,7 +4259,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     VideoCommon::WaitStats::Report();
-    if (VideoCommon::BackX::g_stats) [[unlikely]] {
+    if (VideoCommon::BackX::g_stats || VideoCommon::BackX::g_verify) [[unlikely]] {
         VideoCommon::BackX::Report();
     }
     if (VideoCore::Nx2Debug::HasRequests()) {

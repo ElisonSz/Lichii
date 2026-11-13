@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/device_memory_manager.h"
+#include "video_core/nx2_backx.h"
 
 namespace Core {
 
@@ -25,6 +26,9 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
+        // EDEN_NX2_BACKX_GATHER with _VERIFY: odd while a Collect runs (CollectEpoch).
+        const EpochScope epoch_scope{VideoCommon::BackX::g_gather_epochs ? &collect_epoch
+                                                                         : nullptr};
         TransformAddress t = BuildTransform(address, size);
         TransformAddress tmp, original;
         do {
@@ -34,7 +38,10 @@ public:
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
+                    back_buffer_used.store(true, std::memory_order_relaxed);
+                    // Release: whoever sees `t` sees back_buffer_used too (MayHavePending). The
+                    // same instruction as relaxed on x86.
+                    current.exchange(t, std::memory_order_release);
                     return;
                 }
                 tmp.address = t.address;
@@ -75,6 +82,8 @@ public:
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
+            // The last gather emptied front_buffer, which is back_buffer now.
+            back_buffer_used.store(false, std::memory_order_relaxed);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
@@ -85,13 +94,25 @@ public:
         front_buffer.clear();
     }
 
-    /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
-    /// in `current` (by compare-exchange, or by exchange after pushing the one before to
-    /// back_buffer), and only Gather, which takes back_buffer too, empties `current` again. An
-    /// empty transform has no mask bits (IsValid holds for every 32-bit page index). Without the
+    /// False when Gather would find nothing: `current` has no mask bits (an empty transform;
+    /// IsValid holds for every 32-bit page index) and nothing was pushed to back_buffer since the
+    /// last gather. back_buffer counts on its own: a write crossing a 2 KiB granule gets an empty
+    /// mask (BuildTransform), and its push leaves the transform before it in back_buffer behind an
+    /// empty `current`. `current` is read first: a push sets back_buffer_used before it releases
+    /// the new `current`, so a `current` from after the push comes with the flag. Without the
     /// locks: a Collect it misses is one the caller may order after itself.
     [[nodiscard]] bool MayHavePending() const {
-        return current.load(std::memory_order_acquire).mask != 0;
+        if (current.load(std::memory_order_acquire).mask != 0) {
+            return true;
+        }
+        return back_buffer_used.load(std::memory_order_acquire);
+    }
+
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: counts Collect calls twice, on entry and on return
+    /// (odd while one runs). Equal even values before a MayHavePending check and after a gather
+    /// mean no Collect ran in between.
+    [[nodiscard]] u64 CollectEpoch() const {
+        return collect_epoch.load(std::memory_order_seq_cst);
     }
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
@@ -181,6 +202,30 @@ private:
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
+    /// back_buffer holds transforms pushed since the last gather (written under guard, read by
+    /// MayHavePending without it).
+    std::atomic<bool> back_buffer_used{false};
+    std::atomic<u64> collect_epoch{};
+
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: collect_epoch around one Collect.
+    class EpochScope {
+    public:
+        explicit EpochScope(std::atomic<u64>* epoch_) noexcept : epoch{epoch_} {
+            if (epoch != nullptr) [[unlikely]] {
+                epoch->fetch_add(1, std::memory_order_seq_cst);
+            }
+        }
+        ~EpochScope() {
+            if (epoch != nullptr) [[unlikely]] {
+                epoch->fetch_add(1, std::memory_order_seq_cst);
+            }
+        }
+        EpochScope(const EpochScope&) = delete;
+        EpochScope& operator=(const EpochScope&) = delete;
+
+    private:
+        std::atomic<u64>* epoch;
+    };
 };
 
 } // namespace Core

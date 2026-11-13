@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <random>
@@ -259,27 +261,81 @@ TEST_CASE("BackX gather: a manager shows a collected write until it is gathered"
     REQUIRE_FALSE(manager.MayHavePending());
 }
 
+TEST_CASE("BackX gather: a write crossing a 2 KiB granule leaves the write before it pending",
+          "[core][nx2_backx]") {
+    // BuildTransform gives a write crossing the manager's 2 KiB granule an empty mask (an
+    // out-of-range shift). Its push moves the transform before it to back_buffer and leaves an
+    // empty `current`: a check of `current` alone missed that write (round 1's verify mismatches).
+    struct Write {
+        PAddr address;
+        size_t size;
+    };
+    constexpr std::array<Write, 4> crossing{
+        {{0x107fc, 8}, {0x10700, 0x200}, {0x10400, 0x800}, {0x107c0, 0x41}}};
+    for (const Write& write : crossing) {
+        Core::GPUDirtyMemoryManager manager;
+        manager.Collect(0x20000, 4);
+        manager.Collect(write.address, write.size);
+        REQUIRE(manager.MayHavePending());
+        std::set<u64> gathered;
+        std::function<void(PAddr, size_t)> callback = [&](PAddr address, size_t size) {
+            AddBlocks(gathered, address, size);
+        };
+        manager.Gather(callback);
+        REQUIRE(gathered.contains(0x20000 >> 6));
+        REQUIRE_FALSE(manager.MayHavePending());
+    }
+}
+
+TEST_CASE("BackX gather: collect epochs count each Collect twice with verify on",
+          "[core][nx2_backx]") {
+    const SwitchScope epochs{BackX::g_gather_epochs, true};
+    Core::GPUDirtyMemoryManager manager;
+    REQUIRE(manager.CollectEpoch() == 0);
+    manager.Collect(0x10000, 4);
+    REQUIRE(manager.CollectEpoch() == 2);
+    // Every return path: nothing new, the push path, a crossing write.
+    manager.Collect(0x10000, 4);
+    manager.Collect(0x30000, 4);
+    manager.Collect(0x107fc, 8);
+    REQUIRE(manager.CollectEpoch() == 8);
+    {
+        const SwitchScope off{BackX::g_gather_epochs, false};
+        manager.Collect(0x40000, 4);
+    }
+    REQUIRE(manager.CollectEpoch() == 8);
+}
+
 TEST_CASE("BackX gather: gathering only when a manager shows a write loses none",
           "[core][nx2_backx]") {
     // One collecting thread per manager, as each guest core has its own; the GPU thread gathers
-    // only when MayHavePending says so, at the same time.
+    // only when MayHavePending says so, at the same time. Some writes cross a 2 KiB granule. What
+    // the base would gather of each write is what a second manager, gathered after every write,
+    // returns for it (crossing writes lose bytes there too: BuildTransform).
     for (u64 seed = 1; seed <= 8; ++seed) {
         Core::GPUDirtyMemoryManager manager;
-        std::set<u64> collected;
+        Core::GPUDirtyMemoryManager shadow;
+        std::set<u64> expected;
         std::set<u64> gathered;
         std::atomic<bool> done{false};
         u64 checks = 0;
         u64 skipped = 0;
+        u64 crossing = 0;
         std::thread collector([&] {
             std::mt19937_64 rng{seed};
+            std::function<void(PAddr, size_t)> shadow_callback = [&](PAddr address, size_t size) {
+                AddBlocks(expected, address, size);
+            };
             for (int i = 0; i < 300000; ++i) {
                 // A few 2 KiB pages, so both the compare-exchange and the push path run.
                 const u64 page = rng() % (seed % 2 == 0 ? 3 : 64);
-                const u64 offset = rng() % 2040;
-                const u64 size = 1 + rng() % 8;
+                const u64 offset = rng() % 2048;
+                const u64 size = rng() % 16 == 0 ? 1 + rng() % 0x400 : 1 + rng() % 16;
                 const u64 address = 0x100000 + page * 2048 + offset;
+                crossing += offset + size > 2048 ? 1 : 0;
                 manager.Collect(address, size);
-                AddBlocks(collected, address, size);
+                shadow.Collect(address, size);
+                shadow.Gather(shadow_callback);
             }
             done.store(true, std::memory_order_release);
         });
@@ -298,12 +354,66 @@ TEST_CASE("BackX gather: gathering only when a manager shows a write loses none"
         if (manager.MayHavePending()) {
             manager.Gather(callback);
         }
-        INFO("checks " << checks << " skipped " << skipped);
+        INFO("checks " << checks << " skipped " << skipped << " crossing writes " << crossing);
         REQUIRE_FALSE(manager.MayHavePending());
         const size_t before = gathered.size();
         manager.Gather(callback);
         REQUIRE(gathered.size() == before);
-        REQUIRE(std::ranges::includes(gathered, collected));
+        REQUIRE(std::ranges::includes(gathered, expected));
+        REQUIRE(crossing > 0);
         REQUIRE(checks > 0);
     }
+}
+
+TEST_CASE("BackX gather: the verify classification finds no write the check missed",
+          "[core][nx2_backx]") {
+    // GPU::Impl's verify: read the collect epochs, check, gather anyway; writes found after a skip
+    // with an even, unchanged epoch were there at the check (a gap), else they raced with it. The
+    // collector pauses after some crossing writes, as a guest core does other work.
+    const SwitchScope epochs{BackX::g_gather_epochs, true};
+    u64 gaps = 0;
+    u64 races = 0;
+    for (u64 seed = 1; seed <= 4; ++seed) {
+        Core::GPUDirtyMemoryManager manager;
+        std::atomic<bool> done{false};
+        std::thread collector([&] {
+            std::mt19937_64 rng{seed};
+            for (int i = 0; i < 100000; ++i) {
+                const u64 page = rng() % 8;
+                const u64 offset = rng() % 2048;
+                const u64 size = 1 + rng() % 64;
+                manager.Collect(0x100000 + page * 2048 + offset, size);
+                if (offset + size > 2048 && rng() % 4 == 0) {
+                    const auto until =
+                        std::chrono::steady_clock::now() + std::chrono::microseconds{5};
+                    while (std::chrono::steady_clock::now() < until) {
+                    }
+                }
+            }
+            done.store(true, std::memory_order_release);
+        });
+        std::function<void(PAddr, size_t)> callback = [](PAddr, size_t) {};
+        bool found = false;
+        std::function<void(PAddr, size_t)> verify_callback = [&](PAddr, size_t) { found = true; };
+        while (!done.load(std::memory_order_acquire)) {
+            const u64 epoch = manager.CollectEpoch();
+            if (manager.MayHavePending()) {
+                manager.Gather(callback);
+                continue;
+            }
+            found = false;
+            manager.Gather(verify_callback);
+            if (!found) {
+                continue;
+            }
+            if ((epoch & 1) == 0 && manager.CollectEpoch() == epoch) {
+                ++gaps;
+            } else {
+                ++races;
+            }
+        }
+        collector.join();
+    }
+    INFO("races " << races);
+    REQUIRE(gaps == 0);
 }

@@ -29,6 +29,10 @@ inline bool g_report{};
 /// EDEN_NX2_BACKX_GATHER=1: InvalidateGPUCache gathers collected CPU writes (two locks per core's
 /// manager) only when a manager may hold one.
 inline bool g_gather{};
+/// _GATHER with _VERIFY: GPUDirtyMemoryManager::Collect counts its calls (CollectEpoch), so a
+/// verify gather that finds writes tells a Collect racing with the check from a check that missed
+/// a write.
+inline bool g_gather_epochs{};
 /// EDEN_NX2_BACKX_TICK=1: a buffer's usage tracker clears only the words it set since its last
 /// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame).
 inline bool g_tick{};
@@ -58,6 +62,7 @@ enum class Counter : std::size_t {
     GatherSkipped,    ///< InvalidateGPUCache calls that found no manager with a collected write
     GatherRun,        ///< calls that gathered
     GatherEmpty,      ///< gathers that found nothing (a write collected and gathered meanwhile)
+    GatherRaces,      ///< verify: skipped gathers' writes collected after the check (as the base)
     TickResets,       ///< usage tracker resets
     TickWordsCleared, ///< words cleared by them
     TickWordsSkipped, ///< words the base would have cleared too (already zero)
@@ -147,6 +152,7 @@ inline void ReadSwitches() {
     }
     g_verify = ReadFlag("EDEN_NX2_BACKX_VERIFY");
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
+    g_gather_epochs = g_gather && g_verify;
     if (g_inline || g_report || g_gather || g_tick || g_apply || g_submit_draws != 0 || g_verify ||
         g_stats) {
         LOG_INFO(HW_GPU,
@@ -179,6 +185,7 @@ inline void Report() {
     const u64 gather_skipped = Take(Counter::GatherSkipped);
     const u64 gather_run = Take(Counter::GatherRun);
     const u64 gather_empty = Take(Counter::GatherEmpty);
+    const u64 gather_races = Take(Counter::GatherRaces);
     const u64 tick_resets = Take(Counter::TickResets);
     const u64 tick_cleared = Take(Counter::TickWordsCleared);
     const u64 tick_skipped = Take(Counter::TickWordsSkipped);
@@ -189,12 +196,12 @@ inline void Report() {
     LOG_INFO(HW_GPU,
              "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
              "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
-             "gathers {} skipped, {} run ({} found nothing); usage resets {} clearing {} words, "
-             "{} words left alone; collected writes {} in {} passes; deferred fence flushes "
-             "submitted early {}; verify mismatches {}",
+             "gathers {} skipped, {} run ({} found nothing, {} skipped with writes collected after "
+             "the check); usage resets {} clearing {} words, {} words left alone; collected writes "
+             "{} in {} passes; deferred fence flushes submitted early {}; verify mismatches {}",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
-             report_locked, gather_skipped, gather_run, gather_empty, tick_resets, tick_cleared,
-             tick_skipped, apply_ranges, apply_passes, early_submits, mismatches);
+             report_locked, gather_skipped, gather_run, gather_empty, gather_races, tick_resets,
+             tick_cleared, tick_skipped, apply_ranges, apply_passes, early_submits, mismatches);
 }
 
 } // namespace VideoCommon::BackX
