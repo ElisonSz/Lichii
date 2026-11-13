@@ -1185,19 +1185,55 @@ private:
     struct ReadBackPage {
         DAddr page{};
         u64 last_read{};     ///< read_back_reads at its last read of a write (eviction)
-        u16 reads{};         ///< Writes in a row the guest read, up to EarlyAfterReads
+        u16 reads{};         ///< Writes in a row the guest read, up to Early().after_reads
         u16 unread_writes{}; ///< GPU writes since its last read
         bool written{};      ///< A GPU write since its last read
     };
-    /// Reads of a page's writes in a row before its writes get early downloads.
-    static constexpr u16 EarlyAfterReads = 2;
-    /// Writes in a row without a read that stop them.
-    static constexpr u16 MaxUnreadWrites = 4;
-    static constexpr size_t MaxReadBackPages = 64;
-    /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
-    /// flush on demand.
-    static constexpr u64 EarlyBytesPerFrame = 1_MiB;
-    static constexpr u32 MaxPendingEarlyDownloads = 32;
+    struct EarlyLimits {
+        /// Reads of a page's writes in a row before its writes get early downloads.
+        u16 after_reads;
+        /// Writes in a row without a read that stop them.
+        u16 max_unread_writes;
+        size_t max_pages;
+        /// Early download bytes a frame, and early downloads not yet in guest memory: past them,
+        /// reads flush on demand.
+        u64 bytes_per_frame;
+        u32 max_pending;
+    };
+    /// The limits above: 2 reads, 4 unread writes, 64 pages, 1 MiB a frame and 32 pending, or
+    /// EDEN_NX2_EARLY_AFTER_READS, _UNREAD, _PAGES, _KIB and _PENDING (comparisons; read at first
+    /// use, after the frontend loaded its switches). They only decide which downloads are
+    /// recorded early, never what a read finds: a read that no early download covers flushes.
+    [[nodiscard]] static const EarlyLimits& Early() {
+        static const EarlyLimits limits = [] {
+            const auto read = [](const char* name, u64 fallback, u64 max) -> u64 {
+                const char* const value = std::getenv(name);
+                if (value == nullptr || value[0] == '\0') {
+                    return fallback;
+                }
+                char* end = nullptr;
+                const u64 parsed = std::strtoull(value, &end, 10);
+                if (end == value || parsed == 0) {
+                    return fallback;
+                }
+                return (std::min)(parsed, max);
+            };
+            const EarlyLimits result{
+                .after_reads = static_cast<u16>(read("EDEN_NX2_EARLY_AFTER_READS", 2, 1000)),
+                .max_unread_writes = static_cast<u16>(read("EDEN_NX2_EARLY_UNREAD", 4, 60000)),
+                .max_pages = static_cast<size_t>(read("EDEN_NX2_EARLY_PAGES", 64, 65536)),
+                .bytes_per_frame = read("EDEN_NX2_EARLY_KIB", 1024, 1ULL << 20) * 1024,
+                .max_pending = static_cast<u32>(read("EDEN_NX2_EARLY_PENDING", 32, 4096)),
+            };
+            LOG_INFO(HW_GPU,
+                     "Early read-back downloads: after {} reads, up to {} unread writes, {} pages, "
+                     "{} KiB a frame, {} pending",
+                     result.after_reads, result.max_unread_writes, result.max_pages,
+                     result.bytes_per_frame / 1024, result.max_pending);
+            return result;
+        }();
+        return limits;
+    }
     std::vector<ReadBackPage> read_back_pages; ///< Sorted by page
     /// EDEN_NX2_BACKX_REPORT: the pages of read_back_pages, changed under `mutex` (a page marked
     /// before it enters, rebuilt after one leaves), read without it (MayBeReadBackPage).
