@@ -618,9 +618,40 @@ struct Memory::Impl {
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
+    /// EDEN_NX2_READ_AREAS=1: a GPU write invalidates only the cores' read areas it overlaps.
+    [[nodiscard]] static bool ReadAreasTargeted() {
+        static const bool targeted = [] {
+            const char* value = std::getenv("EDEN_NX2_READ_AREAS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return targeted;
+    }
+
+    void InvalidateReadAreas(u64 device_begin, u64 size) {
+        if (!ReadAreasTargeted() || size == 0) {
+            return;
+        }
+        const u64 device_end = device_begin + size;
+        // Pairs with the core's publish-then-check in HandleRasterizerDownload: either the core
+        // sees this epoch and drops the area it is publishing, or this sees the published area.
+        arm_epoch.fetch_add(1, std::memory_order_seq_cst);
+        for (SharedReadArea& shared : shared_read_areas) {
+            const u64 start = shared.start.load(std::memory_order_seq_cst);
+            const u64 end = shared.end.load(std::memory_order_seq_cst);
+            if (start < device_end && device_begin < end) {
+                shared.invalidations.fetch_add(1, std::memory_order_release);
+            }
+        }
+    }
+
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
-        // Clean cached read areas also need invalidation when reactive flushing is enabled.
-        read_trap_generation.fetch_add(1, std::memory_order_release);
+        // Clean cached read areas also need invalidation when reactive flushing is enabled. With
+        // EDEN_NX2_READ_AREAS only the areas the write overlaps lose it (InvalidateReadAreas): this
+        // bump emptied every core's area at each GPU write, so most reads of cached memory asked
+        // the caches again (~10,000 a second in Castle Town), and waited for their locks.
+        if (!ReadAreasTargeted()) {
+            read_trap_generation.fetch_add(1, std::memory_order_release);
+        }
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
             return;
@@ -984,6 +1015,15 @@ struct Memory::Impl {
             current_area = {};
             read_area_generations[core] = generation;
         }
+        SharedReadArea& shared = shared_read_areas[core];
+        const bool targeted = ReadAreasTargeted();
+        if (targeted) {
+            if (const u64 invalidations = shared.invalidations.load(std::memory_order_acquire);
+                seen_read_area_invalidations[core] != invalidations) {
+                current_area = {};
+                seen_read_area_invalidations[core] = invalidations;
+            }
+        }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
@@ -994,7 +1034,17 @@ struct Memory::Impl {
             if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
                 VideoCommon::Nx2Protect::NoteCpuReadAsked();
             }
+            const u64 epoch = targeted ? arm_epoch.load(std::memory_order_seq_cst) : 0;
             current_area = system.GPU().OnCPURead(address, size);
+            if (targeted) {
+                // Publish the area, then look whether an invalidation ran meanwhile: it may have
+                // looked at the previous area, so this one is not kept.
+                shared.start.store(current_area.start_address, std::memory_order_seq_cst);
+                shared.end.store(current_area.end_address, std::memory_order_seq_cst);
+                if (arm_epoch.load(std::memory_order_seq_cst) != epoch) {
+                    current_area = {};
+                }
+            }
         });
     }
 
@@ -1083,6 +1133,18 @@ struct Memory::Impl {
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
+    /// EDEN_NX2_READ_AREAS: each core's read area as other threads see it, and how often a GPU
+    /// write overlapping it invalidated it (the core compares with the count it last saw).
+    struct SharedReadArea {
+        std::atomic<u64> start{};
+        std::atomic<u64> end{};
+        std::atomic<u64> invalidations{};
+    };
+    std::array<SharedReadArea, Core::Hardware::NUM_CPU_CORES> shared_read_areas{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> seen_read_area_invalidations{};
+    /// EDEN_NX2_READ_AREAS: counts InvalidateReadAreas calls, so a core that computed its area
+    /// while one ran drops it.
+    std::atomic<u64> arm_epoch{};
     std::atomic<u64> read_trap_generation{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
@@ -1288,6 +1350,10 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+}
+
+void Memory::InvalidateReadAreas(u64 device_begin, u64 size) {
+    impl->InvalidateReadAreas(device_begin, size);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {

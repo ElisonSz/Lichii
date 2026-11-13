@@ -807,6 +807,8 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
+    const auto InvalidateReadAreas = &DeviceMemoryManager<Traits>::DeviceMethods::InvalidateReadAreas;
+    Memory::Memory* invalidated_inter = nullptr;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;
     u64 run_pages = 0;
@@ -826,6 +828,11 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
             continue;
         }
         auto* const inter = registered_processes[asid.id];
+        if (inter != nullptr && inter != invalidated_inter) {
+            // The read areas are device ranges: the whole write's, once per process.
+            InvalidateReadAreas(inter, addr, size);
+            invalidated_inter = inter;
+        }
         if (inter != run_inter || vpage != run_begin + run_pages) {
             release_run();
             run_inter = inter;

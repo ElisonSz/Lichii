@@ -17,6 +17,11 @@ struct MaxwellDeviceMethods {
                                           size_t size) {
         interface->RasterizerArmReadTraps(address, size);
     }
+
+    static inline void InvalidateReadAreas(Core::Memory::Memory* interface, DAddr address,
+                                           size_t size) {
+        interface->InvalidateReadAreas(address, size);
+    }
 };
 
 } // namespace Tegra
