@@ -428,6 +428,35 @@ bool BufferCache<P>::WriteGpuMemoryInPlace(DAddr device_addr, u64 size, bool ren
             note(InPlace::Large, 0);
             return false;
         }
+        // The tracker's answer, the last check below, declines most attempts (Castle Town: its
+        // word scan runs often, in-place uploads are rare).
+        const auto declined_by_tracker = [&](InPlaceCheck check) {
+            switch (check) {
+            case InPlaceCheck::Clean:
+                return false;
+            case InPlaceCheck::Untracked:
+                // Untracked pages are unprotected already, and the next scan uploads them.
+                note(InPlace::Untracked, 0);
+                return true;
+            case InPlaceCheck::GpuState:
+                note(InPlace::GpuData, 0);
+                return true;
+            case InPlaceCheck::Uploaded:
+                // Written again before anything used the last in-place upload: as before, so
+                // pages written over and over between uses get one upload at their next use.
+                note(InPlace::AgainBeforeUse, 0);
+                return true;
+            }
+            return true;
+        };
+        // EDEN_NX2_BACKX_FLUSH: the tracker first. Every check here is a pure read and each one
+        // that fails returns false, so their order changes only which stats note a decline gets.
+        const bool tracker_first = VideoCommon::BackX::g_flush;
+        if (tracker_first &&
+            declined_by_tracker(memory_tracker.CheckInPlace(page_begin, pages_size))) {
+            VideoCommon::BackX::Count(VideoCommon::BackX::Counter::TrackerFirst);
+            return false;
+        }
         const u64 caching_page = page_begin >> CACHING_PAGEBITS;
         const BufferId buffer_id = caching_page < page_table.size() ? page_table[caching_page]
                                                                     : NULL_BUFFER_ID;
@@ -441,20 +470,8 @@ bool BufferCache<P>::WriteGpuMemoryInPlace(DAddr device_addr, u64 size, bool ren
             note(InPlace::GpuData, 0);
             return false;
         }
-        switch (memory_tracker.CheckInPlace(page_begin, pages_size)) {
-        case InPlaceCheck::Clean:
-            break;
-        case InPlaceCheck::Untracked:
-            // Untracked pages are unprotected already, and the next scan uploads them.
-            note(InPlace::Untracked, 0);
-            return false;
-        case InPlaceCheck::GpuState:
-            note(InPlace::GpuData, 0);
-            return false;
-        case InPlaceCheck::Uploaded:
-            // Written again before anything used the last in-place upload: as before, so pages
-            // written over and over between uses get one upload at their next use.
-            note(InPlace::AgainBeforeUse, 0);
+        if (!tracker_first &&
+            declined_by_tracker(memory_tracker.CheckInPlace(page_begin, pages_size))) {
             return false;
         }
         std::array copies{BufferCopy{

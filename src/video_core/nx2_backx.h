@@ -60,6 +60,10 @@ inline u32 g_submit_draws{};
 /// instead of allocating one per fence, and the query cache's UnregisterPending gives
 /// cache_mutex back every 32 entries (the back's reports waited for whole passes).
 inline bool g_ops{};
+/// EDEN_NX2_BACKX_FLUSH=1: the in-place upload attempt of the GPU thread's own writes
+/// (EDEN_NX2_PROTECT_INLINE) asks the tracker first, so the attempts it declines skip the page
+/// table lookup and the GPU-written range search.
+inline bool g_flush{};
 /// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
 /// then does what the base does.
 inline bool g_verify{};
@@ -88,6 +92,7 @@ enum class Counter : std::size_t {
     OpsAllocated,     ///< operation lists the free list could not give
     UnregisterPasses, ///< UnregisterPending passes with entries
     UnregisterChunks, ///< their cache_mutex holds
+    TrackerFirst,     ///< in-place attempts declined by the tracker before the range search
     Mismatches,       ///< verify: skips the base's check contradicted
     Count,
 };
@@ -250,6 +255,7 @@ inline void ReadSwitches() {
     g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
     g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
     g_ops = ReadFlag("EDEN_NX2_BACKX_OPS");
+    g_flush = ReadFlag("EDEN_NX2_BACKX_FLUSH");
     g_submit_draws = 0;
     if (const char* value = std::getenv("EDEN_NX2_BACKX_SUBMIT_DRAWS")) {
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
@@ -259,12 +265,12 @@ inline void ReadSwitches() {
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
     g_gather_epochs = g_gather && g_verify;
     if (g_inline || g_report || g_gather || g_collect_split || g_tick || g_apply ||
-        g_submit_draws != 0 || g_ops || g_verify || g_stats) {
+        g_submit_draws != 0 || g_ops || g_flush || g_verify || g_stats) {
         LOG_INFO(HW_GPU,
                  "BackX: inline {} report {} gather {} collect split {} tick {} apply {} submit "
-                 "after {} draws ops {} verify {} stats {}",
+                 "after {} draws ops {} flush {} verify {} stats {}",
                  g_inline, g_report, g_gather, g_collect_split, g_tick, g_apply, g_submit_draws,
-                 g_ops, g_verify, g_stats);
+                 g_ops, g_flush, g_verify, g_stats);
     }
 }
 
@@ -318,15 +324,17 @@ inline void Report() {
              apply_ranges, apply_passes, early_submits, mismatches,
              Mismatches(Check::InlineGpuData), Mismatches(Check::InlineQuery),
              Mismatches(Check::Report), Mismatches(Check::Gather), Mismatches(Check::Tick));
-    // OPS counts only while switched on.
+    // OPS and FLUSH count only while switched on.
     const u64 ops_reused = Take(Counter::OpsReused);
     const u64 ops_allocated = Take(Counter::OpsAllocated);
     const u64 unregister_passes = Take(Counter::UnregisterPasses);
     const u64 unregister_chunks = Take(Counter::UnregisterChunks);
+    const u64 tracker_first = Take(Counter::TrackerFirst);
     LOG_INFO(HW_GPU,
              "BackX3 {:.1f} s: operation lists {} reused, {} allocated; unregister passes {} in {} "
-             "lock holds",
-             seconds, ops_reused, ops_allocated, unregister_passes, unregister_chunks);
+             "lock holds; in-place attempts declined by the tracker first {}",
+             seconds, ops_reused, ops_allocated, unregister_passes, unregister_chunks,
+             tracker_first);
 }
 
 } // namespace VideoCommon::BackX
