@@ -33,6 +33,13 @@ inline bool g_gather{};
 /// verify gather that finds writes tells a Collect racing with the check from a check that missed
 /// a write.
 inline bool g_gather_epochs{};
+/// EDEN_NX2_BACKX_COLLECT_SPLIT=1: a CPU write into GPU-written memory that crosses one of the
+/// GPUDirtyMemoryManager's 2 KiB granules is collected granule by granule. The base builds one
+/// transform from the write's first granule with a mask shift out of range past it: such a write
+/// loses its bytes (often all), so they never reach the GPU's copy, and a later download can write
+/// the GPU's older bytes over them in guest memory. A fix of the base, so off by default: the
+/// stats line counts crossing writes ("crossing writes") with or without it.
+inline bool g_collect_split{};
 /// EDEN_NX2_BACKX_TICK=1: a buffer's usage tracker clears only the words it set since its last
 /// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame).
 inline bool g_tick{};
@@ -63,6 +70,7 @@ enum class Counter : std::size_t {
     GatherRun,        ///< calls that gathered
     GatherEmpty,      ///< gathers that found nothing (a write collected and gathered meanwhile)
     GatherRaces,      ///< verify: skipped gathers' writes collected after the check (as the base)
+    CrossingWrites,   ///< collected CPU writes crossing a 2 KiB granule (split or lost)
     TickResets,       ///< usage tracker resets
     TickWordsCleared, ///< words cleared by them
     TickWordsSkipped, ///< words the base would have cleared too (already zero)
@@ -143,6 +151,7 @@ inline void ReadSwitches() {
     g_inline = ReadFlag("EDEN_NX2_BACKX_INLINE");
     g_report = ReadFlag("EDEN_NX2_BACKX_REPORT");
     g_gather = ReadFlag("EDEN_NX2_BACKX_GATHER");
+    g_collect_split = ReadFlag("EDEN_NX2_BACKX_COLLECT_SPLIT");
     g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
     g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
     g_submit_draws = 0;
@@ -153,12 +162,13 @@ inline void ReadSwitches() {
     g_verify = ReadFlag("EDEN_NX2_BACKX_VERIFY");
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
     g_gather_epochs = g_gather && g_verify;
-    if (g_inline || g_report || g_gather || g_tick || g_apply || g_submit_draws != 0 || g_verify ||
-        g_stats) {
+    if (g_inline || g_report || g_gather || g_collect_split || g_tick || g_apply ||
+        g_submit_draws != 0 || g_verify || g_stats) {
         LOG_INFO(HW_GPU,
-                 "BackX: inline {} report {} gather {} tick {} apply {} submit after {} draws "
-                 "verify {} stats {}",
-                 g_inline, g_report, g_gather, g_tick, g_apply, g_submit_draws, g_verify, g_stats);
+                 "BackX: inline {} report {} gather {} collect split {} tick {} apply {} submit "
+                 "after {} draws verify {} stats {}",
+                 g_inline, g_report, g_gather, g_collect_split, g_tick, g_apply, g_submit_draws,
+                 g_verify, g_stats);
     }
 }
 
@@ -186,6 +196,7 @@ inline void Report() {
     const u64 gather_run = Take(Counter::GatherRun);
     const u64 gather_empty = Take(Counter::GatherEmpty);
     const u64 gather_races = Take(Counter::GatherRaces);
+    const u64 crossing_writes = Take(Counter::CrossingWrites);
     const u64 tick_resets = Take(Counter::TickResets);
     const u64 tick_cleared = Take(Counter::TickWordsCleared);
     const u64 tick_skipped = Take(Counter::TickWordsSkipped);
@@ -197,11 +208,13 @@ inline void Report() {
              "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
              "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
              "gathers {} skipped, {} run ({} found nothing, {} skipped with writes collected after "
-             "the check); usage resets {} clearing {} words, {} words left alone; collected writes "
-             "{} in {} passes; deferred fence flushes submitted early {}; verify mismatches {}",
+             "the check); crossing writes {} ({}); usage resets {} clearing {} words, {} words "
+             "left alone; collected writes {} in {} passes; deferred fence flushes submitted "
+             "early {}; verify mismatches {}",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
-             report_locked, gather_skipped, gather_run, gather_empty, gather_races, tick_resets,
-             tick_cleared, tick_skipped, apply_ranges, apply_passes, early_submits, mismatches);
+             report_locked, gather_skipped, gather_run, gather_empty, gather_races, crossing_writes,
+             g_collect_split ? "split" : "lost", tick_resets, tick_cleared, tick_skipped,
+             apply_ranges, apply_passes, early_submits, mismatches);
 }
 
 } // namespace VideoCommon::BackX

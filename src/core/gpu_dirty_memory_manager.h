@@ -29,30 +29,26 @@ public:
         // EDEN_NX2_BACKX_GATHER with _VERIFY: odd while a Collect runs (CollectEpoch).
         const EpochScope epoch_scope{VideoCommon::BackX::g_gather_epochs ? &collect_epoch
                                                                          : nullptr};
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    back_buffer_used.store(true, std::memory_order_relaxed);
-                    // Release: whoever sees `t` sees back_buffer_used too (MayHavePending). The
-                    // same instruction as relaxed on x86.
-                    current.exchange(t, std::memory_order_release);
+        if (VideoCommon::BackX::g_collect_split || VideoCommon::BackX::g_stats ||
+            VideoCommon::BackX::g_verify) [[unlikely]] {
+            if ((address & page_mask) + size > page_size) {
+                // BuildTransform covers one 2 KiB granule; past its end the mask's shift is out of
+                // range, and the write's bytes are lost (often all of them).
+                VideoCommon::BackX::Count(VideoCommon::BackX::Counter::CrossingWrites);
+                if (VideoCommon::BackX::g_collect_split) {
+                    // EDEN_NX2_BACKX_COLLECT_SPLIT: one transform per granule the write touches.
+                    while (size != 0) {
+                        const size_t chunk = (std::min)(
+                            size, static_cast<size_t>(page_size - (address & page_mask)));
+                        CollectInGranule(address, chunk);
+                        address += chunk;
+                        size -= chunk;
+                    }
                     return;
                 }
-                tmp.address = t.address;
-                tmp.mask = 0;
             }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        }
+        CollectInGranule(address, size);
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -143,6 +139,34 @@ public:
     }
 
 private:
+    /// One write within one 2 KiB granule (Collect).
+    void CollectInGranule(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        do {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    back_buffer.emplace_back(tmp);
+                    back_buffer_used.store(true, std::memory_order_relaxed);
+                    // Release: whoever sees `t` sees back_buffer_used too (MayHavePending). The
+                    // same instruction as relaxed on x86.
+                    current.exchange(t, std::memory_order_release);
+                    return;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                std::memory_order_relaxed));
+    }
+
     struct alignas(8) TransformAddress {
         u32 address;
         u32 mask;

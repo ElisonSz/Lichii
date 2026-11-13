@@ -417,3 +417,63 @@ TEST_CASE("BackX gather: the verify classification finds no write the check miss
     INFO("races " << races);
     REQUIRE(gaps == 0);
 }
+
+TEST_CASE("BackX collect split: every byte of a write crossing 2 KiB granules is collected",
+          "[core][nx2_backx]") {
+    // Without the switch the base loses such writes (BuildTransform); with it each granule gets
+    // its own transform. Each write is collected alone and gathered: exactly its 64-byte blocks.
+    const SwitchScope split{BackX::g_collect_split, true};
+    std::mt19937_64 rng{11};
+    u64 crossing = 0;
+    for (int i = 0; i < 20000; ++i) {
+        Core::GPUDirtyMemoryManager manager;
+        const PAddr address = 0x100000 + rng() % 0x4000;
+        const size_t size = 1 + rng() % 0x1000;
+        crossing += (address % 2048) + size > 2048 ? 1 : 0;
+        manager.Collect(address, size);
+        std::set<u64> gathered;
+        std::function<void(PAddr, size_t)> callback = [&](PAddr a, size_t s) {
+            AddBlocks(gathered, a, s);
+        };
+        manager.Gather(callback);
+        std::set<u64> expected;
+        AddBlocks(expected, address, size);
+        REQUIRE(gathered == expected);
+        REQUIRE_FALSE(manager.MayHavePending());
+    }
+    REQUIRE(crossing > 1000);
+}
+
+TEST_CASE("BackX collect split: a racing gatherer gets every byte of every write",
+          "[core][nx2_backx]") {
+    const SwitchScope split{BackX::g_collect_split, true};
+    for (u64 seed = 1; seed <= 4; ++seed) {
+        Core::GPUDirtyMemoryManager manager;
+        std::set<u64> collected;
+        std::set<u64> gathered;
+        std::atomic<bool> done{false};
+        std::thread collector([&] {
+            std::mt19937_64 rng{seed};
+            for (int i = 0; i < 100000; ++i) {
+                const PAddr address = 0x100000 + rng() % 0x8000;
+                const size_t size = rng() % 8 == 0 ? 1 + rng() % 0x1000 : 1 + rng() % 16;
+                manager.Collect(address, size);
+                AddBlocks(collected, address, size);
+            }
+            done.store(true, std::memory_order_release);
+        });
+        std::function<void(PAddr, size_t)> callback = [&](PAddr address, size_t size) {
+            AddBlocks(gathered, address, size);
+        };
+        while (!done.load(std::memory_order_acquire)) {
+            if (manager.MayHavePending()) {
+                manager.Gather(callback);
+            }
+        }
+        collector.join();
+        if (manager.MayHavePending()) {
+            manager.Gather(callback);
+        }
+        REQUIRE(gathered == collected);
+    }
+}
