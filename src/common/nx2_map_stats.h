@@ -41,6 +41,23 @@ enum class Counter : size_t {
     HostUnmapBytes,
     HostUnmapNs,
     SameBackingBytes,
+    // Where the host's time goes: waits for the placeholder lock, and each kind of system call.
+    MapLockNs,
+    UnmapLockNs,
+    ProtectLockNs,
+    Lookups,
+    LookupLockNs,
+    Splits,
+    SplitNs,
+    MapViews,
+    MapViewNs,
+    UnmapViews,
+    UnmapViewNs,
+    Coalesces,
+    CoalesceNs,
+    Protects,
+    VirtualProtects,
+    VirtualProtectNs,
     Count,
 };
 
@@ -55,6 +72,30 @@ inline void Add(Counter counter, u64 value) {
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
 }
+
+/// Counts one call and its time when the statistics are on.
+class Timer {
+public:
+    Timer(Counter calls_, Counter ns_)
+        : calls{calls_}, ns{ns_}, on{Enabled()}, start{on ? NowNs() : 0} {}
+    ~Timer() {
+        if (on) [[unlikely]] {
+            Add(calls, 1);
+            Add(ns, NowNs() - start);
+        }
+    }
+    Timer(const Timer&) = delete;
+    Timer& operator=(const Timer&) = delete;
+
+private:
+    Counter calls;
+    Counter ns;
+    bool on;
+    u64 start;
+};
+
+/// The process's page faults so far (host_memory.cpp; 0 where unknown).
+[[nodiscard]] u64 PageFaultCount();
 
 /// After each counted SVC: logs and clears the counters once at least 10 s have passed.
 inline void MaybeReport() {
@@ -90,6 +131,21 @@ inline void MaybeReport() {
              get(Counter::HostUnmaps), get(Counter::HostUnmapPlaceholders),
              mib(Counter::HostUnmapBytes), ms(Counter::HostUnmapNs),
              mib(Counter::SameBackingBytes));
+    static std::atomic<u64> last_faults{};
+    const u64 faults = PageFaultCount();
+    const u64 new_faults = faults - last_faults.exchange(faults, std::memory_order_relaxed);
+    LOG_INFO(Kernel,
+             "Host memory {:.1f} s: lock waits map {:.1f} ms, unmap {:.1f} ms, protect {:.1f} ms, "
+             "{} lookups {:.1f} ms; splits {} {:.1f} ms, views mapped {} {:.1f} ms, unmapped {} "
+             "{:.1f} ms, coalesces {} {:.1f} ms; {} protects, {} VirtualProtect {:.1f} ms; {} page "
+             "faults",
+             static_cast<double>(now - start) / 1e9, ms(Counter::MapLockNs),
+             ms(Counter::UnmapLockNs), ms(Counter::ProtectLockNs), get(Counter::Lookups),
+             ms(Counter::LookupLockNs), get(Counter::Splits), ms(Counter::SplitNs),
+             get(Counter::MapViews), ms(Counter::MapViewNs), get(Counter::UnmapViews),
+             ms(Counter::UnmapViewNs), get(Counter::Coalesces), ms(Counter::CoalesceNs),
+             get(Counter::Protects), get(Counter::VirtualProtects), ms(Counter::VirtualProtectNs),
+             new_faults);
 }
 
 } // namespace Common::Nx2MapStats

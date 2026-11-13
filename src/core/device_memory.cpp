@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "common/logging.h"
+#include "common/nx2_map_stats.h"
 #include "common/thread.h"
 #endif
 
@@ -57,6 +58,10 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+        if (Common::Nx2MapStats::Enabled()) {
+            LOG_INFO(HW_Memory, "Zero trim pass: {} MiB of {} MiB resident in {} ms",
+                     trimmed >> 20, resident >> 20, ms);
+        }
         if (trimmed < Busy) {
             interval = (std::min)(interval * 2, std::chrono::seconds{60});
             continue;

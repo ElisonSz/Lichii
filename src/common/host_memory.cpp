@@ -82,6 +82,16 @@ static int memfd_create(const char* name, unsigned int flags) {
 
 namespace Common {
 
+u64 Nx2MapStats::PageFaultCount() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return counters.PageFaultCount;
+    }
+#endif
+    return 0;
+}
+
 thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
 
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
@@ -236,8 +246,12 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
-        std::unique_lock lock{placeholder_mutex};
         const bool map_stats = Nx2MapStats::Enabled();
+        const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
+        std::unique_lock lock{placeholder_mutex};
+        if (map_stats) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::MapLockNs, Nx2MapStats::NowNs() - lock_start);
+        }
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
             if (map_stats) [[unlikely]] {
@@ -256,14 +270,19 @@ public:
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
+        const bool map_stats = Nx2MapStats::Enabled();
+        const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
         std::scoped_lock lock{placeholder_mutex};
+        if (map_stats) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::UnmapLockNs, Nx2MapStats::NowNs() - lock_start);
+        }
 
         // Unmap until there are no more placeholders
         u64 unmapped_placeholders = 0;
         while (UnmapOnePlaceholder(virtual_offset, length)) {
             ++unmapped_placeholders;
         }
-        if (Nx2MapStats::Enabled()) [[unlikely]] {
+        if (map_stats) [[unlikely]] {
             Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmapPlaceholders, unmapped_placeholders);
         }
     }
@@ -281,12 +300,21 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        const bool map_stats = Nx2MapStats::Enabled();
+        const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
         std::scoped_lock lock{placeholder_mutex};
+        if (map_stats) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::Protects, 1);
+            Nx2MapStats::Add(Nx2MapStats::Counter::ProtectLockNs,
+                             Nx2MapStats::NowNs() - lock_start);
+        }
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
             DWORD old_flags{};
+            const Nx2MapStats::Timer timer{Nx2MapStats::Counter::VirtualProtects,
+                                           Nx2MapStats::Counter::VirtualProtectNs};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
@@ -296,7 +324,13 @@ public:
 
     /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
     std::optional<size_t> BackingOffset(size_t virtual_offset) {
+        const bool map_stats = Nx2MapStats::Enabled();
+        const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
         std::scoped_lock lock{placeholder_mutex};
+        if (map_stats) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::Lookups, 1);
+            Nx2MapStats::Add(Nx2MapStats::Counter::LookupLockNs, Nx2MapStats::NowNs() - lock_start);
+        }
         const auto it = placeholders.find(virtual_offset);
         if (it == placeholders.end()) {
             return std::nullopt;
@@ -381,9 +415,13 @@ private:
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
 
-        if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
-                                  MEM_PRESERVE_PLACEHOLDER)) {
-            LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
+        {
+            const Nx2MapStats::Timer timer{Nx2MapStats::Counter::UnmapViews,
+                                           Nx2MapStats::Counter::UnmapViewNs};
+            if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
+                                      MEM_PRESERVE_PLACEHOLDER)) {
+                LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
+            }
         }
         // If we have to remap memory regions due to partial unmaps, we are in a data race as
         // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
@@ -432,6 +470,8 @@ private:
     }
 
     void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
+        const Nx2MapStats::Timer timer{Nx2MapStats::Counter::MapViews,
+                                       Nx2MapStats::Counter::MapViewNs};
         if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
                                 length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
             LOG_CRITICAL(HW_Memory, "Failed to map placeholder");
@@ -439,6 +479,7 @@ private:
     }
 
     void Split(size_t virtual_offset, size_t length) {
+        const Nx2MapStats::Timer timer{Nx2MapStats::Counter::Splits, Nx2MapStats::Counter::SplitNs};
         if (!VirtualFreeEx(process, reinterpret_cast<LPVOID>(virtual_base + virtual_offset), length,
                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
             LOG_CRITICAL(HW_Memory, "Failed to split placeholder");
@@ -446,6 +487,8 @@ private:
     }
 
     void Coalesce(size_t virtual_offset, size_t length) {
+        const Nx2MapStats::Timer timer{Nx2MapStats::Counter::Coalesces,
+                                       Nx2MapStats::Counter::CoalesceNs};
         if (!VirtualFreeEx(process, reinterpret_cast<LPVOID>(virtual_base + virtual_offset), length,
                            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
             LOG_CRITICAL(HW_Memory, "Failed to coalesce placeholders");
