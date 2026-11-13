@@ -3019,8 +3019,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
 
 template <class P>
 void BufferCache<P>::NoteBankUpload(DAddr device_addr, u64 size) {
-    // TEST: EDEN_NX2_CFG_BANK_STATS. Bounded: the map forgets everything past 4096 banks.
-    if (bank_upload_shadows.size() > 4096) {
+    // TEST: EDEN_NX2_CFG_BANK_STATS. Bounded: the map forgets everything past 1024 banks (64 MiB
+    // of copies at most).
+    if (bank_upload_shadows.size() > 1024) {
         bank_upload_shadows.clear();
     }
     std::vector<u8> bytes(size);
