@@ -47,6 +47,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
@@ -332,6 +333,11 @@ public:
     /// lands it: the older result lands over it, and a later read downloads it again. True when
     /// it keeps the result, which FinishReport then ends.
     [[nodiscard]] bool NoteReportPending(DAddr device_addr, u64 size);
+
+    /// EDEN_NX2_BACKX_REPORT: false when the page of `device_addr` is not a read-back page, so
+    /// NoteReportPending would keep nothing. Without `mutex`: a page is marked before it becomes
+    /// one and stays marked while it is one. True when the switch is off.
+    [[nodiscard]] bool MayBeReadBackPage(DAddr device_addr) const noexcept;
 
     /// The query cache wrote a result NoteReportPending kept to guest memory, or dropped it.
     void FinishReport(DAddr device_addr, u64 size);
@@ -1115,6 +1121,9 @@ private:
     static constexpr u64 EarlyBytesPerFrame = 1_MiB;
     static constexpr u32 MaxPendingEarlyDownloads = 32;
     std::vector<ReadBackPage> read_back_pages; ///< Sorted by page
+    /// EDEN_NX2_BACKX_REPORT: the pages of read_back_pages, changed under `mutex` (a page marked
+    /// before it enters, rebuilt after one leaves), read without it (MayBeReadBackPage).
+    VideoCommon::BackX::PageSetFilter read_back_filter;
     /// NoteReportPending's results not yet written, oldest first.
     struct PendingReport {
         DAddr addr;

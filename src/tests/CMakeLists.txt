@@ -22,6 +22,7 @@ add_executable(tests
     video_core/semaphore_waiters.cpp
     video_core/nx2_fast_wake.cpp
     video_core/nx2_sync_suspend.cpp
+    video_core/nx2_backx.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp

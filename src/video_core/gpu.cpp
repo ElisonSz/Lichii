@@ -43,6 +43,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
@@ -114,6 +115,16 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        if (VideoCommon::BackX::g_gather) [[unlikely]] {
+            BackXInvalidateGPUCache();
+            return;
+        }
+        ApplyCollectedWrites();
+    }
+
+    /// Gathers the CPU writes collected into GPU-written pages and applies them to the caches.
+    /// True when there were some.
+    bool ApplyCollectedWrites() {
         std::vector<std::pair<DAddr, u64>> writes;
         {
             // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
@@ -124,7 +135,7 @@ struct GPU::Impl {
                 [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
             system.GatherGPUDirtyMemory(callback_writes);
             if (writes.empty()) {
-                return;
+                return false;
             }
             applying_writes.push_back(&writes);
         }
@@ -135,6 +146,34 @@ struct GPU::Impl {
             std::erase(applying_writes, &writes);
         };
         renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        return true;
+    }
+
+    /// EDEN_NX2_BACKX_GATHER: gathers (applying_writes_mutex, then two locks per core's manager)
+    /// only when a manager may hold a collected write (GPUDirtyMemoryManager::MayHavePending). A
+    /// write collected after the check is gathered by the next call, as one collected just after
+    /// the base's gather is.
+    void BackXInvalidateGPUCache() {
+        namespace BackX = VideoCommon::BackX;
+        bool pending = false;
+        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+            if (manager.MayHavePending()) {
+                pending = true;
+                break;
+            }
+        }
+        if (pending) {
+            BackX::Count(BackX::Counter::GatherRun);
+            if (!ApplyCollectedWrites()) {
+                BackX::Count(BackX::Counter::GatherEmpty);
+            }
+            return;
+        }
+        BackX::Count(BackX::Counter::GatherSkipped);
+        if (BackX::g_verify && ApplyCollectedWrites()) [[unlikely]] {
+            // Also counts a write collected between the check and this gather (rare).
+            BackX::Mismatch("collected CPU write while no manager showed one", 0, 0);
+        }
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {

@@ -16,6 +16,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_perf.h"
 
 namespace VideoCommon {
@@ -36,7 +37,11 @@ public:
             return;
         }
         tracked = false;
-        std::ranges::fill(pages, 0ULL);
+        if (BackX::g_tick) [[unlikely]] {
+            ResetSetWords();
+        } else {
+            std::ranges::fill(pages, 0ULL);
+        }
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -57,6 +62,12 @@ public:
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
             return;
+        }
+        if (BackX::g_tick) [[unlikely]] {
+            // EDEN_NX2_BACKX_TICK: TrackPage and FillPages below set words only in
+            // [page, page_end].
+            set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
+            set_end = (std::max)(set_end, page_end + 1);
         }
         TrackPage(page, offset, size);
         if (page == page_end) {
@@ -92,6 +103,28 @@ public:
     }
 
 private:
+    /// EDEN_NX2_BACKX_TICK: clears the words set since the last reset, [set_begin, set_end); every
+    /// other word is zero already (only Track sets words). A buffer of hundreds of MiB bound in
+    /// part cleared all its words (8 bytes a 4 KiB page) every frame.
+    void ResetSetWords() noexcept {
+        if (set_end != 0) {
+            std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
+                      pages.begin() + static_cast<std::ptrdiff_t>(set_end), 0ULL);
+        }
+        BackX::Count(BackX::Counter::TickResets);
+        BackX::Count(BackX::Counter::TickWordsCleared, set_end - set_begin);
+        BackX::Count(BackX::Counter::TickWordsSkipped, pages.size() - (set_end - set_begin));
+        if (BackX::g_verify) [[unlikely]] {
+            if (std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
+                BackX::Mismatch("usage tracker word set outside the tracked extent", set_begin,
+                                set_end);
+                std::ranges::fill(pages, 0ULL);
+            }
+        }
+        set_begin = 0;
+        set_end = 0;
+    }
+
     void FillPages(size_t begin, size_t end) noexcept {
         if (begin >= end) {
             return;
@@ -164,6 +197,10 @@ private:
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
+    /// EDEN_NX2_BACKX_TICK: the words set since the last reset lie in [set_begin, set_end) (none
+    /// when set_end is 0).
+    size_t set_begin{};
+    size_t set_end{};
     bool tracked{};
 };
 

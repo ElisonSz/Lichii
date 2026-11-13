@@ -30,6 +30,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -1041,7 +1042,14 @@ void BufferCache<P>::NoteReadBack(DAddr begin, DAddr end, bool gpu_modified) {
                     // The page whose writes were read longest ago makes room.
                     read_back_pages.erase(
                         std::ranges::min_element(read_back_pages, {}, &ReadBackPage::last_read));
+                    if (VideoCommon::BackX::g_report) [[unlikely]] {
+                        read_back_filter.Rebuild(
+                            read_back_pages, [](const ReadBackPage& entry) { return entry.page; });
+                    }
                     it = std::ranges::lower_bound(read_back_pages, page, {}, &ReadBackPage::page);
+                }
+                if (VideoCommon::BackX::g_report) [[unlikely]] {
+                    read_back_filter.Mark(page);
                 }
                 it = read_back_pages.insert(it, ReadBackPage{.page = page, .written = true});
             }
@@ -1067,6 +1075,20 @@ bool BufferCache<P>::NoteReportPending(DAddr device_addr, u64 size) {
         }
     }
     return false;
+}
+
+template <class P>
+bool BufferCache<P>::MayBeReadBackPage(DAddr device_addr) const noexcept {
+    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
+        if (!VideoCommon::BackX::g_report) {
+            return true;
+        }
+        static_assert(VideoCommon::BackX::PageSetFilter::PageBits == Core::DEVICE_PAGEBITS);
+        return read_back_filter.MayHold(device_addr);
+    } else {
+        // NoteReportPending keeps nothing here.
+        return false;
+    }
 }
 
 template <class P>

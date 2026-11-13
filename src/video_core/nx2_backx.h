@@ -1,0 +1,174 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdlib>
+#include <mutex>
+
+#include "common/common_types.h"
+#include "common/logging.h"
+
+/// The GPU back thread's work outside draw preparation (EDEN_NX2_BACKX_*): locks and passes the
+/// base takes where an exact check without the lock shows they would change nothing. Guest CPU
+/// write traps hold the buffer cache's lock across page protection system calls, so every
+/// acquisition the back makes can meet one and spin (3 % of the back's time on Castle Town).
+namespace VideoCommon::BackX {
+
+/// EDEN_NX2_BACKX_INLINE=1: an inline-to-memory write takes the buffer cache's lock only when one
+/// of its pages may hold GPU-written data or a command list (otherwise InlineMemory would find
+/// nothing to upload), and invalidates the query cache only where its page filter marks a query.
+inline bool g_inline{};
+/// EDEN_NX2_BACKX_REPORT=1: a report takes the buffer cache's lock (NoteReportPending) only when
+/// its page may be one the guest read GPU-written data from (read-back pages).
+inline bool g_report{};
+/// EDEN_NX2_BACKX_GATHER=1: InvalidateGPUCache gathers collected CPU writes (two locks per core's
+/// manager) only when a manager may hold one.
+inline bool g_gather{};
+/// EDEN_NX2_BACKX_TICK=1: a buffer's usage tracker clears only the words it set since its last
+/// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame).
+inline bool g_tick{};
+/// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
+/// then does what the base does.
+inline bool g_verify{};
+/// EDEN_NX2_BACKX_STATS=1: one "BackX" line every 10 s with the counters below.
+inline bool g_stats{};
+
+enum class Counter : std::size_t {
+    InlineFast,       ///< inline writes that skipped the buffer cache's lock
+    InlineLocked,     ///< inline writes that took it
+    QuerySkipped,     ///< inline writes whose query cache invalidation was skipped
+    QueryRun,         ///< inline writes that invalidated the query cache
+    ReportFast,       ///< reports that skipped the lock of NoteReportPending
+    ReportLocked,     ///< reports that took it
+    GatherSkipped,    ///< InvalidateGPUCache calls that found no manager with a collected write
+    GatherRun,        ///< calls that gathered
+    GatherEmpty,      ///< gathers that found nothing (the flag was set, the write already gone)
+    TickResets,       ///< usage tracker resets
+    TickWordsCleared, ///< words cleared by them
+    TickWordsSkipped, ///< words the base would have cleared too (already zero)
+    Mismatches,       ///< verify: skips the base's check contradicted
+    Count,
+};
+
+inline std::array<std::atomic<u64>, static_cast<std::size_t>(Counter::Count)> g_counters{};
+
+/// Counts only with the stats or verify line on (else one predictable branch).
+inline void Count(Counter counter, u64 amount = 1) {
+    if (g_stats || g_verify) [[unlikely]] {
+        g_counters[static_cast<std::size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
+    }
+}
+
+/// Verify: a skip the base's own check contradicts (logged 64 times at most).
+inline void Mismatch(const char* what, u64 address, u64 size) {
+    g_counters[static_cast<std::size_t>(Counter::Mismatches)].fetch_add(1,
+                                                                        std::memory_order_relaxed);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_ERROR(HW_GPU, "BackX verify mismatch: {} at {:#x}+{:#x}", what, address, size);
+    }
+}
+
+/// EDEN_NX2_BACKX_REPORT: whether a device page may be in a small set of pages that changes under
+/// a lock while others ask without it. One bit per page index modulo 4096. A page's bit is set
+/// before the page enters the set; after pages leave, Rebuild stores every word anew from the
+/// pages still in it, so a page that stays in the set keeps its bit in each value a reader can
+/// load. Mark and Rebuild need the set's lock; MayHold does not.
+class PageSetFilter {
+public:
+    static constexpr u64 PageBits = 12;
+    static constexpr std::size_t NumWords = 64;
+
+    void Mark(u64 address) noexcept {
+        const u64 index = Index(address);
+        words[index / 64].fetch_or(u64{1} << (index % 64), std::memory_order_release);
+    }
+
+    /// `pages`: the device addresses of the pages now in the set.
+    template <typename Range, typename Projection>
+    void Rebuild(const Range& pages, Projection&& projection) noexcept {
+        std::array<u64, NumWords> rebuilt{};
+        for (const auto& entry : pages) {
+            const u64 index = Index(projection(entry));
+            rebuilt[index / 64] |= u64{1} << (index % 64);
+        }
+        for (std::size_t i = 0; i < NumWords; ++i) {
+            words[i].store(rebuilt[i], std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] bool MayHold(u64 address) const noexcept {
+        const u64 index = Index(address);
+        return ((words[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
+    }
+
+private:
+    [[nodiscard]] static constexpr u64 Index(u64 address) noexcept {
+        return (address >> PageBits) % (NumWords * 64);
+    }
+
+    std::array<std::atomic<u64>, NumWords> words{};
+};
+
+[[nodiscard]] inline bool ReadFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+
+/// Called by VideoCore::CreateGPU, before the caches exist.
+inline void ReadSwitches() {
+    g_inline = ReadFlag("EDEN_NX2_BACKX_INLINE");
+    g_report = ReadFlag("EDEN_NX2_BACKX_REPORT");
+    g_gather = ReadFlag("EDEN_NX2_BACKX_GATHER");
+    g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
+    g_verify = ReadFlag("EDEN_NX2_BACKX_VERIFY");
+    g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
+    if (g_inline || g_report || g_gather || g_tick || g_verify || g_stats) {
+        LOG_INFO(HW_GPU, "BackX: inline {} report {} gather {} tick {} verify {} stats {}",
+                 g_inline, g_report, g_gather, g_tick, g_verify, g_stats);
+    }
+}
+
+[[nodiscard]] inline u64 Take(Counter counter) {
+    return g_counters[static_cast<std::size_t>(counter)].exchange(0, std::memory_order_relaxed);
+}
+
+/// The stats line, at most once every 10 s (called once a frame by RasterizerVulkan::TickFrame).
+inline void Report() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point window_start = Clock::now();
+    const Clock::time_point now = Clock::now();
+    if (now - window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - window_start).count();
+    window_start = now;
+    const u64 inline_fast = Take(Counter::InlineFast);
+    const u64 inline_locked = Take(Counter::InlineLocked);
+    const u64 query_skipped = Take(Counter::QuerySkipped);
+    const u64 query_run = Take(Counter::QueryRun);
+    const u64 report_fast = Take(Counter::ReportFast);
+    const u64 report_locked = Take(Counter::ReportLocked);
+    const u64 gather_skipped = Take(Counter::GatherSkipped);
+    const u64 gather_run = Take(Counter::GatherRun);
+    const u64 gather_empty = Take(Counter::GatherEmpty);
+    const u64 tick_resets = Take(Counter::TickResets);
+    const u64 tick_cleared = Take(Counter::TickWordsCleared);
+    const u64 tick_skipped = Take(Counter::TickWordsSkipped);
+    const u64 mismatches = Take(Counter::Mismatches);
+    LOG_INFO(HW_GPU,
+             "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
+             "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
+             "gathers {} skipped, {} run ({} found nothing); usage resets {} clearing {} words, "
+             "{} words left alone; verify mismatches {}",
+             seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
+             report_locked, gather_skipped, gather_run, gather_empty, tick_resets, tick_cleared,
+             tick_skipped, mismatches);
+}
+
+} // namespace VideoCommon::BackX

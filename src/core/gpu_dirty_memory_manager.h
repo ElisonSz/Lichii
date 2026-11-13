@@ -85,6 +85,15 @@ public:
         front_buffer.clear();
     }
 
+    /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
+    /// in `current` (by compare-exchange, or by exchange after pushing the one before to
+    /// back_buffer), and only Gather, which takes back_buffer too, empties `current` again. An
+    /// empty transform has no mask bits (IsValid holds for every 32-bit page index). Without the
+    /// locks: a Collect it misses is one the caller may order after itself.
+    [[nodiscard]] bool MayHavePending() const {
+        return current.load(std::memory_order_acquire).mask != 0;
+    }
+
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
     bool Overlaps(PAddr address, size_t size) {
         const PAddr end = address + size;

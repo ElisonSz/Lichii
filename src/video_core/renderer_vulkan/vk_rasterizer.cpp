@@ -58,6 +58,7 @@
 #include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -3176,6 +3177,24 @@ void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
 }
 
 bool RasterizerVulkan::NoteReportPending(DAddr addr, u64 size) {
+    if (VideoCommon::BackX::g_report) [[unlikely]] {
+        // EDEN_NX2_BACKX_REPORT: NoteReportPending notes only reports on read-back pages, and a
+        // page is marked in the filter before it becomes one. A page that becomes one after this
+        // check is the base with this lock taken first.
+        if (!buffer_cache.MayBeReadBackPage(addr)) {
+            VideoCommon::BackX::Count(VideoCommon::BackX::Counter::ReportFast);
+            if (!VideoCommon::BackX::g_verify) {
+                return false;
+            }
+            std::scoped_lock lock{buffer_cache.mutex};
+            const bool noted = buffer_cache.NoteReportPending(addr, size);
+            if (noted) {
+                VideoCommon::BackX::Mismatch("report on a read-back page", addr, size);
+            }
+            return noted;
+        }
+        VideoCommon::BackX::Count(VideoCommon::BackX::Counter::ReportLocked);
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     return buffer_cache.NoteReportPending(addr, size);
 }
@@ -4075,6 +4094,9 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     VideoCommon::WaitStats::Report();
+    if (VideoCommon::BackX::g_stats) [[unlikely]] {
+        VideoCommon::BackX::Report();
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -4226,6 +4248,75 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
     return accelerate_dma;
 }
 
+namespace {
+
+/// EDEN_NX2_BACKX_INLINE: the buffer and query caches' part of an inline-to-memory write, without
+/// their locks where the base's locked work would change nothing:
+/// - InlineMemory uploads only into GPU-written buffer data on the written pages, and every range
+///   the buffer cache records as GPU-written marks its pages in Tegra::g_nx2_gpu_written_pages
+///   first, under its lock, on this thread, and the bits never clear (MustFlushRegion answers from
+///   them the same way); Nx2NoteListHostWrite acts only on command list pages. So with no such
+///   page the locked section does nothing.
+/// - The query cache's InvalidateRegion changes only pages holding a cached query, and
+///   CounterReport (this thread) marks a query's page in page_filter before caching it; the
+///   filter never clears.
+bool BackXInlineCaches(BufferCache& buffer_cache, QueryCache& query_cache, DAddr addr, size_t size,
+                       std::span<const u8> memory) {
+    namespace BackX = VideoCommon::BackX;
+    const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+    const auto no_list_page = [&] {
+        if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        const DAddr last = addr + size - 1;
+        for (DAddr page = addr >> Tegra::Nx2WrittenPageBits;
+             page <= (last >> Tegra::Nx2WrittenPageBits); ++page) {
+            if (Tegra::Nx2IsCommandListPage(page << Tegra::Nx2WrittenPageBits)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool lock_free = Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                           !Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin) &&
+                           no_list_page();
+    bool uploaded = false;
+    if (lock_free) {
+        BackX::Count(BackX::Counter::InlineFast);
+        if (BackX::g_verify) [[unlikely]] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+                BackX::Mismatch("inline write into GPU-written buffer data", addr, size);
+                buffer_cache.Nx2NoteListHostWrite(addr, size);
+                uploaded = buffer_cache.InlineMemory(addr, size, memory);
+            }
+        }
+    } else {
+        BackX::Count(BackX::Counter::InlineLocked);
+        std::scoped_lock lock{buffer_cache.mutex};
+        // Guest memory has the words now: a command list copy of the page no longer does.
+        buffer_cache.Nx2NoteListHostWrite(addr, size);
+        uploaded = buffer_cache.InlineMemory(addr, size, memory);
+    }
+    // Pending query results must not land over the new words later: drop them now.
+    if (query_cache.page_filter.Any(addr, size)) {
+        BackX::Count(BackX::Counter::QueryRun);
+        query_cache.InvalidateRegion(addr, size);
+    } else {
+        BackX::Count(BackX::Counter::QuerySkipped);
+        // HoldsQueries looks at every report overlapping the range (a superset of what
+        // InvalidateRegion drops).
+        if (BackX::g_verify && query_cache.HoldsQueries(addr, size)) [[unlikely]] {
+            BackX::Mismatch("inline write over a cached query", addr, size);
+            query_cache.InvalidateRegion(addr, size);
+        }
+    }
+    return uploaded;
+}
+
+} // Anonymous namespace
+
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
@@ -4260,17 +4351,21 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     // fencing thread and CPU write traps holding one of them most of the time.
     const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::Inline};
     bool uploaded;
-    {
-        std::scoped_lock lock{buffer_cache.mutex};
-        // Guest memory has the words now: a command list copy of the page no longer does.
-        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
-        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
-        if (!uploaded && !defer) {
-            buffer_cache.WriteMemory(*cpu_addr, copy_size);
+    if (VideoCommon::BackX::g_inline && defer) [[unlikely]] {
+        uploaded = BackXInlineCaches(buffer_cache, query_cache, *cpu_addr, copy_size, memory);
+    } else {
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            // Guest memory has the words now: a command list copy of the page no longer does.
+            buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+            uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+            if (!uploaded && !defer) {
+                buffer_cache.WriteMemory(*cpu_addr, copy_size);
+            }
         }
+        // Pending query results must not land over the new words later: drop them now.
+        query_cache.InvalidateRegion(*cpu_addr, copy_size);
     }
-    // Pending query results must not land over the new words later: drop them now.
-    query_cache.InvalidateRegion(*cpu_addr, copy_size);
     if (!uploaded && defer) {
         // Title 1 makes thousands of small inline writes between draws (~10% of the GPU
         // thread invalidating every cache for each). Guest memory is written; the buffer,
