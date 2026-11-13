@@ -360,6 +360,9 @@ struct RunAheadCheck {
     u32 value;
     u32 operation;
     VideoCommon::RunAhead::Reach reason;
+    /// A fence-flagged release to the word was pending at the decision: it may land at any time,
+    /// for the baseline too (its view reads memory then as well), so a change counts apart.
+    bool fenced;
 
     void operator()() const {
         auto& verified = VideoCommon::RunAhead::verified;
@@ -374,6 +377,10 @@ struct RunAheadCheck {
                          : operation == Nx2SemaphoreWaiters::AcquireGequal ? seen >= value
                                                                            : (seen & value) != 0;
         if (met && !flush) {
+            return;
+        }
+        if (fenced && !flush) {
+            verified.raced.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         verified.mismatches.fetch_add(1, std::memory_order_relaxed);
@@ -1066,11 +1073,12 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
             // The baseline would still wait for its writers here.
             ++RunAhead::counters.sooner;
             if (RunAhead::verify) {
-                split.Defer(
-                    RunAheadCheck{dma_pusher.rasterizer, &dma_pusher.memory_manager,
-                                  acquire.address, *device, acquire.sent_at, reach.position,
-                                  base_writers, acquire.value, acquire.operation, reach.reason},
-                    VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Noted);
+                split.Defer(RunAheadCheck{dma_pusher.rasterizer, &dma_pusher.memory_manager,
+                                          acquire.address, *device, acquire.sent_at, reach.position,
+                                          base_writers, acquire.value, acquire.operation,
+                                          reach.reason, FencedWritePending(*device)},
+                            VideoCommon::GpuSplit::FastDrawNeutral,
+                            VideoCommon::GpuSplit::Writes::Noted);
             }
         }
         if (pass && answer.kind == Kind::MetByQueued) {

@@ -100,6 +100,9 @@ struct VerifyCounters {
     std::atomic<u64> checked{};
     std::atomic<u64> mismatches{};
     std::atomic<u64> flushes{}; ///< Of mismatches: the buffer cache holds the word GPU-written
+    /// Changed while a fence-flagged release to the word was pending at the decision: a landing
+    /// the baseline's timing allows as well, not a mismatch of the reach
+    std::atomic<u64> raced{};
 };
 inline VerifyCounters verified;
 

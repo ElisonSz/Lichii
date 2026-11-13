@@ -388,14 +388,15 @@ inline void ReportRunAhead() {
              "logged writes scanned; front lead at acquires {:.0f} words avg, {} max; 1 ms valve "
              "drains {} {:.2f} ms; shim acquires met without a drain {}, drained {}; QMDs read "
              "from queued uploads {}, QMD signals unvalued {}; verify {} checked, {} mismatches "
-             "({} GPU-written)",
+             "({} GPU-written), {} changed by a fenced release landing",
              seconds, counts.acquires, counts.earlier, counts.sooner, counts.waits,
              static_cast<double>(counts.wait_ns) / 1e6, reasons, counts.scanned, lead_avg,
              counts.lead_max, counts.valve_drains, static_cast<double>(counts.valve_ns) / 1e6,
              counts.shim_met, counts.shim_drained, counts.upload_qmds, counts.unvalued,
              verified.checked.exchange(0, std::memory_order_relaxed),
              verified.mismatches.exchange(0, std::memory_order_relaxed),
-             verified.flushes.exchange(0, std::memory_order_relaxed));
+             verified.flushes.exchange(0, std::memory_order_relaxed),
+             verified.raced.exchange(0, std::memory_order_relaxed));
     counts = {};
 }
 
