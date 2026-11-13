@@ -1116,6 +1116,10 @@ bool CurrentProgramIsSwitch2();
 /// that requires it.
 bool ReactiveFlushing();
 
+/// cpu_accuracy, or EDEN_NX2_CPU_ACCURACY=auto|accurate|unsafe when set (comparisons without
+/// changing the configuration).
+CpuAccuracy EffectiveCpuAccuracy();
+
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();

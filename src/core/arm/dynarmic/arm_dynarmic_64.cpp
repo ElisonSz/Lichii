@@ -379,7 +379,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.code_cache_size = std::uint32_t(8_MiB);
     }
 
-    switch (Settings::values.cpu_accuracy.GetValue()) {
+    switch (Settings::EffectiveCpuAccuracy()) {
     // Debug mode
     case Settings::CpuAccuracy::Debugging:
         if (!Settings::values.cpuopt_page_tables) {
