@@ -3027,7 +3027,8 @@ void BufferCache<P>::RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& p
 
 template <class P>
 void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
-                                              std::vector<MultiRangeSegment>& pool) {
+                                              std::vector<MultiRangeSegment>& pool,
+                                              SingleRangeMemo* single) {
     binding.segment_first = 0;
     binding.segment_count = 0;
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
@@ -3037,10 +3038,43 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
         if (is_written && !runtime.PrefersSparseSources()) {
             return;
         }
+        // EDEN_NX2_CFG_SSBO: while no entry of the range cache was added, replaced or dropped and
+        // no unmap is pending, a Query of the arguments the slot's last Query had finds the same
+        // entry and changes nothing: the answer, one piece, is known.
+        const bool known_single =
+            single != nullptr && single->valid && single->memory == gpu_memory &&
+            single->gpu_addr == binding.gpu_addr && single->size == binding.size &&
+            single->generation == virtual_ranges.Generation() && !virtual_ranges.HasDeferred();
+        if (known_single) {
+            if (!Cfg::g_verify) [[likely]] {
+                Cfg::Count(Cfg::Counter::RangeQueriesSkipped);
+                return;
+            }
+            Cfg::Count(Cfg::Counter::Verified);
+        }
         const VirtualSegments* found =
             virtual_ranges.Query(*gpu_memory, binding.gpu_addr, binding.size);
         if (!found || found->size() < 2) {
+            if (single != nullptr) {
+                Cfg::Count(known_single ? Cfg::Counter::RangeQueriesSkipped
+                                        : Cfg::Counter::RangeQueries);
+                *single = SingleRangeMemo{
+                    .memory = gpu_memory,
+                    .gpu_addr = binding.gpu_addr,
+                    .generation = virtual_ranges.Generation(),
+                    .size = binding.size,
+                    .valid = true,
+                };
+            }
             return;
+        }
+        if (single != nullptr) {
+            if (known_single) {
+                Cfg::Mismatch("storage range known in one piece has segments", binding.gpu_addr,
+                              binding.size);
+            }
+            Cfg::Count(Cfg::Counter::RangeQueries);
+            single->valid = false;
         }
         const VirtualSegments segments = *found;
         const u32 first = static_cast<u32>(pool.size());
@@ -3515,7 +3549,10 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
         const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
         binding.buffer_id = buffer_id;
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-        ResolveMultiRangeStorage(binding, is_written, graphics_segments);
+        SingleRangeMemo* const single = Cfg::g_ssbo && index < NUM_SINGLE_RANGE_MEMOS
+                                            ? &storage_single_ranges[stage][index]
+                                            : nullptr;
+        ResolveMultiRangeStorage(binding, is_written, graphics_segments, single);
     });
 }
 

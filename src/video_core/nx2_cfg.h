@@ -25,9 +25,13 @@ inline bool g_touch{};
 /// EDEN_NX2_CFG_LOOKUP=1: GraphicsPipeline::Next compares a dense digest per transition before it
 /// compares whole keys (vk_graphics_pipeline.h TransitionDigest).
 inline bool g_lookup{};
+/// EDEN_NX2_CFG_SSBO=1: a graphics storage binding whose range the slot's last
+/// VirtualRangeCache::Query found in one piece skips the Query while the range cache has not
+/// changed since and no unmap is pending (BufferCache::ResolveMultiRangeStorage).
+inline bool g_ssbo{};
 /// EDEN_NX2_CFG_VERIFY=1: every skipped Touch checks that the item's tick already is the frame's,
-/// and every digest lookup also runs the base's search; a mismatch is counted, the first 16 are
-/// logged, and the base's answer is used.
+/// every digest lookup also runs the base's search, and every skipped Query runs; a mismatch is
+/// counted, the first 16 are logged, and the base's answer is used.
 inline bool g_verify{};
 /// Any of the switches: the stats line every 10 s.
 inline bool g_any{};
@@ -41,6 +45,8 @@ enum class Counter : std::size_t {
     SearchEntries,        ///< transitions those searches passed over
     SearchCompares,       ///< whole key compares they ran (digest matches)
     SearchHits,           ///< searches that found the key
+    RangeQueries,         ///< storage range queries made (graphics, with the memo)
+    RangeQueriesSkipped,  ///< storage range queries skipped (or, with verify, checked)
     Verified,             ///< verify: skipped touches and searches checked
     Mismatches,           ///< verify: checks that contradicted the skip
     Count,
@@ -148,11 +154,12 @@ template <typename Equal>
 inline void ReadSwitches() {
     g_touch = ReadFlag("EDEN_NX2_CFG_TOUCH");
     g_lookup = ReadFlag("EDEN_NX2_CFG_LOOKUP");
+    g_ssbo = ReadFlag("EDEN_NX2_CFG_SSBO");
     g_verify = ReadFlag("EDEN_NX2_CFG_VERIFY");
-    g_any = g_touch || g_lookup || g_verify;
+    g_any = g_touch || g_lookup || g_ssbo || g_verify;
     if (g_any) {
-        LOG_INFO(HW_GPU, "Track C draw preparation switches: touch={} lookup={} verify={}", g_touch,
-                 g_lookup, g_verify);
+        LOG_INFO(HW_GPU, "Track C draw preparation switches: touch={} lookup={} ssbo={} verify={}",
+                 g_touch, g_lookup, g_ssbo, g_verify);
     }
 }
 
@@ -181,16 +188,19 @@ inline void Report() {
     const u64 entries = Take(Counter::SearchEntries);
     const u64 compares = Take(Counter::SearchCompares);
     const u64 hits = Take(Counter::SearchHits);
+    const u64 range_queries = Take(Counter::RangeQueries);
+    const u64 range_skipped = Take(Counter::RangeQueriesSkipped);
     const u64 verified = Take(Counter::Verified);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
              "Track C {:.1f} s: buffer LRU touches {} skipped, {} made; image LRU touches {} "
              "skipped, {} made; pipeline transition searches {} over {} entries, {} whole key "
-             "compares, {} found; verify checked {}, mismatches {} ({} since start) | touch={} "
-             "lookup={} verify={}",
+             "compares, {} found; storage range queries {} skipped, {} made; verify checked {}, "
+             "mismatches {} ({} since start) | touch={} lookup={} ssbo={} verify={}",
              seconds, buffer_skipped, buffer_touched, image_skipped, image_touched, searches,
-             entries, compares, hits, verified, mismatches,
-             g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup, g_verify);
+             entries, compares, hits, range_skipped, range_queries, verified, mismatches,
+             g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup, g_ssbo,
+             g_verify);
 }
 
 } // namespace VideoCommon::Cfg

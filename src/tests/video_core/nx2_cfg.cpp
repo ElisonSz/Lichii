@@ -6,14 +6,18 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <random>
 #include <utility>
 #include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_types.h"
 #include "common/lru_cache.h"
+#include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/nx2_cfg.h"
 
 namespace {
@@ -267,4 +271,134 @@ TEST_CASE("Cfg: the digest search finds what a linear search finds", "[video_cor
     REQUIRE(missing > 1000U);
     // The digests spare most whole key compares.
     REQUIRE(compares_total * 2 < scanned_total);
+}
+
+namespace {
+
+/// GPU pages mapped to device pages (or not), as VirtualRangeCache::Query reads them.
+struct MockMemory {
+    static constexpr u64 Base = 0x10000000;
+    static constexpr u64 PageBits = 12;
+    static constexpr u64 PageSize = u64{1} << PageBits;
+    std::vector<std::optional<u64>> pages;
+
+    [[nodiscard]] size_t GetID() const noexcept {
+        return 1;
+    }
+
+    [[nodiscard]] std::optional<u64> DevicePage(u64 gpu_addr) const {
+        if (gpu_addr < Base || ((gpu_addr - Base) >> PageBits) >= pages.size()) {
+            return std::nullopt;
+        }
+        return pages[(gpu_addr - Base) >> PageBits];
+    }
+
+    [[nodiscard]] std::optional<u64> GpuToCpuAddress(u64 gpu_addr) const {
+        const std::optional<u64> page = DevicePage(gpu_addr);
+        if (!page) {
+            return std::nullopt;
+        }
+        return (*page << PageBits) | (gpu_addr & (PageSize - 1));
+    }
+
+    /// The mapped parts of the range, split where the device pages stop following each other.
+    [[nodiscard]] boost::container::small_vector<std::pair<u64, std::size_t>, 32> GetSubmappedRange(
+        u64 gpu_addr, std::size_t size) const {
+        boost::container::small_vector<std::pair<u64, std::size_t>, 32> result;
+        u64 address = gpu_addr;
+        const u64 end = gpu_addr + size;
+        std::optional<u64> previous;
+        while (address < end) {
+            const u64 next = (std::min)(end, (address & ~(PageSize - 1)) + PageSize);
+            const std::optional<u64> page = DevicePage(address);
+            if (page) {
+                if (previous && *previous + 1 == *page && !result.empty() &&
+                    result.back().first + result.back().second == address) {
+                    result.back().second += next - address;
+                } else {
+                    result.emplace_back(address, next - address);
+                }
+            }
+            previous = page;
+            address = next;
+        }
+        return result;
+    }
+};
+
+struct RangeMemo {
+    u64 gpu_addr{};
+    u32 size{};
+    u64 generation{};
+    bool valid{};
+};
+
+} // Anonymous namespace
+
+TEST_CASE("Cfg: a range query known in one piece repeats without changing the cache",
+          "[video_core][nx2_cfg]") {
+    std::mt19937_64 rng{23};
+    u64 known_total = 0;
+    u64 queries_total = 0;
+    for (int run = 0; run < 200; ++run) {
+        MockMemory memory;
+        memory.pages.resize(64);
+        for (size_t page = 0; page < memory.pages.size(); ++page) {
+            if (rng() % 8 != 0) {
+                memory.pages[page] = rng() % 4 == 0 ? rng() % 1024 + 1 : page + 100;
+            }
+        }
+        VideoCommon::VirtualRangeCache cache;
+        std::array<RangeMemo, 6> memos{};
+        for (int step = 0; step < 3000; ++step) {
+            const u64 kind = rng() % 64;
+            if (kind == 0) {
+                // A page mapped or remapped without a notification, as Map does.
+                memory.pages[rng() % memory.pages.size()] = rng() % 2 == 0 ? rng() % 1024 + 1 : 7;
+                continue;
+            }
+            if (kind == 1) {
+                // An unmap: the buffer cache tells the range cache (deferred to the next Query).
+                const u64 page = rng() % memory.pages.size();
+                const u64 count = rng() % 4 + 1;
+                for (u64 index = page; index < (std::min)(page + count, u64{memory.pages.size()});
+                     ++index) {
+                    memory.pages[index].reset();
+                }
+                cache.Unmap(memory.GetID(), MockMemory::Base + page * MockMemory::PageSize,
+                            count * MockMemory::PageSize);
+                continue;
+            }
+            const size_t slot = static_cast<size_t>(rng() % memos.size());
+            RangeMemo& memo = memos[slot];
+            // Draws mostly bind a slot to the range it had; sometimes to another one.
+            const bool again = memo.valid && rng() % 4 != 0;
+            const u64 gpu_addr = again ? memo.gpu_addr
+                                       : MockMemory::Base + (rng() % 8) * 3 * MockMemory::PageSize +
+                                             (rng() % 2) * 0x40;
+            const u32 size = again ? memo.size : static_cast<u32>((rng() % 5 + 1) * 0x900);
+            const bool known = memo.valid && memo.gpu_addr == gpu_addr && memo.size == size &&
+                               memo.generation == cache.Generation() && !cache.HasDeferred();
+            const u64 generation_before = cache.Generation();
+            const VideoCommon::VirtualSegments* const found = cache.Query(memory, gpu_addr, size);
+            const bool single = found == nullptr || found->size() < 2;
+            ++queries_total;
+            if (known) {
+                ++known_total;
+                REQUIRE(single);
+                REQUIRE(cache.Generation() == generation_before);
+            }
+            if (single) {
+                memo = RangeMemo{.gpu_addr = gpu_addr,
+                                 .size = size,
+                                 .generation = cache.Generation(),
+                                 .valid = true};
+            } else {
+                memo.valid = false;
+            }
+        }
+    }
+    // Both outcomes occur often.
+    REQUIRE(known_total > 50000U);
+    REQUIRE(known_total * 4 < queries_total * 3);
 }

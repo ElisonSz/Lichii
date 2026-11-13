@@ -253,8 +253,20 @@ public:
                                std::span<const MultiRangeSegment> pool,
                                u64 write_mark_limit = ~u64{0});
 
+    /// EDEN_NX2_CFG_SSBO: a range VirtualRangeCache::Query found in fewer than two segments, in
+    /// which address space and at which VirtualRangeCache::Generation (after the Query).
+    struct SingleRangeMemo {
+        const void* memory{};
+        GPUVAddr gpu_addr{};
+        u64 generation{};
+        u32 size{};
+        bool valid{};
+    };
+
+    /// `single`: EDEN_NX2_CFG_SSBO's memo of the binding's slot, or null.
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
-                                  std::vector<MultiRangeSegment>& pool);
+                                  std::vector<MultiRangeSegment>& pool,
+                                  SingleRangeMemo* single = nullptr);
 
     void RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& pool);
 
@@ -1217,6 +1229,11 @@ private:
     VirtualRangeCache virtual_ranges;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
+    /// EDEN_NX2_CFG_SSBO: per graphics stage and storage slot (the first 16), the range the slot's
+    /// last Query found in one piece.
+    static constexpr u32 NUM_SINGLE_RANGE_MEMOS = 16;
+    std::array<std::array<SingleRangeMemo, NUM_SINGLE_RANGE_MEMOS>, NUM_STAGES>
+        storage_single_ranges{};
     u64 frame_tick = 0;
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;

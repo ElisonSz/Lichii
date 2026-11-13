@@ -39,6 +39,7 @@ public:
         }
         if (entries.size() > MAX_ENTRIES) {
             entries.clear();
+            ++generation;
         }
         const size_t as_id = memory.GetID();
         const u64 key = MakeKey(as_id, gpu_addr);
@@ -84,7 +85,19 @@ public:
             entry.segments.clear();
         }
         const auto result = entries.insert_or_assign(key, std::move(entry));
+        ++generation;
         return &result.first->second.segments;
+    }
+
+    /// Changes whenever an entry is added, replaced or dropped. While it stays the same and no
+    /// unmap is pending (HasDeferred), Query answers the same arguments as it did last time, from
+    /// the same entry and without changing anything (EDEN_NX2_CFG_SSBO).
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
+
+    [[nodiscard]] bool HasDeferred() const noexcept {
+        return has_deferred.load(std::memory_order_acquire);
     }
 
     void Unmap(size_t as_id, GPUVAddr gpu_addr, u64 size) {
@@ -145,6 +158,7 @@ private:
         }
         if (overflow) {
             entries.clear();
+            ++generation;
             return;
         }
         if (pending.empty() || entries.empty()) {
@@ -165,6 +179,7 @@ private:
             }
             if (overlaps) {
                 it = entries.erase(it);
+                ++generation;
             } else {
                 ++it;
             }
@@ -176,6 +191,8 @@ private:
     std::mutex deferred_mutex;
     std::atomic<bool> has_deferred{false};
     bool deferred_overflow{};
+    /// Changes of `entries` (Query's thread only).
+    u64 generation{};
 };
 
 } // namespace VideoCommon
