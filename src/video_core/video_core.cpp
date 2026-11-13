@@ -20,6 +20,7 @@
 #include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_backx.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_drain_check.h"
@@ -117,6 +118,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::Nx2Protect::ReadSwitch();
     VideoCommon::BackX::ReadSwitches();
     VideoCommon::Nx2Macro::ReadSwitches();
+    VideoCommon::Cfg::ReadSwitches();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;

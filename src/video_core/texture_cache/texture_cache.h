@@ -5118,6 +5118,14 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
         MarkModification(image);
     }
+    // EDEN_NX2_CFG_TOUCH: every draw prepares its render targets and sampled images again; after
+    // the first Touch of a frame the others change nothing, but each walks a std::deque.
+    if (Cfg::g_touch &&
+        Cfg::SkipTouch(image.lru_touch, image.lru_index, frame_tick,
+                       Cfg::Counter::ImageTouchesSkipped, Cfg::Counter::ImageTouches,
+                       [&] { return lru_cache.GetTick(image.lru_index); })) {
+        return;
+    }
     lru_cache.Touch(image.lru_index, frame_tick);
 }
 

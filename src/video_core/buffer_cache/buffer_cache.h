@@ -4132,7 +4132,16 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
-        lru_cache.Touch(buffer.getLRUID(), frame_tick);
+        const size_t lru_id = buffer.getLRUID();
+        // EDEN_NX2_CFG_TOUCH: draws bind the same buffers all frame long; after the first Touch
+        // of a frame the others change nothing, but each walks the LRU cache's std::deque.
+        if (Cfg::g_touch &&
+            Cfg::SkipTouch(buffer.lru_touch, lru_id, frame_tick, Cfg::Counter::BufferTouchesSkipped,
+                           Cfg::Counter::BufferTouches,
+                           [&] { return lru_cache.GetTick(lru_id); })) {
+            return;
+        }
+        lru_cache.Touch(lru_id, frame_tick);
     }
 }
 

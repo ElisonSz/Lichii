@@ -24,6 +24,7 @@ add_executable(tests
     video_core/nx2_fast_wake.cpp
     video_core/nx2_sync_suspend.cpp
     video_core/nx2_backx.cpp
+    video_core/nx2_cfg.cpp
     video_core/nx2_runahead.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp

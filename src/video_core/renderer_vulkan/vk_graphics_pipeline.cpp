@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -44,6 +45,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -411,7 +413,8 @@ GraphicsPipeline::CpuMemory GraphicsPipeline::RetainedCpuMemory() const {
     return {
         .count = 1,
         .object = sizeof(*this),
-        .transitions = transitions.capacity() * sizeof(Transition),
+        .transitions = transitions.capacity() * sizeof(Transition) +
+                       transition_digests.capacity() * sizeof(u64),
         .descriptors =
             sampled_images.capacity() * sizeof(SampledImage) +
             texture_memo.entries.capacity() * sizeof(VideoCommon::SampledTextureMemo::Entry) +
@@ -759,6 +762,47 @@ GraphicsPipeline::GraphicsPipeline(
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
     transitions.push_back({transition->key, transition});
+    if (VideoCommon::Cfg::g_lookup) {
+        transition_digests.push_back(TransitionDigest(transition->key));
+    }
+}
+
+GraphicsPipeline* GraphicsPipeline::NextByDigest(
+    const GraphicsPipelineCacheKey& current_key) noexcept {
+    namespace Cfg = VideoCommon::Cfg;
+    const auto base_search = [&]() -> GraphicsPipeline* {
+        const auto it = std::ranges::find(transitions, current_key, &Transition::key);
+        return it != transitions.end() ? it->pipeline : nullptr;
+    };
+    const size_t count = transitions.size();
+    if (transition_digests.size() != count) [[unlikely]] {
+        // Not kept in step (transitions added before the switch was read): search as the base.
+        return base_search();
+    }
+    // A differing digest proves a differing key, so the first index whose digest and key both
+    // match is the first whose key matches: the transition std::ranges::find returns.
+    u64 compares = 0;
+    const size_t index = Cfg::FindByDigest(
+        std::span<const u64>(transition_digests), TransitionDigest(current_key),
+        [&](size_t candidate) { return transitions[candidate].key == current_key; }, compares);
+    GraphicsPipeline* const found = index < count ? transitions[index].pipeline : nullptr;
+    Cfg::Count(Cfg::Counter::Searches);
+    Cfg::Count(Cfg::Counter::SearchEntries, found != nullptr ? index + 1 : count);
+    Cfg::Count(Cfg::Counter::SearchCompares, compares);
+    if (found != nullptr) {
+        Cfg::Count(Cfg::Counter::SearchHits);
+    }
+    if (Cfg::g_verify) [[unlikely]] {
+        Cfg::Count(Cfg::Counter::Verified);
+        GraphicsPipeline* const expected = base_search();
+        if (expected != found) {
+            Cfg::Mismatch("pipeline transition search found another pipeline than the base",
+                          static_cast<u64>(reinterpret_cast<std::uintptr_t>(found)),
+                          static_cast<u64>(reinterpret_cast<std::uintptr_t>(expected)));
+            return expected;
+        }
+    }
+    return found;
 }
 
 template <typename Spec>

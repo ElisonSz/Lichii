@@ -15,6 +15,7 @@
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "video_core/buffer_cache/word_manager.h"
+#include "video_core/nx2_cfg.h"
 
 namespace VideoCommon {
 
@@ -128,6 +129,9 @@ public:
     void setWriteTick(u64 write_tick_) {
         write_tick = write_tick_;
     }
+
+    /// EDEN_NX2_CFG_TOUCH: the LRU item and frame tick of the last TouchBuffer that touched it.
+    Cfg::TouchMemo lru_touch;
 
 private:
     VAddr cpu_addr = 0;

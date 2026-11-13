@@ -10,6 +10,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <span>
@@ -22,6 +24,7 @@
 #include "video_core/draw_delta.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/evicted_pointer_slots.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/graphics_stage_info.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
@@ -60,6 +63,17 @@ struct GraphicsPipelineCacheKey {
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_copyable_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_constructible_v<GraphicsPipelineCacheKey>);
+
+/// EDEN_NX2_CFG_LOOKUP: a digest of what GraphicsPipelineCacheKey::operator== compares first: the
+/// six shader hashes and the first 16 bytes of the fixed state (raw1, raw2 and the color formats,
+/// inside every FixedPipelineState::Size()). Keys that compare equal have equal digests, so a
+/// differing digest proves that two keys differ.
+[[nodiscard]] inline u64 TransitionDigest(const GraphicsPipelineCacheKey& key) noexcept {
+    // The smallest Size() ends at the blending attachments; operator== compares unique_hashes and
+    // then Size() bytes of the state.
+    static_assert(offsetof(FixedPipelineState, attachments) >= 2 * sizeof(u64));
+    return VideoCommon::Cfg::KeyDigest(key);
+}
 
 } // namespace Vulkan
 
@@ -260,6 +274,9 @@ public:
         if (key == current_key) {
             return this;
         }
+        if (VideoCommon::Cfg::g_lookup) {
+            return NextByDigest(current_key);
+        }
         const auto it = std::ranges::find(transitions, current_key, &Transition::key);
         return it != transitions.end() ? it->pipeline : nullptr;
     }
@@ -292,6 +309,7 @@ public:
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
         transitions.clear();
+        transition_digests.clear();
     }
 
     [[nodiscard]] bool WritesStorage() const noexcept {
@@ -448,6 +466,13 @@ private:
         GraphicsPipeline* pipeline;
     };
     std::vector<Transition> transitions;
+    /// EDEN_NX2_CFG_LOOKUP: TransitionDigest of each transition's key, in the same order. A search
+    /// reads these 8-byte words instead of one ~600-byte Transition per entry.
+    std::vector<u64> transition_digests;
+
+    /// EDEN_NX2_CFG_LOOKUP: Next past the own key; the first transition whose key equals.
+    [[nodiscard]] GraphicsPipeline* NextByDigest(
+        const GraphicsPipelineCacheKey& current_key) noexcept;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};

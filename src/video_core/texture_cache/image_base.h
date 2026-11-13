@@ -14,6 +14,7 @@
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_info.h"
 #include "video_core/texture_cache/stale_targets.h"
@@ -138,6 +139,8 @@ struct ImageBase {
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
     size_t lru_index = SIZE_MAX;
+    /// EDEN_NX2_CFG_TOUCH: the LRU item and frame tick of the last PrepareImage that touched it.
+    Cfg::TouchMemo lru_touch;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
