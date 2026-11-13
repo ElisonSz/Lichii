@@ -3303,9 +3303,11 @@ private:
         if (FastDraw::g_drawx_registers) [[unlikely]] {
             switch (FastDraw::DrawXRegisterClass(method)) {
             case FastDraw::DrawXRegister::Neutral:
+            case FastDraw::DrawXRegister::DynamicState:
                 FastDraw::g_delta.drawx_skipped = true;
                 return true;
             case FastDraw::DrawXRegister::PipelineState:
+            case FastDraw::DrawXRegister::DynamicPipeline:
                 FastDraw::g_delta.pipeline_state = true;
                 FastDraw::g_delta.drawx_skipped = true;
                 return true;

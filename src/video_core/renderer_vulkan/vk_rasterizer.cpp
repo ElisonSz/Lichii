@@ -497,6 +497,9 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
     taken_delta = delta;
+    if (FastDraw::g_drawx_coalesce_verify) [[unlikely]] {
+        FastDraw::CheckCoalesced(delta);
+    }
     matched_candidate = false;
     twin_source = nullptr;
     if (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) {
@@ -580,15 +583,17 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         // EDEN_NX2_DRAWX_TWIN: another pipeline object that keeps the same image state (only the
         // vertex input specialization, fixed-function state or an imageless stage's program
         // differs) goes on with the delta.
+        bool by_descriptors = false;
         if (!same && FastDraw::g_drawx_twin && !serial_changed && current != nullptr &&
             current->IsBuilt() &&
             current->HasDynamicVertexInput() == draw.pipeline->HasDynamicVertexInput() &&
-            current->KeepsImageStateOf(*draw.pipeline)) {
+            current->KeepsImageStateOf(*draw.pipeline, &by_descriptors)) {
             current->TakeDeltaState(*draw.pipeline);
             twin_source = draw.pipeline;
             draw.pipeline = current;
             same = true;
             ++drawx_stats.twins;
+            drawx_stats.twins_by_descriptors += by_descriptors ? 1 : 0;
         }
         if (!same) {
             taken_break_classes |= FastDraw::ClassBit(
@@ -868,7 +873,8 @@ void RasterizerVulkan::ReportFastDraws() {
     if (VideoCommon::Nx2FastDraw::g_drawx_neutral || VideoCommon::Nx2FastDraw::g_drawx_pipestate ||
         VideoCommon::Nx2FastDraw::g_drawx_uniforms || VideoCommon::Nx2FastDraw::g_drawx_twin ||
         VideoCommon::Nx2FastDraw::g_drawx_verify || VideoCommon::Nx2FastDraw::g_drawx_keep_audit ||
-        VideoCommon::Nx2FastDraw::g_drawx_no_keeps) {
+        VideoCommon::Nx2FastDraw::g_drawx_no_keeps || VideoCommon::Nx2FastDraw::g_drawx_coalesce ||
+        VideoCommon::Nx2FastDraw::g_drawx_dynstate || VideoCommon::Nx2FastDraw::g_drawx_calls) {
         // Track D, every window the switches are on (cost stats or not).
         const double window = static_cast<double>(now - stats.window_start) / 1e9;
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
@@ -900,6 +906,22 @@ void RasterizerVulkan::ReportFastDraws() {
                  VideoCommon::Nx2FastDraw::g_drawx_verify,
                  VideoCommon::Nx2FastDraw::g_drawx_keep_audit,
                  VideoCommon::Nx2FastDraw::g_drawx_no_keeps);
+        // Round 3: what the lists, twins and calls switches changed.
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        LOG_INFO(Render_Vulkan,
+                 "DrawX round 3: {:.1f} s | coalesced writes/s={:.0f} lists still overflowing/s="
+                 "{:.0f} | coalesce verify checked={} mismatches={} | twins by descriptors/s="
+                 "{:.0f} | neutral list ends/s={:.0f} release targets/s={:.0f} | coalesce={} "
+                 "dynstate={} twin2={} calls={}",
+                 window, rate(FastDraw::g_coalesced_writes), rate(FastDraw::g_coalesce_overflows),
+                 FastDraw::g_coalesce_verify.checked, FastDraw::g_coalesce_verify.mismatches,
+                 rate(drawx.twins_by_descriptors), rate(FastDraw::g_neutral_list_ends),
+                 rate(FastDraw::g_neutral_releases), FastDraw::g_drawx_coalesce,
+                 FastDraw::g_drawx_dynstate, FastDraw::g_drawx_twin2, FastDraw::g_drawx_calls);
+        FastDraw::g_coalesced_writes = 0;
+        FastDraw::g_coalesce_overflows = 0;
+        FastDraw::g_neutral_list_ends = 0;
+        FastDraw::g_neutral_releases = 0;
         drawx_stats = {};
         drawx_keep_chain.ended_early = 0;
     }
@@ -1322,6 +1344,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_on = on;
         reusable_draw = {};
         FastDraw::g_delta = {};
+        FastDraw::g_coalesce_verify.Clear();
         fast_draw_stats = {};
         drawx_stats = {};
         drawx_keep_chain.Reset();
@@ -3139,6 +3162,18 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
     default:
         LOG_DEBUG(Render_Vulkan, "Unimplemented counter reset={}", type);
         return;
+    }
+}
+
+void RasterizerVulkan::NoteFastDrawWrite(GPUVAddr gpu_addr, u64 size) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    // EDEN_NX2_DRAWX_CALLS: as the 3D report method's target under EDEN_NX2_DRAW_REUSE: constant
+    // buffer data written (handle inputs, uniform keeps), ending the chain if it reaches the
+    // texture or sampler headers.
+    if (FastDraw::g_drawx_calls && FastDraw::Enabled() && maxwell3d != nullptr && gpu_addr != 0 &&
+        size != 0) {
+        maxwell3d->NoteFastDrawConstantData(gpu_addr, gpu_addr + size);
+        FastDraw::NoteNeutralCall(FastDraw::g_neutral_releases);
     }
 }
 

@@ -32,6 +32,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_profile.h"
@@ -98,12 +99,17 @@ void DmaPusher::DispatchCalls() {
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         // Submits, and releases the fences done (downloads where the GPU wrote).
+        // EDEN_NX2_DRAWX_CALLS: neutral for fast draws. A submit changes the command buffer, which
+        // ends delta draws and uniform keeps by itself; released fences end the chain where they
+        // are released (FenceManager); nothing else here changes what a draw resolves to.
         split.Defer(
             [gpu = &system.GPU()] {
+                VideoCommon::Nx2FastDraw::NoteNeutralCall(
+                    VideoCommon::Nx2FastDraw::g_neutral_list_ends);
                 gpu->FlushCommands();
                 gpu->OnCommandListEnd();
             },
-            0, VideoCommon::GpuSplit::Writes::Caches);
+            VideoCommon::Nx2FastDraw::CallFlags(), VideoCommon::GpuSplit::Writes::Caches);
         split.Publish();
         return;
     }

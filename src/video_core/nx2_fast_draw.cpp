@@ -40,24 +40,67 @@ void ReadDrawXSwitches() {
     g_drawx_verify = on("EDEN_NX2_DRAWX_VERIFY");
     g_drawx_keep_audit = g_drawx_verify || on("EDEN_NX2_DRAWX_KEEP_AUDIT");
     g_drawx_no_keeps = on("EDEN_NX2_DRAWX_NO_KEEPS");
-    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin;
+    g_drawx_coalesce = on("EDEN_NX2_DRAWX_COALESCE");
+    g_drawx_coalesce_verify = g_drawx_coalesce && on("EDEN_NX2_DRAWX_COALESCE_VERIFY");
+    g_drawx_dynstate = on("EDEN_NX2_DRAWX_DYNSTATE");
+    g_drawx_twin2 = on("EDEN_NX2_DRAWX_TWIN2");
+    g_drawx_twin = g_drawx_twin || g_drawx_twin2;
+    // The calls' neutrality leans on REUSE's checks of the writes the caches heard of (texture
+    // headers, handle inputs), which the plain delta path does not make.
+    g_drawx_calls = on("EDEN_NX2_DRAWX_CALLS") && g_draw_reuse;
+    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate;
     for (u32 method = 0; method < g_drawx_register_class.size(); ++method) {
         DrawXRegister kind = ClassifyDrawXRegister(method);
         if ((kind == DrawXRegister::Neutral && !g_drawx_neutral) ||
             (kind == DrawXRegister::PipelineState && !g_drawx_pipestate) ||
-            (kind == DrawXRegister::Shader && !g_drawx_twin)) {
+            (kind == DrawXRegister::Shader && !g_drawx_twin) ||
+            ((kind == DrawXRegister::DynamicState || kind == DrawXRegister::DynamicPipeline) &&
+             !g_drawx_dynstate)) {
             kind = DrawXRegister::Breaks;
         }
         g_drawx_register_class[method] = kind;
     }
     if (g_drawx_registers || g_drawx_uniforms || g_drawx_twin || g_drawx_verify ||
-        g_drawx_keep_audit || g_drawx_no_keeps) {
+        g_drawx_keep_audit || g_drawx_no_keeps || g_drawx_coalesce || g_drawx_calls) {
         LOG_INFO(HW_GPU,
                  "Track D draw switches: neutral={} pipestate={} uniforms={} twin={} verify={} "
-                 "keep_audit={} no_keeps={}",
-                 g_drawx_neutral, g_drawx_pipestate, g_drawx_uniforms, g_drawx_twin,
-                 g_drawx_verify, g_drawx_keep_audit, g_drawx_no_keeps);
+                 "keep_audit={} no_keeps={} coalesce={} coalesce_verify={} dynstate={} twin2={} "
+                 "calls={}",
+                 g_drawx_neutral, g_drawx_pipestate, g_drawx_uniforms, g_drawx_twin, g_drawx_verify,
+                 g_drawx_keep_audit, g_drawx_no_keeps, g_drawx_coalesce, g_drawx_coalesce_verify,
+                 g_drawx_dynstate, g_drawx_twin2, g_drawx_calls);
     }
+    if (on("EDEN_NX2_DRAWX_CALLS") && !g_draw_reuse) {
+        LOG_WARNING(HW_GPU, "EDEN_NX2_DRAWX_CALLS needs EDEN_NX2_DRAW_REUSE=1: left off");
+    }
+}
+
+void CheckCoalesced(const Delta& taken) {
+    CoalesceVerify& verify = g_coalesce_verify;
+    if (!taken.overflowed) {
+        const auto check = [&](const std::vector<std::pair<u64, u64>>& ranges,
+                               const std::array<u64, Delta::MaxWrites>& begins,
+                               const std::array<u64, Delta::MaxWrites>& ends, u32 count,
+                               const char* kind) {
+            for (const auto& [begin, end] : ranges) {
+                ++verify.checked;
+                bool covered = false;
+                for (u32 index = 0; index < count && !covered; ++index) {
+                    covered = begins[index] <= begin && end <= ends[index];
+                }
+                if (!covered && verify.mismatches++ < 16) {
+                    LOG_ERROR(HW_GPU,
+                              "DrawX coalesce verify: {} write [{:#x}, {:#x}) is in no list range "
+                              "({} ranges)",
+                              kind, begin, end, count);
+                }
+            }
+        };
+        check(verify.gpu, taken.write_begin, taken.write_end, taken.num_writes, "GPU");
+        check(verify.device, taken.device_begin, taken.device_end, taken.num_device_writes,
+              "device");
+    }
+    verify.Clear();
 }
 
 DrawXRegister ClassifyDrawXRegister(u32 method) {
@@ -77,6 +120,23 @@ DrawXRegister ClassifyDrawXRegister(u32 method) {
     if (method >= constant_color &&
         method < constant_color + sizeof(Regs::ConstantColorRendering) / sizeof(u32)) {
         return DrawXRegister::Neutral;
+    }
+    // EDEN_NX2_DRAWX_DYNSTATE: the depth bias values are read only by UpdateDepthBias (dynamic
+    // state by its DepthBias dirty flag, on both paths); sub_tiling_perf and opportunistic_early_z
+    // are read by nothing.
+    const auto within = [method](u32 first, size_t bytes) {
+        return method >= first && method < first + bytes / sizeof(u32);
+    };
+    if (method == MAXWELL3D_REG_INDEX(depth_bias) ||
+        method == MAXWELL3D_REG_INDEX(slope_scale_depth_bias) ||
+        method == MAXWELL3D_REG_INDEX(depth_bias_clamp) ||
+        within(MAXWELL3D_REG_INDEX(sub_tiling_perf), sizeof(Regs::SubTilingPerf)) ||
+        within(MAXWELL3D_REG_INDEX(opportunistic_early_z), sizeof(Regs::OpportunisticEarlyZ))) {
+        return DrawXRegister::DynamicState;
+    }
+    // mandated_early_z is in the pipeline key (FixedPipelineState::early_z) and read nowhere else.
+    if (method == MAXWELL3D_REG_INDEX(mandated_early_z)) {
+        return DrawXRegister::DynamicPipeline;
     }
     // Fixed-function state feeds the pipeline key and dynamic state only: no part of a resolve
     // the delta path keeps reads it, and UpdateDynamicStates runs on both paths.

@@ -43,6 +43,10 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 
+// EDEN_NX2_DRAWX_CALLS: Nx2FastDraw::CallFlags hands this flag to GpuSplit::Defer.
+static_assert(VideoCommon::Nx2FastDraw::SplitFastDrawNeutral ==
+              VideoCommon::GpuSplit::FastDrawNeutral);
+
 namespace Tegra::Engines {
 
 /// First register id that is actually a Macro call.
@@ -416,7 +420,14 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
                                method == MAXWELL3D_REG_INDEX(report_semaphore.query));
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
         !(VideoCommon::Nx2FastDraw::Enabled() && query_method && NoteFastDrawState(method))) {
-        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+        if (VideoCommon::Nx2FastDraw::g_drawx_dynstate &&
+            method == MAXWELL3D_REG_INDEX(shadow_ram_control)) [[unlikely]] {
+            // EDEN_NX2_DRAWX_DYNSTATE: it only selects how later register writes are taken
+            // (ProcessShadowRam), and those break as any other write.
+            VideoCommon::Nx2FastDraw::g_delta.drawx_skipped = true;
+        } else {
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+        }
     } else if (VideoCommon::Nx2FastDraw::g_draw_reuse && query_method &&
                method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
         // EDEN_NX2_DRAW_REUSE: the report writes its value (and timestamp) at the report address

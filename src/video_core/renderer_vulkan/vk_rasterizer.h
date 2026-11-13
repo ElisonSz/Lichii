@@ -104,6 +104,7 @@ public:
     void ResetCounter(VideoCommon::QueryType type) override;
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
+    void NoteFastDrawWrite(GPUVAddr gpu_addr, u64 size) override;
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
     void FlushAll() override;
@@ -546,6 +547,7 @@ private:
         u64 uniform_full_streamed{};
         u64 twins{};      ///< Delta candidates that went on with a twin pipeline
         u64 twin_delta{}; ///< ... and were drawn as delta draws
+        u64 twins_by_descriptors{}; ///< Twins only EDEN_NX2_DRAWX_TWIN2 allows
         u64 verified{}; ///< Candidates a skipped break or a twin kept, prepared in full, compared
         u64 pipeline_mismatches{};
         u64 view_mismatches{};

@@ -24,6 +24,7 @@
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
 #include "video_core/oot_whiteout_trace.h"
+#include "video_core/renderer_vulkan/drawx_twin.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -1374,7 +1375,8 @@ bool GraphicsPipeline::DeltaImagesChange() const noexcept {
     return texture_cache.SampledViewsChange(delta_views);
 }
 
-bool GraphicsPipeline::KeepsImageStateOf(const GraphicsPipeline& other) const noexcept {
+bool GraphicsPipeline::KeepsImageStateOf(const GraphicsPipeline& other,
+                                         bool* by_descriptors) const noexcept {
     if (configure_func != other.configure_func || delta_blocker != DeltaBlocker::None ||
         other.delta_blocker != DeltaBlocker::None) {
         return false;
@@ -1383,11 +1385,20 @@ bool GraphicsPipeline::KeepsImageStateOf(const GraphicsPipeline& other) const no
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
                info.texture_descriptors.empty() && info.image_descriptors.empty();
     };
+    bool descriptors_only = false;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        if (stage_infos[stage] != other.stage_infos[stage] &&
-            !(imageless(*stage_infos[stage]) && imageless(*other.stage_infos[stage]))) {
+        if (stage_infos[stage] == other.stage_infos[stage] ||
+            (imageless(*stage_infos[stage]) && imageless(*other.stage_infos[stage]))) {
+            continue;
+        }
+        if (!VideoCommon::Nx2FastDraw::g_drawx_twin2 ||
+            !ResolvesSameImageState(*stage_infos[stage], *other.stage_infos[stage])) {
             return false;
         }
+        descriptors_only = true;
+    }
+    if (by_descriptors != nullptr) {
+        *by_descriptors = descriptors_only;
     }
     return true;
 }

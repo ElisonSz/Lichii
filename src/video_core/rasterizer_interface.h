@@ -80,6 +80,11 @@ public:
     virtual void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) = 0;
 
+    /// EDEN_NX2_DRAWX_CALLS: a deferred call that the fast draw delta chain survives writes
+    /// [gpu_addr, gpu_addr + size) of the current channel's memory (a semaphore release): the
+    /// delta records it as constant buffer data written (Nx2FastDraw::CallFlags).
+    virtual void NoteFastDrawWrite([[maybe_unused]] GPUVAddr gpu_addr, [[maybe_unused]] u64 size) {}
+
     /// Signal an uniform buffer binding
     virtual void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                            u32 size) = 0;

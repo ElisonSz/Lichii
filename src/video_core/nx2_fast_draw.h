@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -121,8 +122,26 @@ inline bool g_drawx_keep_audit{};
 /// EDEN_NX2_DRAWX_NO_KEEPS=1: no uniform keeps at all, also none on delta draws (where they are on
 /// by default): every small uniform buffer is compared with the bytes its slot streamed last.
 inline bool g_drawx_no_keeps{};
-/// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin: the one flag the register write path
-/// tests.
+/// EDEN_NX2_DRAWX_COALESCE=1: a full constant data write list (Delta::MaxWrites GPU and device
+/// ranges) takes a further range by widening the entry it grows least (CoalesceRange) instead of
+/// ending the chain (Reason::DeltaOverflow). Every reader of the lists treats a range as maybe
+/// written, so a covering range only makes them more careful. EDEN_NX2_DRAWX_COALESCE_VERIFY=1
+/// also keeps every range exactly and checks the lists cover them when a draw takes them.
+inline bool g_drawx_coalesce{};
+inline bool g_drawx_coalesce_verify{};
+/// EDEN_NX2_DRAWX_DYNSTATE=1: depth bias values (read only by UpdateDepthBias, dynamic state on
+/// both paths) and sub_tiling_perf (read by nothing) no longer end the chain, nor does
+/// SET_SHADOW_RAM_CONTROL (it only selects how later register writes are taken); the early-Z
+/// registers (in the pipeline key) mark the delta for a pipeline lookup as fixed-function state.
+inline bool g_drawx_dynstate{};
+/// EDEN_NX2_DRAWX_TWIN2=1 (implies EDEN_NX2_DRAWX_TWIN): a twin may also differ in a stage whose
+/// image descriptors are the same (GraphicsPipeline::KeepsImageStateOf).
+inline bool g_drawx_twin2{};
+/// EDEN_NX2_DRAWX_CALLS=1, only with EDEN_NX2_DRAW_REUSE: deferred calls that change nothing a
+/// delta draw keeps without ending the chain themselves go to the back as neutral (CallFlags).
+inline bool g_drawx_calls{};
+/// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate: the one flag the
+/// register write path tests.
 inline bool g_drawx_registers{};
 /// Reads the switches above; called by VideoCore::CreateGPU after ReadDrawReuseSwitches.
 void ReadDrawXSwitches();
@@ -173,12 +192,25 @@ private:
     bool open{};  ///< A draw took g_delta and has not reached Keeps yet
 };
 
+/// The GpuSplit entry flag of a call that doesn't end fast draw reuse (GpuSplit::FastDrawNeutral,
+/// which nx2_fast_draw.cpp checks this against).
+inline constexpr u64 SplitFastDrawNeutral = u64{1} << 7;
+
+/// EDEN_NX2_DRAWX_CALLS: the GpuSplit::Defer flags of a deferred call that changes nothing a delta
+/// draw keeps, or ends the chain itself when it does (a submit changes the command buffer, fence
+/// releases break, written guest memory is recorded as constant data). Off: 0, as before.
+[[nodiscard]] inline u64 CallFlags() noexcept {
+    return g_drawx_calls ? SplitFastDrawNeutral : 0;
+}
+
 /// What a 3D register write does to the delta chain under the switches above.
 enum class DrawXRegister : u8 {
-    Breaks,        ///< As without the switches
-    Neutral,       ///< Read by no draw preparation: no break (EDEN_NX2_DRAWX_NEUTRAL)
-    PipelineState, ///< Fixed-function state: Delta::pipeline_state (EDEN_NX2_DRAWX_PIPESTATE)
-    Shader,        ///< Shader programs: Delta::pipeline_state (EDEN_NX2_DRAWX_TWIN)
+    Breaks,          ///< As without the switches
+    Neutral,         ///< Read by no draw preparation: no break (EDEN_NX2_DRAWX_NEUTRAL)
+    PipelineState,   ///< Fixed-function state: Delta::pipeline_state (EDEN_NX2_DRAWX_PIPESTATE)
+    Shader,          ///< Shader programs: Delta::pipeline_state (EDEN_NX2_DRAWX_TWIN)
+    DynamicState,    ///< Dynamic state only, or read by nothing: no break (EDEN_NX2_DRAWX_DYNSTATE)
+    DynamicPipeline, ///< In the pipeline key: Delta::pipeline_state (EDEN_NX2_DRAWX_DYNSTATE)
 };
 /// One entry per 3D register (Maxwell3D::Regs::NUM_REGS), filled by ReadDrawXSwitches.
 inline std::array<DrawXRegister, 0xe00> g_drawx_register_class{};
@@ -534,6 +566,85 @@ inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
     return true;
 }
 
+/// EDEN_NX2_DRAWX_COALESCE: the most bytes nobody wrote that one merge may add to a range. A list
+/// whose every entry is further away than this from the new range overflows as before.
+inline constexpr u64 CoalesceGrowthLimit = 0x10000;
+
+/// AppendRange; when the list is full, [begin, end) widens the entry it grows by the fewest
+/// bytes nobody wrote (none for a range inside or touching an entry), and `merged` is set. False
+/// when every merge would add more than CoalesceGrowthLimit such bytes.
+inline bool CoalesceRange(std::array<u64, Delta::MaxWrites>& begins,
+                          std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end,
+                          bool& merged) {
+    if (AppendRange(begins, ends, count, begin, end)) {
+        return true;
+    }
+    u32 best = Delta::MaxWrites;
+    u64 best_growth = CoalesceGrowthLimit + 1;
+    for (u32 index = 0; index < count; ++index) {
+        const u64 low = (std::min)(begins[index], begin);
+        const u64 high = (std::max)(ends[index], end);
+        const u64 written = (ends[index] - begins[index]) + (end - begin);
+        const u64 growth = high - low > written ? high - low - written : 0;
+        if (growth < best_growth) {
+            best_growth = growth;
+            best = index;
+            if (growth == 0) {
+                break;
+            }
+        }
+    }
+    if (best == Delta::MaxWrites) {
+        return false;
+    }
+    begins[best] = (std::min)(begins[best], begin);
+    ends[best] = (std::max)(ends[best], end);
+    merged = true;
+    return true;
+}
+
+/// EDEN_NX2_DRAWX_COALESCE statistics (the back's thread only): ranges merged into a full list,
+/// and ranges a full list still could not take.
+inline u64 g_coalesced_writes{};
+inline u64 g_coalesce_overflows{};
+
+/// EDEN_NX2_DRAWX_COALESCE_VERIFY: every range noted since the delta was taken, exactly
+/// (CheckCoalesced compares them with the lists when a draw takes the delta).
+struct CoalesceVerify {
+    std::vector<std::pair<u64, u64>> gpu;
+    std::vector<std::pair<u64, u64>> device;
+    u64 checked{};    ///< Ranges compared
+    u64 mismatches{}; ///< Ranges no list entry covers
+    void Clear() {
+        gpu.clear();
+        device.clear();
+    }
+};
+inline CoalesceVerify g_coalesce_verify;
+/// Checks that `taken`'s lists cover every range noted for it (unless it overflowed, when its
+/// readers already treat everything as written), counts and logs ranges they miss, and forgets
+/// the ranges.
+void CheckCoalesced(const Delta& taken);
+
+/// Appends to one of the delta's range lists as the switches say. False when the range is lost.
+inline bool NoteRange(Delta& delta, std::array<u64, Delta::MaxWrites>& begins,
+                      std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
+    if (!g_drawx_coalesce) {
+        return AppendRange(begins, ends, count, begin, end);
+    }
+    bool merged = false;
+    if (!CoalesceRange(begins, ends, count, begin, end, merged)) {
+        ++g_coalesce_overflows;
+        return false;
+    }
+    if (merged) {
+        // A write that ended the chain without the switch (verify attribution, statistics).
+        ++g_coalesced_writes;
+        delta.drawx_skipped = true;
+    }
+    return true;
+}
+
 inline void NoteBind(size_t stage, u32 slot) {
     if (Enabled()) {
         g_delta.binds[stage] |= 1U << slot;
@@ -546,7 +657,10 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
         return;
     }
     Delta& delta = g_delta;
-    if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
+    if (g_drawx_coalesce_verify) [[unlikely]] {
+        g_coalesce_verify.gpu.emplace_back(begin, end);
+    }
+    if (!NoteRange(delta, delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
         delta.overflowed = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
@@ -561,12 +675,31 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
         return;
     }
     Delta& delta = g_delta;
-    if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
+    if (g_drawx_coalesce_verify) [[unlikely]] {
+        g_coalesce_verify.device.emplace_back(begin, end);
+    }
+    if (!NoteRange(delta, delta.device_begin, delta.device_end, delta.num_device_writes, begin,
+                   end)) {
         delta.overflowed = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
             g_device_overflows.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+}
+
+/// EDEN_NX2_DRAWX_CALLS statistics (the back's thread only): command list ends and semaphore
+/// release targets that went on without ending the chain.
+inline u64 g_neutral_list_ends{};
+inline u64 g_neutral_releases{};
+
+/// EDEN_NX2_DRAWX_CALLS, on the back inside a call deferred with CallFlags(): it would have ended
+/// the chain without the switch (verify attribution, statistics). No effect when the switch is
+/// off.
+inline void NoteNeutralCall(u64& counter) {
+    if (g_drawx_calls) {
+        g_delta.drawx_skipped = true;
+        ++counter;
     }
 }
 

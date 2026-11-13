@@ -393,7 +393,11 @@ public:
     /// one without texture, image, texture buffer or image buffer descriptors: such a stage adds
     /// no view, sampler, handle, image descriptor or rescaling bit to what a resolve keeps, and a
     /// delta draw binds its uniform and storage buffers from this pipeline's own infos.
-    [[nodiscard]] bool KeepsImageStateOf(const GraphicsPipeline& other) const noexcept;
+    /// EDEN_NX2_DRAWX_TWIN2: or a stage whose image descriptors (and the handle programs they use,
+    /// with the storage bindings those read) are the same; `by_descriptors` (optional) tells
+    /// whether a stage needed that.
+    [[nodiscard]] bool KeepsImageStateOf(const GraphicsPipeline& other,
+                                         bool* by_descriptors = nullptr) const noexcept;
     /// EDEN_NX2_DRAWX_TWIN: takes what the last captured resolve of `source` (KeepsImageStateOf)
     /// kept for delta draws: views, samplers, image descriptors, rescaling words, handles.
     void TakeDeltaState(const GraphicsPipeline& source);

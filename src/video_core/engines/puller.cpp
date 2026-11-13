@@ -134,12 +134,22 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 // only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack).
 template <typename Func>
 void OnBack(const Func& func,
-            VideoCommon::GpuSplit::Writes writes = VideoCommon::GpuSplit::Writes::Anywhere) {
+            VideoCommon::GpuSplit::Writes writes = VideoCommon::GpuSplit::Writes::Anywhere,
+            u64 flags = 0) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(func, 0, writes);
+        split.Defer(func, flags, writes);
     } else {
         func();
     }
+}
+
+// EDEN_NX2_DRAWX_CALLS (releases deferred with Nx2FastDraw::CallFlags()): a release writes at
+// most 16 bytes at its address (payload and timestamp), now or when its fence is released, which
+// ends the fast draw chain itself. The bytes count as constant buffer data written, as the 3D
+// report method's do under EDEN_NX2_DRAW_REUSE. Nothing when the switch is off.
+void NoteReleaseForFastDraw(VideoCore::RasterizerInterface* rasterizer, GPUVAddr address) {
+    constexpr u64 ReleaseBytes = 16;
+    rasterizer->NoteFastDrawWrite(address, ReleaseBytes);
 }
 
 constexpr auto FenceWrites = VideoCommon::GpuSplit::Writes::Caches;
@@ -1026,15 +1036,17 @@ void Puller::ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher) {
         }
         OnBack(
             [rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
+                NoteReleaseForFastDraw(rasterizer, sequence_address);
                 rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties,
                                   payload, 0);
                 if (mirror != 0) {
+                    NoteReleaseForFastDraw(rasterizer, mirror);
                     rasterizer->Query(mirror, VideoCommon::QueryType::Payload,
                                       properties | VideoCommon::QueryPropertiesFlags::Nx2Mirror,
                                       payload, 0);
                 }
             },
-            VideoCommon::GpuSplit::Writes::Noted);
+            VideoCommon::GpuSplit::Writes::Noted, VideoCommon::Nx2FastDraw::CallFlags());
         NoteRelease(dma_pusher, sequence_address, payload, properties);
         if (mirror != 0) {
             // The mirrored word is what GPU acquires read, in guest memory or the shadow.
@@ -1435,10 +1447,11 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const u32 payload = regs.semaphore_release;
     OnBack(
         [rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+            NoteReleaseForFastDraw(rasterizer, sequence_address);
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         },
-        VideoCommon::GpuSplit::Writes::Noted);
+        VideoCommon::GpuSplit::Writes::Noted, VideoCommon::Nx2FastDraw::CallFlags());
     NoteRelease(dma_pusher, sequence_address, payload, VideoCommon::QueryPropertiesFlags::IsAFence);
 }
 
@@ -1469,10 +1482,11 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     if (operation == 1) { // RELEASE
         OnBack(
             [rasterizer = dma_pusher.rasterizer, address, payload] {
+                NoteReleaseForFastDraw(rasterizer, address);
                 rasterizer->Query(address, VideoCommon::QueryType::Payload,
                                   VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
             },
-            VideoCommon::GpuSplit::Writes::Noted);
+            VideoCommon::GpuSplit::Writes::Noted, VideoCommon::Nx2FastDraw::CallFlags());
         NoteRelease(dma_pusher, address, payload, VideoCommon::QueryPropertiesFlags::IsAFence);
         return;
     }
