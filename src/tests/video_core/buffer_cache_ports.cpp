@@ -357,6 +357,10 @@ struct BufferCacheTestAccess {
         const auto& keep = cache.uniform_keep;
         return {keep.kept, keep.streamed_binds, keep.verified, keep.mismatches};
     }
+    /// EDEN_NX2_DRAWX_KEEP_AUDIT's counts of this window.
+    static const auto& KeepAudit(const KeepCache& cache) {
+        return cache.uniform_keep.audit;
+    }
     static void GpuWrite(KeepCache& cache, BufferId id, DAddr address, u32 size) {
         cache.MarkWrittenBuffer(id, address, size);
     }
@@ -1162,6 +1166,86 @@ TEST_CASE("Uniform keep verify counts guest writes the delta did not report",
     REQUIRE(f.Counts().verified == 2);
     REQUIRE(f.Counts().mismatches == 1);
     REQUIRE(f.Counts().kept == 0);
+    // It also counts a size the keep would refuse (another pipeline's) as a mismatch.
+    Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo,
+                     KeepFixture::UboSize / 2);
+    REQUIRE(f.Counts().verified == 3);
+    REQUIRE(f.Counts().mismatches == 2);
+}
+
+TEST_CASE("Uniform keep audit counts only bound keeps whose bytes changed as mismatches",
+          "[buffer_ports]") {
+    KeepFixture f{"EDEN_NX2_DRAWX_KEEP_AUDIT"};
+    using VideoCommon::KeptUniform;
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    const auto& audit = Access::KeepAudit(*f.cache);
+    const auto result = [&](KeptUniform kind) {
+        return audit.results[0][static_cast<size_t>(kind)];
+    };
+    f.Draw(nullptr);
+    f.Draw(&unchanged);
+    REQUIRE(result(KeptUniform::Held) == 1);
+    REQUIRE(audit.held_by_pages[0][1] == 1); // streamed while its page was write-protected
+    REQUIRE(f.Counts().mismatches == 0);
+
+    // Another pipeline reads fewer bytes, then the first one again: refused, not mismatches.
+    Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo,
+                     KeepFixture::UboSize / 2);
+    f.Draw(&unchanged);
+    REQUIRE(result(KeptUniform::RefusedSize) == 2);
+    REQUIRE(f.Counts().mismatches == 0);
+
+    // A write nothing reported: a stale keep, bound the original way (Draw checks the data).
+    f.UboBytes()[3] = 9;
+    f.Draw(&unchanged);
+    REQUIRE(result(KeptUniform::Stale) == 1);
+    REQUIRE(f.Counts().mismatches == 1);
+    REQUIRE(f.Counts().kept == 0);
+
+    // Another command buffer: refused, and told apart when the bytes changed too.
+    ++f.runtime.tick;
+    f.Draw(&unchanged);
+    REQUIRE(result(KeptUniform::RefusedTick) == 1);
+    f.UboBytes()[4] = 5;
+    ++f.runtime.tick;
+    f.Draw(&unchanged);
+    REQUIRE(result(KeptUniform::RefusedTickStale) == 1);
+    REQUIRE(f.Counts().mismatches == 1);
+    REQUIRE(f.Counts().verified == 6);
+    REQUIRE(audit.gpu_written[0] == 0);
+    REQUIRE(audit.stale_by_pages[4] == 2); // neither page state explains the two changes
+}
+
+TEST_CASE("Uniform keep audit: GPU writes over a kept range leave no candidate",
+          "[buffer_ports]") {
+    using VideoCommon::KeptUniform;
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    {
+        // Over the range: MarkWrittenBuffer notes it, so the next draw keeps nothing there.
+        KeepFixture f{"EDEN_NX2_DRAWX_KEEP_AUDIT"};
+        f.Draw(nullptr);
+        Access::GpuWrite(*f.cache, f.id, KeepFixture::Ubo + 0x80, 4);
+        Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo,
+                         KeepFixture::UboSize);
+        REQUIRE(f.Counts().verified == 0);
+        REQUIRE(Access::KeepAudit(*f.cache).gpu_written[0] == 0);
+    }
+    {
+        // Beside it on its page: still a candidate, holding its bytes, that the original path
+        // binds from the buffer (the page is GPU-modified), with no GPU-written byte in it.
+        KeepFixture f{"EDEN_NX2_DRAWX_KEEP_AUDIT"};
+        f.Draw(nullptr);
+        Access::GpuWrite(*f.cache, f.id, KeepFixture::Ubo + KeepFixture::UboSize, 0x40);
+        Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo,
+                         KeepFixture::UboSize);
+        const auto& audit = Access::KeepAudit(*f.cache);
+        REQUIRE(f.Counts().verified == 1);
+        REQUIRE(audit.results[0][static_cast<size_t>(KeptUniform::Held)] == 1);
+        REQUIRE(audit.gpu_written[0] == 0);
+        REQUIRE(audit.not_streamed[0][0] == 0);
+        REQUIRE(audit.not_streamed[0][1] == 1);
+        REQUIRE(f.Counts().mismatches == 0);
+    }
 }
 
 TEST_CASE("Read downloads stay GPU-modified until the reading thread writes them",

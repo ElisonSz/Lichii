@@ -172,6 +172,51 @@ void BufferCache<P>::TickFrame() {
                      "mismatches",
                      keep.kept, keep.streamed_binds, keep.verified, keep.mismatches);
         }
+        if (ubo_keep_audit) {
+            // EDEN_NX2_DRAWX_KEEP_AUDIT: "verify mismatches" above are the stale bound keeps only.
+            using VideoCommon::KeptUniform;
+            auto& audit = keep.audit;
+            for (size_t source = 0; source < UniformKeep::Audit::NumSources; ++source) {
+                const auto& results = audit.results[source];
+                const auto count = [&](KeptUniform result) {
+                    return results[static_cast<size_t>(result)];
+                };
+                u64 candidates = 0;
+                for (const u64 result : results) {
+                    candidates += result;
+                }
+                if (candidates == 0) {
+                    continue;
+                }
+                LOG_INFO(HW_GPU,
+                         "Uniform keep audit in 600 frames, {} draws: {} candidates: {} held "
+                         "({} streamed protected, {} CPU-modified), {} STALE, refused: {} size, "
+                         "{} address, {} command buffer ({} of them changed); {} over "
+                         "GPU-written bytes; {} no longer streamed ({} over GPU-written bytes)",
+                         Nx2FastDraw::keep_source_names[source], candidates,
+                         count(KeptUniform::Held), audit.held_by_pages[source][1],
+                         audit.held_by_pages[source][0], count(KeptUniform::Stale),
+                         count(KeptUniform::RefusedSize), count(KeptUniform::RefusedAddress),
+                         count(KeptUniform::RefusedTick) + count(KeptUniform::RefusedTickStale),
+                         count(KeptUniform::RefusedTickStale), audit.gpu_written[source],
+                         audit.not_streamed[source][0] + audit.not_streamed[source][1],
+                         audit.not_streamed[source][0]);
+            }
+            const auto& pages = audit.stale_by_pages;
+            if (pages[0] + pages[1] + pages[2] + pages[3] + pages[4] != 0) {
+                LOG_INFO(HW_GPU,
+                         "Uniform keep audit in 600 frames, changed kept ranges: {} CPU-modified "
+                         "when streamed, {} CPU-modified now, {} on GPU-modified pages now, {} "
+                         "over GPU-written bytes now, {} none of these",
+                         pages[0], pages[1], pages[2], pages[3], pages[4]);
+            }
+            audit.results = {};
+            audit.gpu_written = {};
+            audit.not_streamed = {};
+            audit.held_by_pages = {};
+            audit.stale_by_pages = {};
+            audit.logged = 0;
+        }
         if (ubo_stats) {
             // Ticks to nanoseconds by the wall clock over the window, as Nx2Profile's report does.
             UniformBindStats& binds = uniform_bind_stats;
@@ -1898,8 +1943,10 @@ void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& m
 }
 
 template <class P>
-void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta) {
+void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta,
+                                           Nx2FastDraw::KeepSource source) {
     UniformKeep& keep = uniform_keep;
+    keep.source = source;
     const bool unwritten = !keep.memory_writes_lost && keep.draw_deletions == buffer_deletions;
     keep.draw_deletions = buffer_deletions;
     keep.candidates = {};
@@ -1937,6 +1984,80 @@ bool BufferCache<P>::UniformRangeKept(size_t stage, u32 index, DAddr device_addr
     };
     return !keep.memory_writes_lost && std::ranges::none_of(keep.writes, overlaps) &&
            std::ranges::none_of(keep.memory_writes, overlaps);
+}
+
+template <class P>
+void BufferCache<P>::AuditKeptUniform(size_t stage, u32 index, DAddr device_addr, u32 size) {
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        using VideoCommon::KeptUniform;
+        UniformKeep& keep = uniform_keep;
+        auto& audit = keep.audit;
+        const size_t source = static_cast<size_t>(keep.source);
+        const VideoCommon::KeptUniformAudit check =
+            VideoCommon::AuditKeptUniform(runtime, device_memory, stage, index, device_addr, size);
+        ++audit.results[source][static_cast<size_t>(check.result)];
+        // Every GPU write mark (MarkWrittenBuffer, DMACopy) notes its range (NoteUniformWrite), so
+        // no range the GPU wrote since the previous draw's stream is a candidate
+        // (Audit::gpu_written).
+        const bool gpu_bytes = IsRegionGpuModified(device_addr, size);
+        audit.gpu_written[source] += gpu_bytes ? 1 : 0;
+        if (index >= UniformKeep::Audit::NumSlots) {
+            return;
+        }
+        const bool unprotected_then = ((audit.unprotected[stage] >> index) & 1) != 0;
+        if (check.result == KeptUniform::Held) {
+            ++audit.held_by_pages[source][unprotected_then ? 0 : 1];
+            return;
+        }
+        if (check.result != KeptUniform::Stale && check.result != KeptUniform::RefusedTickStale) {
+            return;
+        }
+        // Bytes changed that no write list holds: the bound ones are the mismatches the old
+        // verify meant (the refused ones would have been streamed again, but a write was missed).
+        keep.mismatches += check.result == KeptUniform::Stale ? 1 : 0;
+        const bool unprotected_now = memory_tracker.IsRegionCpuModified(device_addr, size);
+        const bool gpu_pages = memory_tracker.IsRegionGpuModified(device_addr, size);
+        audit.stale_by_pages[0] += unprotected_then ? 1 : 0;
+        audit.stale_by_pages[1] += unprotected_now ? 1 : 0;
+        audit.stale_by_pages[2] += gpu_pages ? 1 : 0;
+        audit.stale_by_pages[3] += gpu_bytes ? 1 : 0;
+        audit.stale_by_pages[4] +=
+            !unprotected_then && !unprotected_now && !gpu_pages && !gpu_bytes ? 1 : 0;
+        if (audit.logged++ < 16) {
+            const u64 now_ns = Nx2Profile::Now();
+            const u64 then_ns = audit.stream_ns[stage][index];
+            LOG_ERROR(HW_GPU,
+                      "Uniform keep audit: {} on a {} draw: stage {} slot {} at {:#x}+{:#x}, byte "
+                      "{:#x}: kept {:#010x}, memory {:#010x}; streamed {} us before, {} breaks "
+                      "since; pages then {}, now {}{}{}",
+                      check.result == KeptUniform::Stale ? "STALE keep"
+                                                         : "refused keep (tick), changed",
+                      Nx2FastDraw::keep_source_names[source], stage, index, device_addr, size,
+                      check.offset, check.was, check.now,
+                      now_ns >= then_ns ? (now_ns - then_ns) / 1000 : 0,
+                      Nx2FastDraw::Serial() - audit.stream_serial[stage][index],
+                      unprotected_then ? "CPU-modified" : "protected",
+                      unprotected_now ? "CPU-modified" : "protected",
+                      gpu_pages ? ", GPU-modified pages" : "",
+                      gpu_bytes ? ", GPU-written bytes" : "");
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::NoteAuditedStream(size_t stage, u32 index, DAddr device_addr, u32 size) {
+    auto& audit = uniform_keep.audit;
+    if (index >= UniformKeep::Audit::NumSlots) {
+        return;
+    }
+    const u32 bit = 1u << index;
+    if (memory_tracker.IsRegionCpuModified(device_addr, size)) {
+        audit.unprotected[stage] |= bit;
+    } else {
+        audit.unprotected[stage] &= ~bit;
+    }
+    audit.stream_ns[stage][index] = Nx2Profile::Now();
+    audit.stream_serial[stage][index] = Nx2FastDraw::Serial();
 }
 
 template <class P>
@@ -2714,8 +2835,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (ubo_keep_verify) {
                 ++uniform_keep.verified;
                 verify_kept = true;
-                if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,
-                                                             device_addr, size)) {
+                if (ubo_keep_audit) {
+                    AuditKeptUniform(stage, index, device_addr, size);
+                } else if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,
+                                                                    device_addr, size)) {
                     if (uniform_keep.mismatches++ < 16) {
                         LOG_ERROR(HW_GPU,
                                   "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} changed "
@@ -2810,6 +2933,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 if (streamed) {
                     uniform_keep.streamed[stage] |= 1u << index;
                     ++uniform_keep.streamed_binds;
+                    if (ubo_keep_audit) [[unlikely]] {
+                        NoteAuditedStream(stage, index, device_addr, size);
+                    }
                 }
             }
         }
@@ -2820,7 +2946,24 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         return;
     }
     // Classic cached path
-    if (verify_kept && uniform_keep.mismatches++ < 16) {
+    if (verify_kept && ubo_keep_audit) {
+        // A keep would bind the previous draw's stream allocation where the original path binds
+        // the buffer: GPU-modified pages now (the tracker's granularity: a GPU write beside the
+        // range, noted without reaching it), or a range no longer small enough. GPU-written bytes
+        // in the range itself would be a write the keep missed.
+        const size_t source = static_cast<size_t>(uniform_keep.source);
+        const bool gpu_bytes = IsRegionGpuModified(device_addr, size);
+        ++uniform_keep.audit.not_streamed[source][gpu_bytes ? 0 : 1];
+        if (uniform_keep.audit.logged++ < 16) {
+            LOG_ERROR(HW_GPU,
+                      "Uniform keep audit: kept range on a {} draw no longer streamed: stage {} "
+                      "slot {} at {:#x}+{:#x}{}{}",
+                      Nx2FastDraw::keep_source_names[source], stage, index, device_addr, size,
+                      memory_tracker.IsRegionGpuModified(device_addr, size) ? ", GPU-modified pages"
+                                                                            : "",
+                      gpu_bytes ? ", GPU-WRITTEN BYTES" : ", no GPU-written bytes in the range");
+        }
+    } else if (verify_kept && uniform_keep.mismatches++ < 16) {
         LOG_ERROR(HW_GPU,
                   "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} is no longer streamed",
                   stage, index, device_addr, size);

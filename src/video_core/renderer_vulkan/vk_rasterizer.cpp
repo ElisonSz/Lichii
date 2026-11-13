@@ -867,7 +867,8 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     if (VideoCommon::Nx2FastDraw::g_drawx_neutral || VideoCommon::Nx2FastDraw::g_drawx_pipestate ||
         VideoCommon::Nx2FastDraw::g_drawx_uniforms || VideoCommon::Nx2FastDraw::g_drawx_twin ||
-        VideoCommon::Nx2FastDraw::g_drawx_verify) {
+        VideoCommon::Nx2FastDraw::g_drawx_verify || VideoCommon::Nx2FastDraw::g_drawx_keep_audit ||
+        VideoCommon::Nx2FastDraw::g_drawx_no_keeps) {
         // Track D, every window the switches are on (cost stats or not).
         const double window = static_cast<double>(now - stats.window_start) / 1e9;
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
@@ -877,9 +878,11 @@ void RasterizerVulkan::ReportFastDraws() {
                  "shader re-lookups/s same={:.0f} other={:.0f} | twins/s={:.0f} drawn as "
                  "delta={:.0f} | "
                  "uniform keeps on full draws/s={:.0f} "
-                 "blocked/s={:.0f} kept={} streamed={} ({:.2f} kept per draw) | verify "
+                 "blocked/s={:.0f} kept={} streamed={} ({:.2f} kept per draw) "
+                 "draws ended before their uniforms={} | verify "
                  "candidates={} pipeline_mismatches={} view_mismatches={} binding_mismatches={} | "
-                 "neutral={} pipestate={} uniforms={} twin={} verify={}",
+                 "neutral={} pipestate={} uniforms={} twin={} verify={} keep_audit={} "
+                 "no_keeps={}",
                  window, rate(drawx.converted), rate(drawx.pipeline_state_same),
                  rate(drawx.pipeline_state_other), rate(drawx.twins), rate(drawx.twin_delta),
                  rate(drawx.uniform_full_draws),
@@ -889,12 +892,16 @@ void RasterizerVulkan::ReportFastDraws() {
                      ? 0.0
                      : static_cast<double>(drawx.uniform_full_kept) /
                            static_cast<double>(drawx.uniform_full_draws),
-                 drawx.verified, drawx.pipeline_mismatches, drawx.view_mismatches,
-                 drawx.binding_mismatches, VideoCommon::Nx2FastDraw::g_drawx_neutral,
+                 drawx_keep_chain.ended_early, drawx.verified, drawx.pipeline_mismatches,
+                 drawx.view_mismatches, drawx.binding_mismatches,
+                 VideoCommon::Nx2FastDraw::g_drawx_neutral,
                  VideoCommon::Nx2FastDraw::g_drawx_pipestate,
                  VideoCommon::Nx2FastDraw::g_drawx_uniforms, VideoCommon::Nx2FastDraw::g_drawx_twin,
-                 VideoCommon::Nx2FastDraw::g_drawx_verify);
+                 VideoCommon::Nx2FastDraw::g_drawx_verify,
+                 VideoCommon::Nx2FastDraw::g_drawx_keep_audit,
+                 VideoCommon::Nx2FastDraw::g_drawx_no_keeps);
         drawx_stats = {};
+        drawx_keep_chain.ended_early = 0;
     }
     // Report preparation costs without GPU_PROFILE selecting the slower Maxwell method path.
     namespace FastDraw = VideoCommon::Nx2FastDraw;
@@ -1317,7 +1324,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         FastDraw::g_delta = {};
         fast_draw_stats = {};
         drawx_stats = {};
-        drawx_keep_serial = 0;
+        drawx_keep_chain.Reset();
         twin_source = nullptr;
     }
     fast_draw_verify = fast_draw_on && (FastDraw::VerifyEnabled() || FastDraw::g_draw_delta_verify ||
@@ -1351,6 +1358,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     };
     GraphicsPipeline* const delta_pipeline =
         fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
+    // EDEN_NX2_DRAWX_UNIFORMS: TakeReusableDraw emptied g_delta for this draw. A return before
+    // this draw binds its uniforms (below) leaves the next draw no serial to keep them by.
+    const u64 drawx_taken_serial =
+        FastDraw::g_drawx_uniforms && fast_draw_on ? drawx_keep_chain.Take() : 0;
     // EDEN_NX2_DRAW_REUSE: the pipeline TakeReusableDraw looked up this draw, if any.
     GraphicsPipeline* const prelooked =
         (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) && fast_draw_on
@@ -1601,24 +1612,33 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool keeps_tracked = !FastDraw::g_draw_delta || FastDraw::g_draw_reuse;
     const FastDraw::Delta* uniform_delta =
         path == DrawPath::Delta && keeps_tracked ? &taken_delta : nullptr;
+    FastDraw::KeepSource keep_source =
+        twin_source != nullptr ? FastDraw::KeepSource::Twin : FastDraw::KeepSource::Delta;
     if (FastDraw::g_drawx_uniforms && fast_draw_on) {
         // EDEN_NX2_DRAWX_UNIFORMS: a full draw keeps them as a delta draw does when only register
         // writes ended the chain since the previous draw began binding its uniforms: the keep
         // rule (no bind, no write over the range, no deletion, same command buffer) does not
         // depend on the pipeline, and register writes write no guest memory. Methods, macros,
         // other engines, fences, invalidations and overflowing write lists bump g_keep_serial.
+        // The previous draw must be the one that took g_delta last (KeepChain).
         const u64 keep_serial = FastDraw::g_keep_serial.load(std::memory_order_relaxed);
-        if (path == DrawPath::Full && keeps_tracked) {
-            if (keep_serial == drawx_keep_serial && !taken_delta.overflowed) {
+        const bool chained =
+            drawx_keep_chain.Keeps(drawx_taken_serial, keep_serial, taken_delta.overflowed);
+        if (path == DrawPath::Full && keeps_tracked && !FastDraw::g_drawx_no_keeps) {
+            if (chained) {
                 uniform_delta = &taken_delta;
+                keep_source = FastDraw::KeepSource::Full;
                 ++drawx_stats.uniform_full_draws;
             } else {
                 ++drawx_stats.uniform_full_blocked;
             }
         }
-        drawx_keep_serial = keep_serial;
     }
-    buffer_cache.BeginGraphicsUniforms(uniform_delta);
+    if (FastDraw::g_drawx_no_keeps) {
+        // EDEN_NX2_DRAWX_NO_KEEPS: every uniform buffer is compared, delta draws' too.
+        uniform_delta = nullptr;
+    }
+    buffer_cache.BeginGraphicsUniforms(uniform_delta, keep_source);
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");

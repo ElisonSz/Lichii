@@ -38,6 +38,8 @@ void ReadDrawXSwitches() {
     g_drawx_uniforms = on("EDEN_NX2_DRAWX_UNIFORMS");
     g_drawx_twin = on("EDEN_NX2_DRAWX_TWIN");
     g_drawx_verify = on("EDEN_NX2_DRAWX_VERIFY");
+    g_drawx_keep_audit = g_drawx_verify || on("EDEN_NX2_DRAWX_KEEP_AUDIT");
+    g_drawx_no_keeps = on("EDEN_NX2_DRAWX_NO_KEEPS");
     g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin;
     for (u32 method = 0; method < g_drawx_register_class.size(); ++method) {
         DrawXRegister kind = ClassifyDrawXRegister(method);
@@ -48,11 +50,13 @@ void ReadDrawXSwitches() {
         }
         g_drawx_register_class[method] = kind;
     }
-    if (g_drawx_registers || g_drawx_uniforms || g_drawx_twin || g_drawx_verify) {
+    if (g_drawx_registers || g_drawx_uniforms || g_drawx_twin || g_drawx_verify ||
+        g_drawx_keep_audit || g_drawx_no_keeps) {
         LOG_INFO(HW_GPU,
-                 "Track D draw switches: neutral={} pipestate={} uniforms={} twin={} verify={}",
+                 "Track D draw switches: neutral={} pipestate={} uniforms={} twin={} verify={} "
+                 "keep_audit={} no_keeps={}",
                  g_drawx_neutral, g_drawx_pipestate, g_drawx_uniforms, g_drawx_twin,
-                 g_drawx_verify);
+                 g_drawx_verify, g_drawx_keep_audit, g_drawx_no_keeps);
     }
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -167,6 +168,62 @@ template <class Runtime>
     }
     runtime.RebindStreamUniform(slot.ref, size);
     return true;
+}
+
+/// EDEN_NX2_DRAWX_KEEP_AUDIT: what RebindKeptUniform does with a range, by the first of its tests
+/// that fails, and whether guest memory still holds the bytes of the allocation it would bind.
+enum class KeptUniform : u8 {
+    Held,             ///< Bound; guest memory holds the allocation's bytes
+    Stale,            ///< Bound; guest memory changed since (a write the keep rule missed)
+    RefusedSize,      ///< Refused: another size (another pipeline), or nothing streamed
+    RefusedAddress,   ///< Refused: the slot last streamed another address
+    RefusedTick,      ///< Refused: another command buffer; guest memory holds the bytes
+    RefusedTickStale, ///< Refused: another command buffer; guest memory changed (a missed write)
+    Count,
+};
+
+struct KeptUniformAudit {
+    KeptUniform result{};
+    u32 offset{}; ///< Stale ones: the first byte that differs
+    u32 was{};    ///< ... the allocation's word there (the aligned word holding that byte)
+    u32 now{};    ///< ... guest memory's word there
+};
+
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] KeptUniformAudit AuditKeptUniform(Runtime& runtime, DeviceMemory& device_memory,
+                                                size_t stage, u32 index, u64 device_addr,
+                                                u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+        index >= Reuse::NumSlots) {
+        return {.result = KeptUniform::RefusedSize};
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    const typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.size != size) {
+        return {.result = KeptUniform::RefusedSize};
+    }
+    if (slot.device_addr != device_addr) {
+        return {.result = KeptUniform::RefusedAddress};
+    }
+    const bool same_tick = slot.tick == runtime.CurrentTick();
+    device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+    u32 offset = 0;
+    while (offset < size && slot.bytes[offset] == reuse.scratch[offset]) {
+        ++offset;
+    }
+    if (offset == size) {
+        return {.result = same_tick ? KeptUniform::Held : KeptUniform::RefusedTick};
+    }
+    KeptUniformAudit audit{
+        .result = same_tick ? KeptUniform::Stale : KeptUniform::RefusedTickStale,
+        .offset = offset,
+    };
+    const u32 word = offset & ~3U;
+    const size_t bytes = (std::min<size_t>)(sizeof(u32), size - word);
+    std::memcpy(&audit.was, slot.bytes.data() + word, bytes);
+    std::memcpy(&audit.now, reuse.scratch.data() + word, bytes);
+    return audit;
 }
 
 /// EDEN_NX2_UBO_KEEP_VERIFY: whether guest memory still holds the bytes the slot's last

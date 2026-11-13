@@ -38,6 +38,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -587,8 +588,9 @@ public:
 
     /// Called before each graphics draw binds its buffers (uniform keeps). `delta`: the constant
     /// buffer binds and data since the previous draw when it is a fast draw delta draw, else
-    /// nullptr.
-    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
+    /// nullptr. `source`: the kind of draw keeping them (EDEN_NX2_DRAWX_KEEP_AUDIT's counts).
+    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta,
+                               Nx2FastDraw::KeepSource source = Nx2FastDraw::KeepSource::Delta);
 
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
@@ -855,14 +857,30 @@ private:
         keep.memory_writes.emplace_back(device_addr, device_addr + size);
     }
     /// EDEN_NX2_UBO_KEEP_VERIFY=1: binds what a keep would skip the original way and logs where
-    /// guest memory changed. EDEN_NX2_DRAWX_VERIFY=1 turns it on too (keeps on full draws).
+    /// guest memory changed. EDEN_NX2_DRAWX_VERIFY=1 and EDEN_NX2_DRAWX_KEEP_AUDIT=1 turn it on
+    /// too.
     const bool ubo_keep_verify = [] {
         const auto on = [](const char* name) {
             const char* const value = std::getenv(name);
             return value != nullptr && value[0] == '1';
         };
-        return on("EDEN_NX2_UBO_KEEP_VERIFY") || on("EDEN_NX2_DRAWX_VERIFY");
+        return on("EDEN_NX2_UBO_KEEP_VERIFY") || on("EDEN_NX2_DRAWX_VERIFY") ||
+               on("EDEN_NX2_DRAWX_KEEP_AUDIT");
     }();
+    /// EDEN_NX2_DRAWX_KEEP_AUDIT=1 or EDEN_NX2_DRAWX_VERIFY=1: the verify above counts exactly
+    /// what RebindKeptUniform would do (AuditKeptUniform), by keep source, and only bytes that
+    /// changed under a bound keep count as mismatches. EDEN_NX2_UBO_KEEP_VERIFY=1 alone counts as
+    /// before: a size or address the keep would refuse counts as a mismatch, the command buffer
+    /// is not compared.
+    const bool ubo_keep_audit = [] {
+        const auto on = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        return on("EDEN_NX2_DRAWX_VERIFY") || on("EDEN_NX2_DRAWX_KEEP_AUDIT");
+    }();
+    void AuditKeptUniform(size_t stage, u32 index, DAddr device_addr, u32 size);
+    void NoteAuditedStream(size_t stage, u32 index, DAddr device_addr, u32 size);
     /// TEST: EDEN_NX2_UBO_STATS=1 times the streamed uniform binds and logs them every 600
     /// frames, without EDEN_NX2_GPU_PROFILE (which selects the slower method path).
     /// EDEN_NX2_UBO_STATS=2 also switches the compare in place on and off between windows, so
@@ -896,6 +914,37 @@ private:
         u64 streamed_binds{};
         u64 verified{};
         u64 mismatches{};
+        Nx2FastDraw::KeepSource source{}; ///< Of the draw binding now
+        /// EDEN_NX2_DRAWX_KEEP_AUDIT: per window, what each keep candidate is
+        /// (VideoCommon::KeptUniform) by keep source, and what the memory tracker says about the
+        /// stale ones. Per slot: when it was streamed and what its pages were then.
+        struct Audit {
+            static constexpr size_t NumSources =
+                static_cast<size_t>(Nx2FastDraw::KeepSource::Count);
+            static constexpr size_t NumResults =
+                static_cast<size_t>(VideoCommon::KeptUniform::Count);
+            static constexpr size_t NumSlots = 18;
+            std::array<std::array<u64, NumResults>, NumSources> results{};
+            /// Candidates over bytes the GPU wrote (gpu_modified_ranges, exact), which guest
+            /// memory does not show, so the compare cannot clear them. Every GPU write mark notes
+            /// its range, so a write since the previous draw leaves no candidate: only GPU bytes
+            /// older than the previous draw's stream (which read guest memory too) can be here.
+            std::array<u64, NumSources> gpu_written{};
+            /// Candidates the original path no longer streams: [over GPU-written bytes, only on
+            /// GPU-modified pages (the tracker's page granularity) or no longer small enough].
+            std::array<std::array<u64, 2>, NumSources> not_streamed{};
+            /// Held keeps by the slot's pages when streamed: [CPU-modified (unprotected),
+            /// protected]
+            std::array<std::array<u64, 2>, NumSources> held_by_pages{};
+            /// Changed ones (bound or refused for the tick) by what the trackers say: streamed
+            /// while CPU-modified, CPU-modified now, GPU-modified pages now, GPU-written bytes
+            /// now, none of these.
+            std::array<u64, 5> stale_by_pages{};
+            u64 logged{};
+            std::array<u32, NUM_STAGES> unprotected{}; ///< Slot pages CPU-modified when streamed
+            std::array<std::array<u64, NumSlots>, NUM_STAGES> stream_ns{};
+            std::array<std::array<u64, NumSlots>, NUM_STAGES> stream_serial{};
+        } audit;
     } uniform_keep;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;

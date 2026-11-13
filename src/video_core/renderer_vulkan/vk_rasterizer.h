@@ -555,8 +555,8 @@ private:
     /// its delta state to a twin (taken_draw.pipeline), else null.
     GraphicsPipeline* twin_source{};
     /// EDEN_NX2_DRAWX_UNIFORMS: Nx2FastDraw::g_keep_serial when the previous draw began binding
-    /// uniforms (0: none since fast draws turned on).
-    u64 drawx_keep_serial{};
+    /// uniforms, if it is the draw that took g_delta last.
+    VideoCommon::Nx2FastDraw::KeepChain drawx_keep_chain;
     u32 taken_break_classes{};
     bool matched_candidate{};
     u64 fast_draw_window{};

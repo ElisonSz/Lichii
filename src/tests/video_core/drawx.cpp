@@ -171,3 +171,39 @@ TEST_CASE("DrawX: only non-register breaks end uniform keeps on full draws",
     FastDraw::SetEnabledForTest(true);
     ReadSwitches(false, false, false);
 }
+
+TEST_CASE("DrawX: uniform keep chains end at draws that never bound their uniforms",
+          "[video_core][drawx]") {
+    FastDraw::KeepChain chain;
+    // The first draw has no previous draw to keep by.
+    u64 taken = chain.Take();
+    CHECK(taken == 0);
+    CHECK(!chain.Keeps(taken, 5, false));
+    // Then each draw keeps while g_keep_serial stays and no write list overflowed; a draw that
+    // could not keep still links the next one.
+    taken = chain.Take();
+    CHECK(chain.Keeps(taken, 5, false));
+    taken = chain.Take();
+    CHECK(!chain.Keeps(taken, 5, true));
+    taken = chain.Take();
+    CHECK(chain.Keeps(taken, 5, false));
+    taken = chain.Take();
+    CHECK(!chain.Keeps(taken, 6, false));
+    CHECK(chain.ended_early == 0);
+    // A draw that took g_delta and returned before its uniforms: the next one keeps nothing, even
+    // though g_keep_serial is the same (its g_delta lacks what came before the returned draw).
+    (void)chain.Take();
+    taken = chain.Take();
+    CHECK(taken == 0);
+    CHECK(chain.ended_early == 1);
+    CHECK(!chain.Keeps(taken, 6, false));
+    taken = chain.Take();
+    CHECK(chain.Keeps(taken, 6, false));
+    // Fast draws turned off and on again.
+    (void)chain.Take();
+    chain.Reset();
+    taken = chain.Take();
+    CHECK(taken == 0);
+    CHECK(chain.ended_early == 1);
+    CHECK(!chain.Keeps(taken, 6, false));
+}

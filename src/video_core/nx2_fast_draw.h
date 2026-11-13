@@ -112,11 +112,66 @@ inline bool g_drawx_twin{};
 /// EDEN_NX2_DRAWX_VERIFY=1: delta candidates are prepared in full and compared (as
 /// EDEN_NX2_FAST_DRAW_VERIFY), kept uniforms are compared with guest memory; counted per window.
 inline bool g_drawx_verify{};
+/// EDEN_NX2_DRAWX_KEEP_AUDIT=1 (also on with EDEN_NX2_DRAWX_VERIFY=1): every uniform buffer a keep
+/// would bind (on delta, twin and full draws) is bound the original way instead and classified as
+/// RebindKeptUniform would treat it: refused (size, address, command buffer) or bound, and then
+/// whether guest memory still holds what the kept allocation holds (BufferCache's audit lines).
+/// Unlike EDEN_NX2_DRAWX_VERIFY it leaves the delta draws on.
+inline bool g_drawx_keep_audit{};
+/// EDEN_NX2_DRAWX_NO_KEEPS=1: no uniform keeps at all, also none on delta draws (where they are on
+/// by default): every small uniform buffer is compared with the bytes its slot streamed last.
+inline bool g_drawx_no_keeps{};
 /// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin: the one flag the register write path
 /// tests.
 inline bool g_drawx_registers{};
 /// Reads the switches above; called by VideoCore::CreateGPU after ReadDrawReuseSwitches.
 void ReadDrawXSwitches();
+
+/// The kind of draw a uniform keep is on (BufferCache::BeginGraphicsUniforms, keep audit).
+enum class KeepSource : u8 {
+    Delta, ///< A delta draw with the previous draw's pipeline
+    Twin,  ///< A delta draw with a twin of it (EDEN_NX2_DRAWX_TWIN)
+    Full,  ///< A full draw (EDEN_NX2_DRAWX_UNIFORMS)
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<size_t>(KeepSource::Count)>
+    keep_source_names{"delta", "twin", "full"};
+
+/// EDEN_NX2_DRAWX_UNIFORMS: links full draws into keep chains. g_keep_serial must not have changed
+/// since the previous draw began binding its uniforms, and that draw must be the one that took
+/// g_delta last: TakeReusableDraw empties g_delta for each draw, so after a draw that returned
+/// before binding its uniforms (no pipeline yet, a skipped mesh draw) the next draw's g_delta
+/// lacks the binds and constant data written before it. Take() when the draw takes g_delta,
+/// Keeps() when it begins binding its uniforms.
+class KeepChain {
+public:
+    /// The serial the previous draw left for this one: 0 (none) unless it reached Keeps().
+    [[nodiscard]] u64 Take() noexcept {
+        ended_early += open ? 1 : 0;
+        open = true;
+        return std::exchange(serial, 0);
+    }
+
+    /// Whether a full draw may keep uniforms: `taken` (Take's value) is g_keep_serial `now` and
+    /// no write list overflowed. Leaves `now` for the next draw.
+    [[nodiscard]] bool Keeps(u64 taken, u64 now, bool overflowed) noexcept {
+        open = false;
+        serial = now;
+        return taken != 0 && taken == now && !overflowed;
+    }
+
+    void Reset() noexcept {
+        serial = 0;
+        open = false;
+    }
+
+    /// Draws that took g_delta and returned before binding their uniforms (statistics).
+    u64 ended_early{};
+
+private:
+    u64 serial{}; ///< g_keep_serial when the previous draw reached Keeps (it starts at 1)
+    bool open{};  ///< A draw took g_delta and has not reached Keeps yet
+};
 
 /// What a 3D register write does to the delta chain under the switches above.
 enum class DrawXRegister : u8 {
