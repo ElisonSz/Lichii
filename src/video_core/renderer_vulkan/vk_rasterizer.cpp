@@ -4540,6 +4540,18 @@ void RasterizerVulkan::FlushWork() {
     if (native && !android) {
         pending_native_work = true;
     }
+    if (VideoCommon::BackX::g_submit_draws != 0) [[unlikely]] {
+        // EDEN_NX2_BACKX_SUBMIT_DRAWS: a deferred fence flush waits at most that many more work
+        // items. FlushWork runs on the split's back only (it owns the scheduler).
+        static u32 deferred_items{};
+        if (!scheduler.IsFlushPending()) {
+            deferred_items = 0;
+        } else if (++deferred_items >= VideoCommon::BackX::g_submit_draws) {
+            deferred_items = 0;
+            VideoCommon::BackX::Count(VideoCommon::BackX::Counter::EarlySubmits);
+            scheduler.FlushDeferred();
+        }
+    }
 }
 
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_,

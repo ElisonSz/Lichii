@@ -36,6 +36,12 @@ inline bool g_tick{};
 /// all of them (OnCacheInvalidations took the buffer cache's twice, the texture cache's once, per
 /// write). The caches are independent and their page counts commute.
 inline bool g_apply{};
+/// EDEN_NX2_BACKX_SUBMIT_DRAWS=n (1 to 4096): a fence flush Scheduler::DeferFlush deferred is
+/// submitted after at most n more draws, dispatches or clears (RasterizerVulkan::FlushWork),
+/// instead of with the next budget flush (128 draws), a fence 500 us after the last flush or the
+/// back's idle hook. Only when or where a busy back holds fences back (track S's run-ahead): it
+/// adds submissions. 0 (off) by default.
+inline u32 g_submit_draws{};
 /// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
 /// then does what the base does.
 inline bool g_verify{};
@@ -57,6 +63,7 @@ enum class Counter : std::size_t {
     TickWordsSkipped, ///< words the base would have cleared too (already zero)
     ApplyPasses,      ///< OnCacheInvalidations calls with each lock taken once
     ApplyRanges,      ///< collected writes they applied
+    EarlySubmits,     ///< deferred fence flushes submitted after EDEN_NX2_BACKX_SUBMIT_DRAWS
     Mismatches,       ///< verify: skips the base's check contradicted
     Count,
 };
@@ -133,11 +140,19 @@ inline void ReadSwitches() {
     g_gather = ReadFlag("EDEN_NX2_BACKX_GATHER");
     g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
     g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
+    g_submit_draws = 0;
+    if (const char* value = std::getenv("EDEN_NX2_BACKX_SUBMIT_DRAWS")) {
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        g_submit_draws = parsed <= 4096 ? static_cast<u32>(parsed) : 4096U;
+    }
     g_verify = ReadFlag("EDEN_NX2_BACKX_VERIFY");
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
-    if (g_inline || g_report || g_gather || g_tick || g_apply || g_verify || g_stats) {
-        LOG_INFO(HW_GPU, "BackX: inline {} report {} gather {} tick {} apply {} verify {} stats {}",
-                 g_inline, g_report, g_gather, g_tick, g_apply, g_verify, g_stats);
+    if (g_inline || g_report || g_gather || g_tick || g_apply || g_submit_draws != 0 || g_verify ||
+        g_stats) {
+        LOG_INFO(HW_GPU,
+                 "BackX: inline {} report {} gather {} tick {} apply {} submit after {} draws "
+                 "verify {} stats {}",
+                 g_inline, g_report, g_gather, g_tick, g_apply, g_submit_draws, g_verify, g_stats);
     }
 }
 
@@ -169,15 +184,17 @@ inline void Report() {
     const u64 tick_skipped = Take(Counter::TickWordsSkipped);
     const u64 apply_passes = Take(Counter::ApplyPasses);
     const u64 apply_ranges = Take(Counter::ApplyRanges);
+    const u64 early_submits = Take(Counter::EarlySubmits);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
              "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
              "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
              "gathers {} skipped, {} run ({} found nothing); usage resets {} clearing {} words, "
-             "{} words left alone; collected writes {} in {} passes; verify mismatches {}",
+             "{} words left alone; collected writes {} in {} passes; deferred fence flushes "
+             "submitted early {}; verify mismatches {}",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
              report_locked, gather_skipped, gather_run, gather_empty, tick_resets, tick_cleared,
-             tick_skipped, apply_ranges, apply_passes, mismatches);
+             tick_skipped, apply_ranges, apply_passes, early_submits, mismatches);
 }
 
 } // namespace VideoCommon::BackX

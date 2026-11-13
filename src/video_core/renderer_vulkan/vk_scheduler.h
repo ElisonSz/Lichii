@@ -70,6 +70,10 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
+    /// A flush DeferFlush deferred waits for its submission (the split's back only).
+    [[nodiscard]] bool IsFlushPending() const noexcept {
+        return flush_pending;
+    }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
