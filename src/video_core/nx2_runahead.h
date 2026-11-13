@@ -88,6 +88,10 @@ struct Counters {
     u64 shim_drained{};
     u64 upload_qmds{}; ///< QMD descriptors read from a queued inline upload
     u64 unvalued{};    ///< QMD signals whose releases the front did not note when it sent them
+    u64 lead_sum{};    ///< Ring words the back had yet to run at the acquires (the front's lead)
+    u64 lead_max{};
+    u64 valve_drains{}; ///< Polls' 1 ms valve drains (each runs the back dry, whatever the lead)
+    u64 valve_ns{};
 };
 inline Counters counters;
 

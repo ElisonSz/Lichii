@@ -682,7 +682,15 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         if constexpr (Track) {
             ++Details::Get().valves[Details::Operation(acquire.operation)];
         }
+        const auto valve_begin = VideoCommon::RunAhead::stats
+                                     ? VideoCommon::SyncSuspend::Clock::now()
+                                     : VideoCommon::SyncSuspend::Clock::time_point{};
         DrainBack(DrainSite::AcquirePoll);
+        if (VideoCommon::RunAhead::stats) [[unlikely]] {
+            ++VideoCommon::RunAhead::counters.valve_drains;
+            VideoCommon::RunAhead::counters.valve_ns += VideoCommon::SyncSuspend::Nanoseconds(
+                VideoCommon::SyncSuspend::Clock::now() - valve_begin);
+        }
         const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
         if (Nx2SemaphoreWaiters::Get().Latched(this) || acquire.Matches(current)) {
             VideoCommon::Count(stats.valve_passes);
@@ -993,6 +1001,9 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     bool base_waits = false;
     if (RunAhead::stats) [[unlikely]] {
         ++RunAhead::counters.acquires;
+        const u64 lead = split.Backlog();
+        RunAhead::counters.lead_sum += lead;
+        RunAhead::counters.lead_max = (std::max)(RunAhead::counters.lead_max, lead);
         if (reach.position < base_writers) {
             ++RunAhead::counters.earlier;
             PendingAcquire base = acquire;
