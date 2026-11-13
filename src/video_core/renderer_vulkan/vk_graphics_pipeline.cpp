@@ -1374,6 +1374,24 @@ bool GraphicsPipeline::DeltaImagesChange() const noexcept {
     return texture_cache.SampledViewsChange(delta_views);
 }
 
+bool GraphicsPipeline::KeepsImageStateOf(const GraphicsPipeline& other) const noexcept {
+    if (configure_func != other.configure_func || delta_blocker != DeltaBlocker::None ||
+        other.delta_blocker != DeltaBlocker::None) {
+        return false;
+    }
+    const auto imageless = [](const GraphicsStageInfo& info) {
+        return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
+               info.texture_descriptors.empty() && info.image_descriptors.empty();
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (stage_infos[stage] != other.stage_infos[stage] &&
+            !(imageless(*stage_infos[stage]) && imageless(*other.stage_infos[stage]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void GraphicsPipeline::TakeDeltaState(const GraphicsPipeline& source) {
     // The same stage infos and specialization resolve the same views, samplers, image
     // descriptors (all GENERAL-layout, in the same order) and rescaling words from the same

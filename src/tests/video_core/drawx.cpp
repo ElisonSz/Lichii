@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Track D (EDEN_NX2_DRAWX_NEUTRAL, _PIPESTATE, _UNIFORMS): which 3D register writes still end the
-// fast draw delta chain, and which breaks end uniform keeps on full draws.
+// Track D (EDEN_NX2_DRAWX_NEUTRAL, _PIPESTATE, _UNIFORMS, _TWIN): which 3D register writes still end
+// the fast draw delta chain, and which breaks end uniform keeps on full draws.
 
 #include <cstdlib>
 
@@ -19,8 +19,8 @@ using FastDraw::DrawXRegister;
 
 constexpr u32 NumRegs = Maxwell3D::Regs::NUM_REGS;
 
-/// Sets the four switches as the environment would and rebuilds the register table.
-void ReadSwitches(bool neutral, bool pipestate, bool uniforms) {
+/// Sets the switches as the environment would and rebuilds the register table.
+void ReadSwitches(bool neutral, bool pipestate, bool uniforms, bool twin = false) {
     const auto set = [](const char* name, bool on) {
 #ifdef _WIN32
         _putenv_s(name, on ? "1" : "0");
@@ -31,6 +31,7 @@ void ReadSwitches(bool neutral, bool pipestate, bool uniforms) {
     set("EDEN_NX2_DRAWX_NEUTRAL", neutral);
     set("EDEN_NX2_DRAWX_PIPESTATE", pipestate);
     set("EDEN_NX2_DRAWX_UNIFORMS", uniforms);
+    set("EDEN_NX2_DRAWX_TWIN", twin);
     set("EDEN_NX2_DRAWX_VERIFY", false);
     FastDraw::ReadDrawXSwitches();
 }
@@ -57,34 +58,42 @@ TEST_CASE("DrawX: neutral registers are the MME memory read and constant colour 
           DrawXRegister::Neutral);
 }
 
-TEST_CASE("DrawX: pipeline state registers are exactly the fixed-function break class",
+TEST_CASE("DrawX: pipeline state and shader registers are exactly their break classes",
           "[video_core][drawx]") {
     const u32 fixed_function = FastDraw::ClassBit(FastDraw::BreakClass::FixedFunction);
+    const u32 shader = FastDraw::ClassBit(FastDraw::BreakClass::Shader);
     u32 pipeline_state = 0;
+    u32 shaders = 0;
     for (u32 method = 0; method < NumRegs; ++method) {
         const DrawXRegister kind = FastDraw::ClassifyDrawXRegister(method);
         if (kind == DrawXRegister::Neutral) {
             continue;
         }
-        const bool fixed = FastDraw::ClassifyBreak(FastDraw::Reason::Register, method) ==
-                           fixed_function;
-        CHECK((kind == DrawXRegister::PipelineState) == fixed);
-        pipeline_state += fixed ? 1 : 0;
+        const u32 breaks = FastDraw::ClassifyBreak(FastDraw::Reason::Register, method);
+        CHECK((kind == DrawXRegister::PipelineState) == (breaks == fixed_function));
+        CHECK((kind == DrawXRegister::Shader) == (breaks == shader));
+        pipeline_state += breaks == fixed_function ? 1 : 0;
+        shaders += breaks == shader ? 1 : 0;
     }
     CHECK(pipeline_state > 0);
+    // Six programs of 16 words and the program region's two address words.
+    CHECK(shaders == sizeof(Maxwell3D::Regs::Pipeline) * Maxwell3D::Regs::MaxShaderProgram / 4 + 2);
 }
 
 TEST_CASE("DrawX: what a delta draw keeps still ends the chain", "[video_core][drawx]") {
     const auto breaks = [](u32 method) {
         return FastDraw::ClassifyDrawXRegister(method) == DrawXRegister::Breaks;
     };
-    // Shaders, texture and sampler tables, render targets, vertex layout, transform feedback.
+    // Shader programs only select the pipeline (looked up again under EDEN_NX2_DRAWX_TWIN).
     for (u32 method = MAXWELL3D_REG_INDEX(pipelines);
          method < MAXWELL3D_REG_INDEX(pipelines) +
                       sizeof(Maxwell3D::Regs::Pipeline) * Maxwell3D::Regs::MaxShaderProgram / 4;
          ++method) {
-        CHECK(breaks(method));
+        CHECK(FastDraw::ClassifyDrawXRegister(method) == DrawXRegister::Shader);
     }
+    CHECK(FastDraw::ClassifyDrawXRegister(MAXWELL3D_REG_INDEX(program_region.address_high)) ==
+          DrawXRegister::Shader);
+    // Texture and sampler tables, render targets, vertex layout, transform feedback.
     for (u32 word = 0; word < sizeof(Maxwell3D::Regs::TexHeader) / 4; ++word) {
         CHECK(breaks(MAXWELL3D_REG_INDEX(tex_header) + word));
     }
@@ -109,16 +118,18 @@ TEST_CASE("DrawX: what a delta draw keeps still ends the chain", "[video_core][d
 }
 
 TEST_CASE("DrawX: the register table follows the switches", "[video_core][drawx]") {
-    for (int mask = 0; mask < 4; ++mask) {
+    for (int mask = 0; mask < 8; ++mask) {
         const bool neutral = (mask & 1) != 0;
         const bool pipestate = (mask & 2) != 0;
-        ReadSwitches(neutral, pipestate, false);
-        CHECK(FastDraw::g_drawx_registers == (neutral || pipestate));
+        const bool twin = (mask & 4) != 0;
+        ReadSwitches(neutral, pipestate, false, twin);
+        CHECK(FastDraw::g_drawx_registers == (neutral || pipestate || twin));
         for (u32 method = 0; method < NumRegs; ++method) {
             const DrawXRegister full = FastDraw::ClassifyDrawXRegister(method);
             DrawXRegister expected = full;
             if ((full == DrawXRegister::Neutral && !neutral) ||
-                (full == DrawXRegister::PipelineState && !pipestate)) {
+                (full == DrawXRegister::PipelineState && !pipestate) ||
+                (full == DrawXRegister::Shader && !twin)) {
                 expected = DrawXRegister::Breaks;
             }
             CHECK(FastDraw::DrawXRegisterClass(method) == expected);

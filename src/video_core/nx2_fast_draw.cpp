@@ -38,11 +38,12 @@ void ReadDrawXSwitches() {
     g_drawx_uniforms = on("EDEN_NX2_DRAWX_UNIFORMS");
     g_drawx_twin = on("EDEN_NX2_DRAWX_TWIN");
     g_drawx_verify = on("EDEN_NX2_DRAWX_VERIFY");
-    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate;
+    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin;
     for (u32 method = 0; method < g_drawx_register_class.size(); ++method) {
         DrawXRegister kind = ClassifyDrawXRegister(method);
         if ((kind == DrawXRegister::Neutral && !g_drawx_neutral) ||
-            (kind == DrawXRegister::PipelineState && !g_drawx_pipestate)) {
+            (kind == DrawXRegister::PipelineState && !g_drawx_pipestate) ||
+            (kind == DrawXRegister::Shader && !g_drawx_twin)) {
             kind = DrawXRegister::Breaks;
         }
         g_drawx_register_class[method] = kind;
@@ -75,8 +76,13 @@ DrawXRegister ClassifyDrawXRegister(u32 method) {
     }
     // Fixed-function state feeds the pipeline key and dynamic state only: no part of a resolve
     // the delta path keeps reads it, and UpdateDynamicStates runs on both paths.
-    if (ClassifyBreak(Reason::Register, method) == ClassBit(BreakClass::FixedFunction)) {
+    const u32 kind = ClassifyBreak(Reason::Register, method);
+    if (kind == ClassBit(BreakClass::FixedFunction)) {
         return DrawXRegister::PipelineState;
+    }
+    // Shader programs (and their region) select the pipeline: only its lookup reads them.
+    if (kind == ClassBit(BreakClass::Shader)) {
+        return DrawXRegister::Shader;
     }
     return DrawXRegister::Breaks;
 }

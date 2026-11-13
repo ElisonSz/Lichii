@@ -103,15 +103,17 @@ inline bool g_drawx_pipestate{};
 /// EDEN_NX2_DRAWX_UNIFORMS=1: uniform keeps (BufferCache::UniformRangeKept) also on full draws
 /// when nothing but register writes ended the delta chain since the previous draw (g_keep_serial).
 inline bool g_drawx_uniforms{};
-/// EDEN_NX2_DRAWX_TWIN=1: when the pipeline looked up again for a vertex layout or fixed-function
-/// change is another object that resolves exactly the same bindings (the same configure
-/// specialization and interned stage infos: descriptors, handle programs, properties), the
-/// delta draw goes on with it, taking what the previous pipeline's last resolve kept.
+/// EDEN_NX2_DRAWX_TWIN=1: when the pipeline looked up again for a vertex layout, fixed-function or
+/// shader program change is another object that keeps the same image state (the same configure
+/// specialization, and per stage the same interned stage info or none with images on either
+/// side), the delta draw goes on with it, taking what the previous pipeline's last resolve kept.
+/// Shader program writes then mark the delta (pipeline_state) instead of ending it.
 inline bool g_drawx_twin{};
 /// EDEN_NX2_DRAWX_VERIFY=1: delta candidates are prepared in full and compared (as
 /// EDEN_NX2_FAST_DRAW_VERIFY), kept uniforms are compared with guest memory; counted per window.
 inline bool g_drawx_verify{};
-/// g_drawx_neutral || g_drawx_pipestate: the one flag the register write path tests.
+/// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin: the one flag the register write path
+/// tests.
 inline bool g_drawx_registers{};
 /// Reads the switches above; called by VideoCore::CreateGPU after ReadDrawReuseSwitches.
 void ReadDrawXSwitches();
@@ -121,6 +123,7 @@ enum class DrawXRegister : u8 {
     Breaks,        ///< As without the switches
     Neutral,       ///< Read by no draw preparation: no break (EDEN_NX2_DRAWX_NEUTRAL)
     PipelineState, ///< Fixed-function state: Delta::pipeline_state (EDEN_NX2_DRAWX_PIPESTATE)
+    Shader,        ///< Shader programs: Delta::pipeline_state (EDEN_NX2_DRAWX_TWIN)
 };
 /// One entry per 3D register (Maxwell3D::Regs::NUM_REGS), filled by ReadDrawXSwitches.
 inline std::array<DrawXRegister, 0xe00> g_drawx_register_class{};
@@ -128,7 +131,7 @@ inline std::array<DrawXRegister, 0xe00> g_drawx_register_class{};
     return method < g_drawx_register_class.size() ? g_drawx_register_class[method]
                                                   : DrawXRegister::Breaks;
 }
-/// The class each register has when both switches are on (tests and ReadDrawXSwitches).
+/// The class each register has when every switch is on (tests and ReadDrawXSwitches).
 [[nodiscard]] DrawXRegister ClassifyDrawXRegister(u32 method);
 
 /// Every break other than a 3D register write (methods, macros, other engines, fences, tick work,

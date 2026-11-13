@@ -499,7 +499,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     taken_delta = delta;
     matched_candidate = false;
     twin_source = nullptr;
-    if (FastDraw::g_draw_reuse) {
+    if (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) {
         prelooked_pipeline = nullptr;
     }
     if (FastDraw::DrawCostStatsEnabled() && delta.overflowed) {
@@ -564,7 +564,8 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             GraphicsPipeline* const current = pipeline_cache.CurrentGraphicsPipeline();
             // EDEN_NX2_DRAW_REUSE: nothing changes the registers before PrepareDraw looks the
             // pipeline up for a full resolve, so it takes this one instead of a second lookup.
-            if (FastDraw::g_draw_reuse) {
+            // EDEN_NX2_DRAWX_TWIN: as well (shader changes are looked up here).
+            if (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) {
                 prelooked_pipeline = current;
             }
             return current;
@@ -576,11 +577,12 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             current = lookup();
             same = current == draw.pipeline;
         }
-        // EDEN_NX2_DRAWX_TWIN: another pipeline object with exactly the same bindings (only the
-        // vertex input specialization or fixed-function state differs) goes on with the delta.
+        // EDEN_NX2_DRAWX_TWIN: another pipeline object that keeps the same image state (only the
+        // vertex input specialization, fixed-function state or an imageless stage's program
+        // differs) goes on with the delta.
         if (!same && FastDraw::g_drawx_twin && !serial_changed && current != nullptr &&
             current->IsBuilt() && (!layout || current->HasDynamicVertexInput()) &&
-            current->SameBindingsAs(*draw.pipeline)) {
+            current->KeepsImageStateOf(*draw.pipeline)) {
             current->TakeDeltaState(*draw.pipeline);
             twin_source = draw.pipeline;
             draw.pipeline = current;
@@ -1344,8 +1346,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
     // EDEN_NX2_DRAW_REUSE: the pipeline TakeReusableDraw looked up this draw, if any.
     GraphicsPipeline* const prelooked =
-        FastDraw::g_draw_reuse && fast_draw_on ? std::exchange(prelooked_pipeline, nullptr)
-                                               : nullptr;
+        (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) && fast_draw_on
+            ? std::exchange(prelooked_pipeline, nullptr)
+            : nullptr;
     // EDEN_NX2_FAST_DRAW_VERIFY: resolve in full and compare with what the delta path keeps.
     GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
     GraphicsPipeline* const pipeline{delta_pipeline && !verify_pipeline ? delta_pipeline : [&] {

@@ -386,14 +386,15 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
-    /// EDEN_NX2_DRAWX_TWIN: whether `other` resolves exactly the bindings this pipeline resolves:
-    /// the same configure specialization (stages) and the same interned stage infos, so the same
-    /// descriptors, handle programs and stage properties (GraphicsStageInfoPool shares an info
-    /// only between programs whose retained properties and descriptors all match).
-    [[nodiscard]] bool SameBindingsAs(const GraphicsPipeline& other) const noexcept {
-        return configure_func == other.configure_func && stage_infos == other.stage_infos;
-    }
-    /// EDEN_NX2_DRAWX_TWIN: takes what the last captured resolve of `source` (SameBindingsAs)
+    /// EDEN_NX2_DRAWX_TWIN: whether a delta draw with this pipeline may keep what a resolve with
+    /// `other` kept: the same configure specialization (stages), no delta blocker, and per stage
+    /// the same interned stage info (GraphicsStageInfoPool shares an info only between programs
+    /// whose retained properties, descriptors and handle programs all match) or, on both sides,
+    /// one without texture, image, texture buffer or image buffer descriptors: such a stage adds
+    /// no view, sampler, handle, image descriptor or rescaling bit to what a resolve keeps, and a
+    /// delta draw binds its uniform and storage buffers from this pipeline's own infos.
+    [[nodiscard]] bool KeepsImageStateOf(const GraphicsPipeline& other) const noexcept;
+    /// EDEN_NX2_DRAWX_TWIN: takes what the last captured resolve of `source` (KeepsImageStateOf)
     /// kept for delta draws: views, samplers, image descriptors, rescaling words, handles.
     void TakeDeltaState(const GraphicsPipeline& source);
 
