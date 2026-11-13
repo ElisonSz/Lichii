@@ -18,6 +18,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_tested.h"
 
 /// Track C (EDEN_NX2_CFG_*): work in draw preparation that repeats although its inputs did not
 /// change. Every switch is off by default, read once by VideoCore::CreateGPU.
@@ -307,12 +308,12 @@ template <typename Translate>
 
 /// Called by VideoCore::CreateGPU, before the caches exist.
 inline void ReadSwitches() {
-    g_touch = ReadFlag("EDEN_NX2_CFG_TOUCH");
-    g_lookup = ReadFlag("EDEN_NX2_CFG_LOOKUP");
-    g_ssbo = ReadFlag("EDEN_NX2_CFG_SSBO");
+    g_touch = Nx2Tested::On("EDEN_NX2_CFG_TOUCH");
+    g_lookup = Nx2Tested::On("EDEN_NX2_CFG_LOOKUP");
+    g_ssbo = Nx2Tested::On("EDEN_NX2_CFG_SSBO");
     g_bank_stats = ReadFlag("EDEN_NX2_CFG_BANK_STATS");
-    g_tic = ReadFlag("EDEN_NX2_CFG_TIC");
-    g_vertex = ReadFlag("EDEN_NX2_CFG_VERTEX");
+    g_tic = Nx2Tested::On("EDEN_NX2_CFG_TIC");
+    g_vertex = Nx2Tested::On("EDEN_NX2_CFG_VERTEX");
     g_cbuf = ReadFlag("EDEN_NX2_CFG_CBUF");
     g_verify = ReadFlag("EDEN_NX2_CFG_VERIFY");
     g_any =

@@ -148,6 +148,8 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_protect.cpp
     nx2_protect.h
+    nx2_tested.cpp
+    nx2_tested.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h

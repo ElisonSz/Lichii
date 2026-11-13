@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <optional>
 
+#include "video_core/nx2_tested.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_churn.h"
 #include "video_core/texture_cache/util.h"
@@ -19,8 +20,8 @@ inline void ReadSwitches() {
         const char* const value = std::getenv(name);
         return value != nullptr && value[0] == '1';
     };
-    reuse_metadata = enabled("EDEN_NX2_IMAGES_JOIN");
-    sparse_check = enabled("EDEN_NX2_IMAGES_SPARSE_CHECK");
+    reuse_metadata = Nx2Tested::On("EDEN_NX2_IMAGES_JOIN");
+    sparse_check = Nx2Tested::On("EDEN_NX2_IMAGES_SPARSE_CHECK");
     verify = enabled("EDEN_NX2_IMAGES_JOIN_VERIFY");
     stats_enabled = enabled("EDEN_NX2_IMAGES_STATS") || verify;
     counters = {};

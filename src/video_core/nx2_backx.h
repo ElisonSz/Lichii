@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_tested.h"
 
 /// The GPU back thread's work outside draw preparation (EDEN_NX2_BACKX_*): locks and passes the
 /// base takes where an exact check without the lock shows they would change nothing. Guest CPU
@@ -295,14 +296,14 @@ std::size_t ForEachLockedInChunks(const Items& items, Mutex& mutex, Func&& func)
 
 /// Called by VideoCore::CreateGPU, before the caches exist.
 inline void ReadSwitches() {
-    g_inline = ReadFlag("EDEN_NX2_BACKX_INLINE");
-    g_report = ReadFlag("EDEN_NX2_BACKX_REPORT");
-    g_gather = ReadFlag("EDEN_NX2_BACKX_GATHER");
+    g_inline = Nx2Tested::On("EDEN_NX2_BACKX_INLINE");
+    g_report = Nx2Tested::On("EDEN_NX2_BACKX_REPORT");
+    g_gather = Nx2Tested::On("EDEN_NX2_BACKX_GATHER");
     g_collect_split = ReadFlag("EDEN_NX2_BACKX_COLLECT_SPLIT");
-    g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
-    g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
-    g_ops = ReadFlag("EDEN_NX2_BACKX_OPS");
-    g_flush = ReadFlag("EDEN_NX2_BACKX_FLUSH");
+    g_tick = Nx2Tested::On("EDEN_NX2_BACKX_TICK");
+    g_apply = Nx2Tested::On("EDEN_NX2_BACKX_APPLY");
+    g_ops = Nx2Tested::On("EDEN_NX2_BACKX_OPS");
+    g_flush = Nx2Tested::On("EDEN_NX2_BACKX_FLUSH");
     g_submit_draws = 0;
     if (const char* value = std::getenv("EDEN_NX2_BACKX_SUBMIT_DRAWS")) {
         const unsigned long parsed = std::strtoul(value, nullptr, 10);

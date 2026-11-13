@@ -20,6 +20,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_tested.h"
 
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -81,8 +82,8 @@ inline void Count(Counter counter, u64 amount = 1) {
 
 /// Called by VideoCore::CreateGPU, before the GPU threads start.
 inline void ReadSwitches() {
-    g_batch = ReadFlag("EDEN_NX2_MACRO_BATCH");
-    g_fastcall = ReadFlag("EDEN_NX2_MACRO_FASTCALL");
+    g_batch = Nx2Tested::On("EDEN_NX2_MACRO_BATCH");
+    g_fastcall = Nx2Tested::On("EDEN_NX2_MACRO_FASTCALL");
     g_verify_every = 0;
     if (const char* value = std::getenv("EDEN_NX2_MACRO_VERIFY")) {
         const unsigned long parsed = std::strtoul(value, nullptr, 10);

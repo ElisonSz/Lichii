@@ -9,6 +9,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_tested.h"
 
 namespace VideoCommon::Nx2FastDraw {
 
@@ -17,14 +18,14 @@ void ReadDrawReuseSwitches() {
         const char* const value = std::getenv(name);
         return value != nullptr && value[0] == '1';
     };
-    g_draw_reuse = on("EDEN_NX2_DRAW_REUSE");
+    g_draw_reuse = Nx2Tested::On("EDEN_NX2_DRAW_REUSE");
     g_draw_reuse_verify = g_draw_reuse && on("EDEN_NX2_DRAW_REUSE_VERIFY");
     if (g_draw_reuse) {
         g_draw_delta = true;
         g_draw_delta_verify = g_draw_delta_verify || g_draw_reuse_verify;
     }
-    g_draw_vertex_input = on("EDEN_NX2_DRAW_VERTEX_INPUT");
-    g_draw_handle_eval = on("EDEN_NX2_DRAW_HANDLE_EVAL");
+    g_draw_vertex_input = Nx2Tested::On("EDEN_NX2_DRAW_VERTEX_INPUT");
+    g_draw_handle_eval = Nx2Tested::On("EDEN_NX2_DRAW_HANDLE_EVAL");
     Shader::g_lean_handle_programs = g_draw_handle_eval;
 }
 
@@ -33,21 +34,21 @@ void ReadDrawXSwitches() {
         const char* const value = std::getenv(name);
         return value != nullptr && value[0] == '1';
     };
-    g_drawx_neutral = on("EDEN_NX2_DRAWX_NEUTRAL");
-    g_drawx_pipestate = on("EDEN_NX2_DRAWX_PIPESTATE");
-    g_drawx_uniforms = on("EDEN_NX2_DRAWX_UNIFORMS");
-    g_drawx_twin = on("EDEN_NX2_DRAWX_TWIN");
+    g_drawx_neutral = Nx2Tested::On("EDEN_NX2_DRAWX_NEUTRAL");
+    g_drawx_pipestate = Nx2Tested::On("EDEN_NX2_DRAWX_PIPESTATE");
+    g_drawx_uniforms = Nx2Tested::On("EDEN_NX2_DRAWX_UNIFORMS");
+    g_drawx_twin = Nx2Tested::On("EDEN_NX2_DRAWX_TWIN");
     g_drawx_verify = on("EDEN_NX2_DRAWX_VERIFY");
     g_drawx_keep_audit = g_drawx_verify || on("EDEN_NX2_DRAWX_KEEP_AUDIT");
     g_drawx_no_keeps = on("EDEN_NX2_DRAWX_NO_KEEPS");
     g_drawx_coalesce = on("EDEN_NX2_DRAWX_COALESCE");
     g_drawx_coalesce_verify = g_drawx_coalesce && on("EDEN_NX2_DRAWX_COALESCE_VERIFY");
-    g_drawx_dynstate = on("EDEN_NX2_DRAWX_DYNSTATE");
-    g_drawx_twin2 = on("EDEN_NX2_DRAWX_TWIN2");
+    g_drawx_dynstate = Nx2Tested::On("EDEN_NX2_DRAWX_DYNSTATE");
+    g_drawx_twin2 = Nx2Tested::On("EDEN_NX2_DRAWX_TWIN2");
     g_drawx_twin = g_drawx_twin || g_drawx_twin2;
     // The calls' neutrality leans on REUSE's checks of the writes the caches heard of (texture
     // headers, handle inputs), which the plain delta path does not make.
-    g_drawx_calls = on("EDEN_NX2_DRAWX_CALLS") && g_draw_reuse;
+    g_drawx_calls = Nx2Tested::On("EDEN_NX2_DRAWX_CALLS") && g_draw_reuse;
     g_drawx_calls2 = on("EDEN_NX2_DRAWX_CALLS2") && g_draw_reuse;
     g_drawx_clears = on("EDEN_NX2_DRAWX_CLEARS");
     g_drawx_clip = on("EDEN_NX2_DRAWX_CLIP");
@@ -79,7 +80,7 @@ void ReadDrawXSwitches() {
                  g_drawx_dynstate, g_drawx_twin2, g_drawx_calls, g_drawx_calls2, g_drawx_clears,
                  g_drawx_clip, Nx2CallSites::g_enabled);
     }
-    if (on("EDEN_NX2_DRAWX_CALLS") && !g_draw_reuse) {
+    if (Nx2Tested::On("EDEN_NX2_DRAWX_CALLS") && !g_draw_reuse) {
         LOG_WARNING(HW_GPU, "EDEN_NX2_DRAWX_CALLS needs EDEN_NX2_DRAW_REUSE=1: left off");
     }
     if (on("EDEN_NX2_DRAWX_CALLS2") && !g_draw_reuse) {

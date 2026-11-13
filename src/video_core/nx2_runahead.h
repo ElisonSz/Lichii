@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "common/common_types.h"
+#include "video_core/nx2_tested.h"
 
 // EDEN_NX2_RUNAHEAD=1: the split GPU thread's front stays ahead of its back where the baseline
 // makes it wait for writes that cannot reach the word it acquires.
@@ -88,6 +89,12 @@ inline bool qmd{};
 /// first of them ran (FrontQmdView::ReadDescriptor, KeptUpload::prior).
 inline bool qmd_patch{};
 
+/// As SwitchIs(name, '1'), but unset it is on in the tested title (Nx2Tested).
+[[nodiscard]] inline bool TestedSwitch(const char* name) {
+    const char* const set = std::getenv(name);
+    return set != nullptr ? set[0] == '1' && set[1] == '\0' : Nx2Tested::TestedTitle();
+}
+
 [[nodiscard]] inline bool SwitchIs(const char* name, char value) {
     const char* const set = std::getenv(name);
     return set != nullptr && set[0] == value && set[1] == '\0';
@@ -96,18 +103,18 @@ inline bool qmd_patch{};
 inline void ReadSwitch() {
     verify = SwitchIs("EDEN_NX2_RUNAHEAD_VERIFY", '1');
     qmd = SwitchIs("EDEN_NX2_RUNAHEAD_QMD", '1');
-    qmd_patch = SwitchIs("EDEN_NX2_RUNAHEAD_QMD_PATCH", '1');
-    window_base = SwitchIs("EDEN_NX2_RUNAHEAD_WINDOW_BASE", '1');
+    qmd_patch = TestedSwitch("EDEN_NX2_RUNAHEAD_QMD_PATCH");
+    window_base = TestedSwitch("EDEN_NX2_RUNAHEAD_WINDOW_BASE");
     // The QMD view's exact targets come from the write log the reach keeps; kept uploads need it,
     // and so do window bases (and the QMD signals the view could not value).
-    enabled = verify || qmd || qmd_patch || window_base || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
+    enabled = verify || qmd || qmd_patch || window_base || TestedSwitch("EDEN_NX2_RUNAHEAD");
     valve_verify = SwitchIs("EDEN_NX2_RUNAHEAD_VALVE_VERIFY", '1');
     valve = valve_verify || SwitchIs("EDEN_NX2_RUNAHEAD_VALVE", '1');
     w1_verify = SwitchIs("EDEN_NX2_RUNAHEAD_W1_VERIFY", '1');
     w1 = w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_W1", '1');
     landings_verify = SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY", '1');
-    landings = landings_verify || SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS", '1');
-    w1_max = SwitchIs("EDEN_NX2_RUNAHEAD_W1_MAX", '1');
+    landings = landings_verify || TestedSwitch("EDEN_NX2_RUNAHEAD_LANDINGS");
+    w1_max = TestedSwitch("EDEN_NX2_RUNAHEAD_W1_MAX");
     stats = (enabled || valve || w1 || landings) &&
             (verify || valve_verify || w1_verify || landings_verify ||
              SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));

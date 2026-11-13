@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "common/common_types.h"
+#include "video_core/nx2_tested.h"
 
 // EDEN_NX2_SYNC_SUSPEND=1: a Switch 2 semaphore acquire that the split's semaphore view could
 // decide only once the back has run the entry of a fence-flagged release to its word (the
@@ -36,8 +37,10 @@ inline bool enabled{};
 inline bool relaxed{};
 
 inline void ReadSwitch() {
+    // Unset, =1 in the tested title (Nx2Tested); =2 stays a measurement.
     const char* const value = std::getenv("EDEN_NX2_SYNC_SUSPEND");
-    const bool one = value != nullptr && value[0] == '1' && value[1] == '\0';
+    const bool one =
+        value != nullptr ? value[0] == '1' && value[1] == '\0' : Nx2Tested::TestedTitle();
     const bool two = value != nullptr && value[0] == '2' && value[1] == '\0';
     enabled = one || two;
     relaxed = two;

@@ -15,6 +15,7 @@
 
 #include "common/logging.h"
 #include "video_core/nx2_protect.h"
+#include "video_core/nx2_tested.h"
 
 namespace VideoCommon::Nx2Protect {
 
@@ -335,7 +336,7 @@ void ReadSwitch() {
         return value != nullptr && value[0] == '1';
     };
     g_stats = enabled("EDEN_NX2_PROTECT_STATS");
-    g_inline = enabled("EDEN_NX2_PROTECT_INLINE");
+    g_inline = Nx2Tested::On("EDEN_NX2_PROTECT_INLINE");
     if (g_stats) {
         std::scoped_lock lock{g_log_mutex};
         g_window_start = NowNs();
