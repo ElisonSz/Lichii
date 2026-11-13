@@ -322,6 +322,28 @@ public:
         }
     }
 
+    /// A mapped view: [lower, upper) of the virtual range and the backing offset at lower.
+    struct View {
+        size_t lower;
+        size_t upper;
+        size_t backing;
+    };
+
+    /// The views mapped now, sorted by virtual offset. Copied under one hold of the lock, for
+    /// callers that look up many pages (TrimZeroPages).
+    std::vector<View> ViewSnapshot() {
+        std::scoped_lock lock{placeholder_mutex};
+        std::vector<View> views;
+        views.reserve(placeholders.iterative_size());
+        for (const auto& interval : placeholders) {
+            const auto host_pointer_it = placeholder_host_pointers.find(interval.lower());
+            if (host_pointer_it != placeholder_host_pointers.end()) {
+                views.push_back({interval.lower(), interval.upper(), host_pointer_it->second});
+            }
+        }
+        return views;
+    }
+
     /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
     std::optional<size_t> BackingOffset(size_t virtual_offset) {
         const bool map_stats = Nx2MapStats::Enabled();
@@ -1311,12 +1333,26 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             zero_bytes += PageAlignment;
         }
     }
+    // The views are looked up in one snapshot: a lookup per page under the placeholder lock took
+    // that lock about a million times a pass, against the guest's maps and the GPU's protects. A
+    // view that changes meanwhile costs at most a page leaving the working set, as below.
+    std::sort(view_pages.begin(), view_pages.end());
+    const auto views = view_pages.empty() ? std::vector<Impl::View>{} : impl->ViewSnapshot();
+    size_t view_index = 0;
     for (const uintptr_t page : view_pages) {
-        const auto offset = impl->BackingOffset(page - view_begin);
-        if (!offset || *offset >= backing_size) {
+        const size_t virtual_offset = page - view_begin;
+        while (view_index < views.size() && views[view_index].upper <= virtual_offset) {
+            ++view_index;
+        }
+        if (view_index == views.size() || virtual_offset < views[view_index].lower) {
             continue;
         }
-        const uintptr_t backing_page = backing_begin + *offset;
+        const size_t offset =
+            views[view_index].backing + (virtual_offset - views[view_index].lower);
+        if (offset >= backing_size) {
+            continue;
+        }
+        const uintptr_t backing_page = backing_begin + offset;
         if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
             trim.push_back(page);
             zero_bytes += PageAlignment;
