@@ -1374,6 +1374,24 @@ bool GraphicsPipeline::DeltaImagesChange() const noexcept {
     return texture_cache.SampledViewsChange(delta_views);
 }
 
+void GraphicsPipeline::TakeDeltaState(const GraphicsPipeline& source) {
+    // The same stage infos and specialization resolve the same views, samplers, image
+    // descriptors (all GENERAL-layout, in the same order) and rescaling words from the same
+    // handles: what source's last captured resolve kept is this pipeline's resolve of that draw.
+    delta_views.assign(source.delta_views.begin(), source.delta_views.end());
+    delta_samplers.assign(source.delta_samplers.begin(), source.delta_samplers.end());
+    delta_views_valid = source.delta_views_valid;
+    configured_stages = source.configured_stages;
+    kept_image_entries.assign(source.kept_image_entries.begin(), source.kept_image_entries.end());
+    kept_image_ranges = source.kept_image_ranges;
+    kept_rescaling = source.kept_rescaling;
+    kept_scale_epoch = source.kept_scale_epoch;
+    kept_images_valid = source.kept_images_valid;
+    delta_handles.assign(source.delta_handles.begin(), source.delta_handles.end());
+    delta_handles_valid = source.delta_handles_valid;
+    draw_delta_textures = source.draw_delta_textures;
+}
+
 bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     namespace Profile = VideoCommon::Nx2Profile;
     // ConfigureImpl without reading handles and resolving image views, samplers and texture

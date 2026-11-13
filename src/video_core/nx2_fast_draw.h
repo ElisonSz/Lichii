@@ -103,6 +103,11 @@ inline bool g_drawx_pipestate{};
 /// EDEN_NX2_DRAWX_UNIFORMS=1: uniform keeps (BufferCache::UniformRangeKept) also on full draws
 /// when nothing but register writes ended the delta chain since the previous draw (g_keep_serial).
 inline bool g_drawx_uniforms{};
+/// EDEN_NX2_DRAWX_TWIN=1: when the pipeline looked up again for a vertex layout or fixed-function
+/// change is another object that resolves exactly the same bindings (the same configure
+/// specialization and interned stage infos: descriptors, handle programs, properties), the
+/// delta draw goes on with it, taking what the previous pipeline's last resolve kept.
+inline bool g_drawx_twin{};
 /// EDEN_NX2_DRAWX_VERIFY=1: delta candidates are prepared in full and compared (as
 /// EDEN_NX2_FAST_DRAW_VERIFY), kept uniforms are compared with guest memory; counted per window.
 inline bool g_drawx_verify{};

@@ -386,6 +386,17 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
+    /// EDEN_NX2_DRAWX_TWIN: whether `other` resolves exactly the bindings this pipeline resolves:
+    /// the same configure specialization (stages) and the same interned stage infos, so the same
+    /// descriptors, handle programs and stage properties (GraphicsStageInfoPool shares an info
+    /// only between programs whose retained properties and descriptors all match).
+    [[nodiscard]] bool SameBindingsAs(const GraphicsPipeline& other) const noexcept {
+        return configure_func == other.configure_func && stage_infos == other.stage_infos;
+    }
+    /// EDEN_NX2_DRAWX_TWIN: takes what the last captured resolve of `source` (SameBindingsAs)
+    /// kept for delta draws: views, samplers, image descriptors, rescaling words, handles.
+    void TakeDeltaState(const GraphicsPipeline& source);
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };

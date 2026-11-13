@@ -544,11 +544,16 @@ private:
         u64 uniform_full_blocked{}; ///< Full draws without: a non-register break came first
         u64 uniform_full_kept{};    ///< Uniform buffers kept on those full draws
         u64 uniform_full_streamed{};
-        u64 verified{}; ///< Candidates a skipped break kept, prepared in full and compared
+        u64 twins{};      ///< Delta candidates that went on with a twin pipeline
+        u64 twin_delta{}; ///< ... and were drawn as delta draws
+        u64 verified{}; ///< Candidates a skipped break or a twin kept, prepared in full, compared
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
     } drawx_stats;
+    /// EDEN_NX2_DRAWX_TWIN: the pipeline the previous draw bound when TakeReusableDraw handed on
+    /// its delta state to a twin (taken_draw.pipeline), else null.
+    GraphicsPipeline* twin_source{};
     /// EDEN_NX2_DRAWX_UNIFORMS: Nx2FastDraw::g_keep_serial when the previous draw began binding
     /// uniforms (0: none since fast draws turned on).
     u64 drawx_keep_serial{};

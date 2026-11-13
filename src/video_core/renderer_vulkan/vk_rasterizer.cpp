@@ -494,10 +494,11 @@ void RasterizerVulkan::NoteStateChanged() {
 
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
-    const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
+    ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
     taken_delta = delta;
     matched_candidate = false;
+    twin_source = nullptr;
     if (FastDraw::g_draw_reuse) {
         prelooked_pipeline = nullptr;
     }
@@ -569,7 +570,24 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             return current;
         };
         const bool layout = delta.vertex_layout || (diagnostic && (delta.match_cases & 2U) != 0);
-        if ((layout && !draw.pipeline->HasDynamicVertexInput()) || lookup() != draw.pipeline) {
+        GraphicsPipeline* current{};
+        bool same = !(layout && !draw.pipeline->HasDynamicVertexInput());
+        if (same) {
+            current = lookup();
+            same = current == draw.pipeline;
+        }
+        // EDEN_NX2_DRAWX_TWIN: another pipeline object with exactly the same bindings (only the
+        // vertex input specialization or fixed-function state differs) goes on with the delta.
+        if (!same && FastDraw::g_drawx_twin && !serial_changed && current != nullptr &&
+            current->IsBuilt() && (!layout || current->HasDynamicVertexInput()) &&
+            current->SameBindingsAs(*draw.pipeline)) {
+            current->TakeDeltaState(*draw.pipeline);
+            twin_source = draw.pipeline;
+            draw.pipeline = current;
+            same = true;
+            ++drawx_stats.twins;
+        }
+        if (!same) {
             taken_break_classes |= FastDraw::ClassBit(layout ? FastDraw::BreakClass::VertexLayout
                                                              : FastDraw::BreakClass::FixedFunction);
             if (delta.pipeline_state && !layout) {
@@ -690,7 +708,9 @@ bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial, bool matching
                       {VideoCommon::Nx2FastDraw::Serial(), gpu_memory->MapSerial(),
                        scheduler.CurrentTick(), scheduler.RenderPassSerial()},
                       scheduler.IsRenderPassActive(),
-                      scheduler.BoundGraphicsPipeline() == taken_draw.pipeline);
+                      // EDEN_NX2_DRAWX_TWIN: the previous draw bound the twin's source.
+                      scheduler.BoundGraphicsPipeline() ==
+                          (twin_source != nullptr ? twin_source : taken_draw.pipeline));
         switch (guard) {
         case VideoCommon::DrawDeltaGuardResult::State:
             return full(FullDraw::StateChanged);
@@ -839,19 +859,22 @@ void RasterizerVulkan::ReportFastDraws() {
         return;
     }
     if (VideoCommon::Nx2FastDraw::g_drawx_neutral || VideoCommon::Nx2FastDraw::g_drawx_pipestate ||
-        VideoCommon::Nx2FastDraw::g_drawx_uniforms || VideoCommon::Nx2FastDraw::g_drawx_verify) {
+        VideoCommon::Nx2FastDraw::g_drawx_uniforms || VideoCommon::Nx2FastDraw::g_drawx_twin ||
+        VideoCommon::Nx2FastDraw::g_drawx_verify) {
         // Track D, every window the switches are on (cost stats or not).
         const double window = static_cast<double>(now - stats.window_start) / 1e9;
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
         const DrawXStats& drawx = drawx_stats;
         LOG_INFO(Render_Vulkan,
                  "DrawX window: {:.1f} s | converted delta draws/s={:.0f} | pipeline state "
-                 "candidates/s same={:.0f} other={:.0f} | uniform keeps on full draws/s={:.0f} "
+                 "candidates/s same={:.0f} other={:.0f} | twins/s={:.0f} drawn as delta={:.0f} | "
+                 "uniform keeps on full draws/s={:.0f} "
                  "blocked/s={:.0f} kept={} streamed={} ({:.2f} kept per draw) | verify "
                  "candidates={} pipeline_mismatches={} view_mismatches={} binding_mismatches={} | "
-                 "neutral={} pipestate={} uniforms={} verify={}",
+                 "neutral={} pipestate={} uniforms={} twin={} verify={}",
                  window, rate(drawx.converted), rate(drawx.pipeline_state_same),
-                 rate(drawx.pipeline_state_other), rate(drawx.uniform_full_draws),
+                 rate(drawx.pipeline_state_other), rate(drawx.twins), rate(drawx.twin_delta),
+                 rate(drawx.uniform_full_draws),
                  rate(drawx.uniform_full_blocked), drawx.uniform_full_kept,
                  drawx.uniform_full_streamed,
                  drawx.uniform_full_draws == 0
@@ -861,7 +884,8 @@ void RasterizerVulkan::ReportFastDraws() {
                  drawx.verified, drawx.pipeline_mismatches, drawx.view_mismatches,
                  drawx.binding_mismatches, VideoCommon::Nx2FastDraw::g_drawx_neutral,
                  VideoCommon::Nx2FastDraw::g_drawx_pipestate,
-                 VideoCommon::Nx2FastDraw::g_drawx_uniforms, VideoCommon::Nx2FastDraw::g_drawx_verify);
+                 VideoCommon::Nx2FastDraw::g_drawx_uniforms, VideoCommon::Nx2FastDraw::g_drawx_twin,
+                 VideoCommon::Nx2FastDraw::g_drawx_verify);
         drawx_stats = {};
     }
     // Report preparation costs without GPU_PROFILE selecting the slower Maxwell method path.
@@ -1546,8 +1570,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                !FastDraw::g_draw_delta &&
                                DeltaStillHolds(draw_serial, draw_map_serial, true);
     // Track D: a delta candidate only because a break was skipped (EDEN_NX2_DRAWX_NEUTRAL,
-    // _PIPESTATE); under verify it is prepared in full and compared like any candidate.
-    const bool drawx_candidate = delta_holds && taken_delta.drawx_skipped;
+    // _PIPESTATE) or a twin took the delta state (_TWIN); under verify it is prepared in full and
+    // compared like any candidate.
+    const bool drawx_candidate =
+        delta_holds && (taken_delta.drawx_skipped || twin_source != nullptr);
     if (drawx_candidate && verify_pipeline != nullptr) {
         ++drawx_stats.verified;
         drawx_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
@@ -1590,7 +1616,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             return;
         }
         ++fast_draw_stats.delta;
-        drawx_stats.converted += taken_delta.drawx_skipped ? 1 : 0;
+        drawx_stats.converted += drawx_candidate ? 1 : 0;
+        drawx_stats.twin_delta += twin_source != nullptr ? 1 : 0;
     } else {
         // What the delta draw would have kept: the texture buffer bindings.
         const u64 kept_bindings =
