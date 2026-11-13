@@ -106,11 +106,14 @@ TEST_CASE("Join metadata preserves ordered overlap decisions across expanding jo
             const auto actual =
                 ImageJoin::Classify(metadata, info, gpu_address, cpu_address, overlap, false, true);
             REQUIRE(actual == Original(info, gpu_address, cpu_address, overlap));
+            REQUIRE(ImageJoin::Verify(actual, info, gpu_address, cpu_address, overlap, false,
+                                      true) == actual);
             ++relations[static_cast<size_t>(actual)];
         }
     }
     REQUIRE(resolves > 1000);
     REQUIRE(relations[static_cast<size_t>(Relation::BadOverlap)] > 1000);
+    REQUIRE(ImageJoin::counters.mismatches == 0);
 }
 
 TEST_CASE("Join metadata handles both alias directions after a failed strict resolve",
@@ -145,4 +148,32 @@ TEST_CASE("Non-sparse creation skips only a discarded continuity query",
             }
         }
     }
+}
+
+TEST_CASE("Retirement diagnostics distinguish same address from same storage",
+          "[video_core][texture_cache]") {
+    const auto info = MakeInfo(128, 128, 1, 1, 2);
+    ImageBase retired(info, 0x100000, 0x200000);
+    ImageJoin::RetirementHistory history;
+    history.Retire(retired, 100);
+    REQUIRE_FALSE(history.Take(0x300000));
+    const auto previous = history.Take(retired.gpu_addr);
+    REQUIRE(previous);
+    REQUIRE(previous->frame == 100);
+    REQUIRE(ImageJoin::RetirementHistory::SameShape(*previous, info, retired.cpu_addr));
+    REQUIRE_FALSE(history.Take(retired.gpu_addr));
+    auto changed = info;
+    changed.size.width += 1;
+    REQUIRE_FALSE(ImageJoin::RetirementHistory::SameShape(*previous, changed, retired.cpu_addr));
+    changed = info;
+    changed.resources.layers += 1;
+    REQUIRE_FALSE(ImageJoin::RetirementHistory::SameShape(*previous, changed, retired.cpu_addr));
+    REQUIRE_FALSE(
+        ImageJoin::RetirementHistory::SameShape(*previous, info, retired.cpu_addr + 4096));
+    for (size_t index = 0; index <= ImageJoin::RetirementHistory::Capacity; ++index) {
+        retired.gpu_addr = 0x100000 + index * 4096;
+        history.Retire(retired, index);
+    }
+    REQUIRE_FALSE(history.Take(0x100000));
+    REQUIRE(history.Take(retired.gpu_addr));
 }

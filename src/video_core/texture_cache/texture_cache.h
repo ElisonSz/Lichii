@@ -463,6 +463,7 @@ void TextureCache<P>::RetireStaleTargets() {
     const auto retire = [&](ImageId image_id) {
         Image& image = slot_images[image_id];
         ++trace_stale_aged;
+        ImageJoin::Retired(image, frame_tick);
         trace_stale_aged_bytes += image.guest_size_bytes;
         MarkStale(image); // before UntrackImage (see MarkStale)
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -495,6 +496,9 @@ void TextureCache<P>::RetireStaleTargets() {
         retire(image_id);
         for (const ImageId partner_id : partners) {
             ++trace_stale_aged_partners;
+            if (ImageJoin::stats_enabled) {
+                ++ImageJoin::counters.retire_partners;
+            }
             retire(partner_id);
         }
     }
@@ -3229,7 +3233,12 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
+    const u64 birth_before = stale_birth;
     const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
+    if (ImageJoin::stats_enabled) {
+        ++(stale_birth == birth_before ? ImageJoin::counters.views_kept_image
+                                      : ImageJoin::counters.views_new_image);
+    }
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
     }
@@ -3715,8 +3724,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return;
         }
         if (ImageJoin::reuse_metadata) {
-            const auto relation = ImageJoin::Classify(join_metadata, new_info, gpu_addr, cpu_addr,
-                                                       overlap, broken_views, native_bgr);
+            auto relation = ImageJoin::Classify(join_metadata, new_info, gpu_addr, cpu_addr,
+                                                overlap, broken_views, native_bgr);
+            if (ImageJoin::verify) {
+                relation = ImageJoin::Verify(relation, new_info, gpu_addr, cpu_addr, overlap,
+                                             broken_views, native_bgr);
+            }
             switch (relation) {
             case ImageJoin::Relation::LeftAlias:
                 join_left_aliased_ids.push_back(overlap_id);
@@ -3844,6 +3857,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    if (ImageJoin::stats_enabled) {
+        ImageJoin::counters.resolved += join_overlap_ids.size();
+        ImageJoin::counters.left_alias += join_left_aliased_ids.size();
+        ImageJoin::counters.right_alias += join_right_aliased_ids.size();
+        ImageJoin::counters.bad_overlap += join_bad_overlap_ids.size();
+        ImageJoin::counters.ignored += join_ignore_textures.size();
+        ImageJoin::counters.sparse_queries_skipped +=
+            ImageJoin::sparse_check && !new_info.is_sparse ? 1U : 0U;
+        ImageJoin::Created(new_image, trace_origin, frame_tick, StaleTargets::retire_age);
+    }
 
     TextureCacheOperations::Created(*this, new_image,
                                     std::string_view{trace_origin} == "render-target" ||
@@ -4797,6 +4820,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    if (ImageJoin::stats_enabled) {
+        ++ImageJoin::counters.deleted;
+    }
     if (mem_trace_enabled) {
         ++trace_deleted;
     }
