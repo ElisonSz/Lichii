@@ -427,8 +427,10 @@ struct Delta {
     u32 num_device_writes{};
     bool vertex_layout{}; ///< Requires a fresh pipeline lookup, then dynamic vertex input.
     /// EDEN_NX2_DRAWX_PIPESTATE: a fixed-function register changed; requires a fresh pipeline
-    /// lookup that selects the same pipeline object.
+    /// lookup that selects the same pipeline object (or a twin, EDEN_NX2_DRAWX_TWIN).
     bool pipeline_state{};
+    /// EDEN_NX2_DRAWX_TWIN: of those, a shader program register (statistics only).
+    bool shader_state{};
     /// EDEN_NX2_DRAWX_NEUTRAL / _PIPESTATE: a write that ends the chain without the switches did
     /// not (statistics and verify attribution only).
     bool drawx_skipped{};

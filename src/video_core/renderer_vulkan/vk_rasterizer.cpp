@@ -591,8 +591,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             ++drawx_stats.twins;
         }
         if (!same) {
-            taken_break_classes |= FastDraw::ClassBit(layout ? FastDraw::BreakClass::VertexLayout
-                                                             : FastDraw::BreakClass::FixedFunction);
+            taken_break_classes |= FastDraw::ClassBit(
+                layout               ? FastDraw::BreakClass::VertexLayout
+                : delta.shader_state ? FastDraw::BreakClass::Shader
+                                     : FastDraw::BreakClass::FixedFunction);
             if (delta.pipeline_state && !layout) {
                 ++drawx_stats.pipeline_state_other;
             }
@@ -871,8 +873,9 @@ void RasterizerVulkan::ReportFastDraws() {
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
         const DrawXStats& drawx = drawx_stats;
         LOG_INFO(Render_Vulkan,
-                 "DrawX window: {:.1f} s | converted delta draws/s={:.0f} | pipeline state "
-                 "candidates/s same={:.0f} other={:.0f} | twins/s={:.0f} drawn as delta={:.0f} | "
+                 "DrawX window: {:.1f} s | converted delta draws/s={:.0f} | fixed-function or "
+                 "shader re-lookups/s same={:.0f} other={:.0f} | twins/s={:.0f} drawn as "
+                 "delta={:.0f} | "
                  "uniform keeps on full draws/s={:.0f} "
                  "blocked/s={:.0f} kept={} streamed={} ({:.2f} kept per draw) | verify "
                  "candidates={} pipeline_mismatches={} view_mismatches={} binding_mismatches={} | "

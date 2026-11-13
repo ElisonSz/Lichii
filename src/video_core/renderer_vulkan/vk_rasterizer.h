@@ -538,7 +538,7 @@ private:
     /// Track D (EDEN_NX2_DRAWX_*), logged with the fast draw windows.
     struct DrawXStats {
         u64 converted{};            ///< Delta draws whose chain a skipped break kept
-        u64 pipeline_state_same{};  ///< Fixed-function candidates: same pipeline looked up
+        u64 pipeline_state_same{};  ///< Fixed-function/shader re-lookups: same pipeline or twin
         u64 pipeline_state_other{}; ///< ... another pipeline (full resolve)
         u64 uniform_full_draws{};   ///< Full draws taking uniform keeps
         u64 uniform_full_blocked{}; ///< Full draws without: a non-register break came first

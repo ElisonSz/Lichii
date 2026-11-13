@@ -3306,8 +3306,12 @@ private:
                 FastDraw::g_delta.drawx_skipped = true;
                 return true;
             case FastDraw::DrawXRegister::PipelineState:
+                FastDraw::g_delta.pipeline_state = true;
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
             case FastDraw::DrawXRegister::Shader:
                 FastDraw::g_delta.pipeline_state = true;
+                FastDraw::g_delta.shader_state = true;
                 FastDraw::g_delta.drawx_skipped = true;
                 return true;
             case FastDraw::DrawXRegister::Breaks:
