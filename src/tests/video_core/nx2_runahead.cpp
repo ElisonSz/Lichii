@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -49,6 +52,58 @@ struct RunAheadTestAccess {
     }
     static u64 MaxPages() {
         return GpuSplit::MaxWatchedPages;
+    }
+    /// The fenced writes of the entries before `position` landed.
+    static void Land(GpuSplit& split, u64 position) {
+        split.fenced_landed.store(split.EntryTag(position), std::memory_order_release);
+    }
+    /// The hashed granule sets' answer for device memory (MemoryWritesTarget's, one piece).
+    static u64 GranuleTarget(const GpuSplit& split, u64 device, u64 size) {
+        return (std::max)(split.last_unplaced_write, split.DeviceWritesTarget(device, size));
+    }
+    static size_t GranuleSet(u64 device) {
+        return GpuSplit::WriteSlot(device >> GpuSplit::WriteGranuleBits);
+    }
+    /// As MaybeStart's ring, without a back thread (entries are run by hand, RunEntry).
+    static void StartRing(GpuSplit& split) {
+        split.ring = std::make_unique<u64[]>(GpuSplit::RingWords);
+        split.active = true;
+    }
+    static void StopRing(GpuSplit& split) {
+        split.active = false;
+        split.ring.reset();
+    }
+    static u64 WritePosition(const GpuSplit& split) {
+        return split.write_position;
+    }
+    static u64 LastEntry(const GpuSplit& split) {
+        return split.last_entry_start;
+    }
+    /// Runs the deferred call sent at `position` as the back does (Execute's Kind::Call).
+    static bool RunEntry(GpuSplit& split, u64 position) {
+        split.back_entry_start = position;
+        const u64* const entry = &split.ring[position & GpuSplit::RingMask];
+        if ((entry[0] & 0xf) != static_cast<u64>(GpuSplit::Kind::Call) ||
+            (entry[0] & GpuSplit::FastDrawNeutral) == 0) {
+            return false;
+        }
+        reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+        return true;
+    }
+    /// The back registered a report of the entry at `position` that lands once its fence ran.
+    static void PendFenced(GpuSplit& split, u64 position) {
+        std::scoped_lock lock{split.fenced_entries_mutex};
+        split.fenced_entries.push_back({split.EntryTag(position)});
+    }
+    /// Its fence ran (a fence thread).
+    static void CompleteFenced(GpuSplit& split, u64 position) {
+        split.CompleteFencedEntry(split.EntryTag(position));
+    }
+    static u64 Tag(const GpuSplit& split, u64 position) {
+        return split.EntryTag(position);
+    }
+    static bool Landed(const GpuSplit& split, u64 position) {
+        return split.fenced_landed.load(std::memory_order_acquire) > split.EntryTag(position);
     }
 };
 } // namespace VideoCommon
@@ -483,4 +538,213 @@ TEST_CASE("Run-ahead model: reach decisions match the baseline after its wait",
     CHECK(sooner > 10);
 }
 
+// Round 2: W1 passes, exact QMD placement.
+
+using W1 = RunAhead::W1;
+
+TEST_CASE("Run-ahead W1 decisions", "[video_core][runahead]") {
+    Fixture f;
+    const auto equals = [](u32 target) { return [target](u32 value) { return value == target; }; };
+    const auto unknown_at = [](u64 position) {
+        return Split::SemaphoreView{ViewKind::Unknown, position, true};
+    };
+    std::optional<Split::QueuedSemaphoreWrite> release;
+    // A fence-flagged report with a known payload: the acquire's view waits for its entry.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 7, true, Split::Landing::Fenced);
+    const u64 report = f.split->Position();
+    Access::Send(*f.split, 2);
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, equals(7), &release) ==
+          W1::Pass);
+    REQUIRE(release.has_value());
+    CHECK(release->payload == 7);
+    CHECK(release->position == report);
+    // Not met by its payload, no waiter slot, another position, a wait for writers.
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, equals(8), nullptr) ==
+          W1::Unmet);
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), false, equals(7), nullptr) ==
+          W1::Unlatched);
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report + 1), true, equals(7), nullptr) ==
+          W1::NotW1);
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::Unknown, report}, true,
+                             equals(7), nullptr) == W1::NotW1);
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::Met}, true, equals(7),
+                             nullptr) == W1::NotW1);
+    // Ran but not landed: memory does not meet it yet (NotMet); the release still decides.
+    Access::Consume(*f.split, f.split->Position());
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, equals(7),
+                             nullptr) == W1::Pass);
+    // Landed: memory decides, as always.
+    Access::Land(*f.split, f.split->Position());
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, equals(7),
+                             nullptr) == W1::NotW1);
+    // A reduction or maximum, or a release behind a pending fenced one: the front can't tell.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 0, false, Split::Landing::Fenced);
+    const u64 reduction = f.split->Position();
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(reduction), true, equals(0), nullptr) ==
+          W1::NotPlain);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 4, 3, true, Split::Landing::Fenced);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 4, 5, true, Split::Landing::AtRun);
+    CHECK(f.split->W1Release(Fixture::Word + 4, Split::SemaphoreView{ViewKind::NotMet}, true,
+                             equals(5), nullptr) == W1::NotPlain);
+    // A release landing at run is not W1 (the view waits for its entry and memory decides).
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 8, 2, true, Split::Landing::AtRun);
+    CHECK(f.split->W1Release(Fixture::Word + 8, unknown_at(f.split->Position()), true, equals(2),
+                             nullptr) == W1::NotW1);
+}
+
+TEST_CASE("Run-ahead W1 passes where the release latches the baseline's waiter",
+          "[video_core][runahead]") {
+    // The baseline's acquire waits suspended with a registered waiter; the release, landing,
+    // latches it even when later writes (CPU, other releases) change the word again. Whenever
+    // W1Release lets the acquire go on, that landing latches it: the baseline goes on as well.
+    std::mt19937_64 random{0x1a7c};
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    u64 passes = 0;
+    for (u32 round = 0; round < 300; ++round) {
+        Fixture f;
+        const u64 device = Fixture::Word;
+        const u32 payload = static_cast<u32>(random() % 6);
+        const u32 target = static_cast<u32>(random() % 6);
+        const bool gequal = random() % 2 == 0;
+        const u32 operation = gequal ? Tegra::Nx2SemaphoreWaiters::AcquireGequal
+                                     : Tegra::Nx2SemaphoreWaiters::AcquireEqual;
+        Access::Send(*f.split, 4);
+        f.split->NoteSemaphoreWrite(device, payload, true, Split::Landing::Fenced);
+        const u64 report = f.split->Position();
+        Access::Send(*f.split, 2);
+        int owner = 0;
+        REQUIRE(waiters.Add(&owner, device, target, operation));
+        const auto matches = [&](u32 value) { return gequal ? value >= target : value == target; };
+        const W1 decision = f.split->W1Release(
+            device, Split::SemaphoreView{ViewKind::Unknown, report, true}, true, matches, nullptr);
+        // Writes before the landing that don't meet it, then the landing, then later writes.
+        for (u32 i = random() % 3; i > 0; --i) {
+            const u32 value = static_cast<u32>(random() % 6);
+            if (!matches(value)) {
+                waiters.OnWrite(device, value);
+            }
+        }
+        CHECK(!waiters.Latched(&owner));
+        waiters.OnWrite(device, payload); // The release lands
+        waiters.OnWrite(device, static_cast<u32>(random() % 6));
+        if (decision == W1::Pass) {
+            ++passes;
+            CHECK(waiters.Latched(&owner));
+        } else {
+            CHECK(decision == W1::Unmet);
+            CHECK(!matches(payload));
+        }
+        waiters.Remove(&owner);
+    }
+    CHECK(passes > 50);
+}
+
+TEST_CASE("Run-ahead exact placement of the writes a QMD read waits for",
+          "[video_core][runahead]") {
+    Fixture f;
+    constexpr u64 Qmd = 0x7000'0000; // A QMD's device address (256 bytes)
+    // First read of the page: writes sent before it were not logged.
+    Access::Send(*f.split, 4);
+    auto exact = f.split->LoggedWritesTarget(Qmd, 256);
+    REQUIRE(exact.has_value());
+    CHECK(*exact == f.split->Position());
+    Access::Consume(*f.split, f.split->Position());
+    // A write into the QMD, one next to it in the same page, and writes that evict the QMD's
+    // granule from its hashed 4-way set.
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Qmd + 0x40, 0x20);
+    const u64 into = f.split->Position();
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Qmd + 0x100, 0x100); // The next QMD
+    u64 evictions = 0;
+    for (u64 granule = 0x10000; evictions < 8; ++granule) {
+        const u64 device = granule << 8;
+        if (Access::GranuleSet(device) != Access::GranuleSet(Qmd)) {
+            continue;
+        }
+        Access::Send(*f.split, 2);
+        Access::Write(*f.split, device, 4); // Another page: not logged
+        ++evictions;
+    }
+    Access::Send(*f.split, 2);
+    exact = f.split->LoggedWritesTarget(Qmd, 256);
+    REQUIRE(exact.has_value());
+    CHECK(*exact == into);
+    // The granules answer with the latest position evicted from the set: a write elsewhere.
+    CHECK(Access::GranuleTarget(*f.split, Qmd, 256) > into);
+    // Once the back ran the write into it, nothing queued writes the QMD.
+    Access::Consume(*f.split, into);
+    exact = f.split->LoggedWritesTarget(Qmd, 256);
+    REQUIRE(exact.has_value());
+    CHECK(*exact <= into);
+    CHECK(f.split->Ran(*exact));
+    CHECK(!f.split->Ran(Access::GranuleTarget(*f.split, Qmd, 256)));
+    // A late placement (a QMD release valued late) at an earlier, unrun position counts.
+    Access::WriteAt(*f.split, Qmd + 0x80, 4, into + 2);
+    exact = f.split->LoggedWritesTarget(Qmd, 256);
+    REQUIRE(exact.has_value());
+    CHECK(*exact == into + 2);
+}
+
 } // namespace
+
+TEST_CASE("Run-ahead W1 hold: the back runs what follows once the release landed",
+          "[video_core][runahead]") {
+    Fixture f;
+    Access::StartRing(*f.split);
+    RunAhead::holds.waits.store(0);
+    // The fence-flagged release Q, in an entry the back ran: its report waits for its fence.
+    Access::Send(*f.split, 4);
+    const u64 q = Access::LastEntry(*f.split);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 7, true, Split::Landing::Fenced);
+    Access::PendFenced(*f.split, q);
+    // A release that lands at run, sent after it to the word: the word holds either until Q
+    // landed, so a hold on the word still waits for Q.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 8, true, Split::Landing::AtRun);
+    const auto entry = f.split->UnlandedFencedEntry(Fixture::Word);
+    REQUIRE(entry == Access::Tag(*f.split, q)); // Q's, not the later release's
+    const u64 hold = Access::WritePosition(*f.split);
+    f.split->HoldBackUntilLanded(*entry);
+    REQUIRE(Access::WritePosition(*f.split) > hold);
+    std::atomic<bool> done{false};
+    std::atomic<bool> ran{false};
+    std::thread back{[&] {
+        ran.store(Access::RunEntry(*f.split, hold));
+        done.store(true);
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds{30});
+    CHECK_FALSE(done.load()); // Sealed past Q, but Q's fence has not run
+    CHECK_FALSE(Access::Landed(*f.split, q));
+    Access::CompleteFenced(*f.split, q);
+    back.join();
+    CHECK(done.load());
+    CHECK(ran.load()); // A deferred call that leaves draws as they are
+    CHECK(Access::Landed(*f.split, q));
+    CHECK(RunAhead::holds.waits.load() == 1);
+    // Landed: nothing to hold for, nor for a word whose last release lands at run.
+    CHECK_FALSE(f.split->UnlandedFencedEntry(Fixture::Word).has_value());
+    f.split->NoteSemaphoreWrite(Fixture::Word + 0x10, 1, true, Split::Landing::AtRun);
+    CHECK_FALSE(f.split->UnlandedFencedEntry(Fixture::Word + 0x10).has_value());
+    // A hold whose release lands before the back reaches it does not wait.
+    Access::Send(*f.split, 4);
+    const u64 q2 = Access::LastEntry(*f.split);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 9, true, Split::Landing::Fenced);
+    Access::PendFenced(*f.split, q2);
+    const auto entry2 = f.split->UnlandedFencedEntry(Fixture::Word);
+    REQUIRE(entry2 == Access::Tag(*f.split, q2));
+    const u64 hold2 = Access::WritePosition(*f.split);
+    f.split->HoldBackUntilLanded(*entry2);
+    REQUIRE(Access::WritePosition(*f.split) > hold2);
+    Access::CompleteFenced(*f.split, q2); // Not sealed past it yet: not landed
+    CHECK_FALSE(Access::Landed(*f.split, q2));
+    CHECK(Access::RunEntry(*f.split, hold2)); // Seals: lands at once
+    CHECK(Access::Landed(*f.split, q2));
+    CHECK(RunAhead::holds.waits.load() == 1);
+    Access::StopRing(*f.split);
+}
