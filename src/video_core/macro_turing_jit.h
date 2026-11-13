@@ -53,7 +53,15 @@ public:
         bool (*emit)(State*, Word method, Word value);
         Word (*read)(State*, Word address);
         const std::vector<Word>* fifo;
+        /// Batch mode (ExecuteBatched): the writes emitted and not yet handed over, as (method,
+        /// value) pairs, and how many pairs fit.
+        Word* writes;
+        Word write_count;
+        Word write_limit;
     };
+
+    /// Batch mode: the (method, value) pairs a call can buffer before they are handed over.
+    static constexpr Word BatchCapacity = 256;
 
     enum Error : Word {
         None = 0,
@@ -126,6 +134,54 @@ public:
         return {false, state.fail_pc, state.consumed, ErrorText(error)};
     }
 
+    /// Batch mode (EDEN_NX2_MACRO_BATCH): as Prepare, for ExecuteBatched's own program.
+    void PrepareBatched(std::span<const Word> code, std::uint64_t generation) {
+        if (batch_program && generation == batch_generation) {
+            return;
+        }
+        batch_program = std::make_unique<Program>(code, true);
+        batch_generation = generation;
+    }
+
+    /// Execute with the same results, except that a write below method 0xe00 other than 0x157
+    /// and 0x158 (the MME DMA reads) is buffered in the generated code instead of emitted at
+    /// once: `flush` gets the buffered writes in order (a std::span<const Word> of method, value
+    /// pairs), always before the next `emit` or `read` call, when the buffer is full and when the
+    /// call ends, failed or not. For a caller whose `emit` returns true for those methods and
+    /// changes neither the FIFO nor the data RAM for them, and whose `flush` does what `emit`
+    /// does for each pair, the writes, reads and their order are the same as Execute's.
+    template <typename Read, typename Emit, typename Flush>
+    Result ExecuteBatched(Word start, std::vector<Word>& parameters, std::span<Word> data_ram,
+                          Read read, Emit emit, Flush flush) {
+        std::array<Word, BatchCapacity * 2> buffer;
+        State state;
+        state.regs.fill(0);
+        state.carry = state.method = state.increment = 0;
+        state.loop_count = state.loop_start = state.loop_end = 0;
+        state.consumed = 0;
+        state.fail_pc = 0;
+        state.end_next = state.stopped = state.cancel_end = 0;
+        state.start = start;
+        state.steps = 1000000;
+        state.params = parameters.data();
+        state.params_size = static_cast<Word>(parameters.size());
+        state.dram = data_ram.data();
+        state.fifo = &parameters;
+        state.writes = buffer.data();
+        state.write_count = 0;
+        state.write_limit = BatchCapacity;
+        BatchThunks<Read, Emit, Flush> thunks{read, emit, flush};
+        state.user = &thunks;
+        state.emit = &BatchThunks<Read, Emit, Flush>::CallEmit;
+        state.read = &BatchThunks<Read, Emit, Flush>::CallRead;
+        const Word error = batch_program->entry(&state);
+        BatchThunks<Read, Emit, Flush>::Flush(&state);
+        if (error == None) {
+            return {true, state.fail_pc, state.consumed, {}};
+        }
+        return {false, state.fail_pc, state.consumed, ErrorText(error)};
+    }
+
 private:
     template <typename Read, typename Emit>
     struct Thunks {
@@ -143,9 +199,40 @@ private:
         }
     };
 
+    /// Batch mode: the buffered writes go out before every call back into C++.
+    template <typename Read, typename Emit, typename FlushWrites>
+    struct BatchThunks {
+        Read& read;
+        Emit& emit;
+        FlushWrites& flush;
+        static void Flush(State* state) {
+            if (state->write_count == 0) {
+                return;
+            }
+            const std::span<const Word> writes{state->writes, std::size_t{state->write_count} * 2};
+            state->write_count = 0;
+            static_cast<BatchThunks*>(state->user)->flush(writes);
+            // As after an emit (the writes flushed append nothing to the FIFO, but cost nothing
+            // to reload).
+            state->params = state->fifo->data();
+            state->params_size = static_cast<Word>(state->fifo->size());
+        }
+        static bool CallEmit(State* state, Word method, Word value) {
+            Flush(state);
+            const bool ok = static_cast<BatchThunks*>(state->user)->emit(method, value);
+            state->params = state->fifo->data();
+            state->params_size = static_cast<Word>(state->fifo->size());
+            return ok;
+        }
+        static Word CallRead(State* state, Word address) {
+            Flush(state);
+            return static_cast<BatchThunks*>(state->user)->read(address);
+        }
+    };
+
     struct Program : Xbyak::CodeGenerator {
-        explicit Program(std::span<const Word> code)
-            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow) {
+        explicit Program(std::span<const Word> code, bool batch_ = false)
+            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow), batch{batch_} {
             Generate(code);
             ready();
             entry = getCode<Word (*)(State*)>();
@@ -154,6 +241,8 @@ private:
         Word (*entry)(State*) = nullptr;
 
     private:
+        /// Batch mode: writes are buffered (ExecuteBatched); otherwise the code is Execute's.
+        const bool batch;
         using Decoded = TuringMacroInterpreter::Decoded;
 #ifdef _WIN32
         const Xbyak::Reg64 arg0 = rcx, arg1 = rdx, arg2 = r8;
@@ -391,12 +480,37 @@ private:
                 }
                 if (d.out_emit[lane]) {
                     Output(eax, d, d.out_emit[lane]);
+                    Xbyak::Label emitted;
+                    if (batch) {
+                        // Buffered unless it is a method the C++ side must see at once.
+                        Xbyak::Label call_out;
+                        mov(ecx, dword[st + offsetof(State, method)]);
+                        cmp(ecx, 0x157);
+                        je(call_out, T_NEAR);
+                        cmp(ecx, 0x158);
+                        je(call_out, T_NEAR);
+                        cmp(ecx, 0xe00);
+                        jae(call_out, T_NEAR);
+                        mov(edx, dword[st + offsetof(State, write_count)]);
+                        cmp(edx, dword[st + offsetof(State, write_limit)]);
+                        jae(call_out, T_NEAR);
+                        mov(r8, qword[st + offsetof(State, writes)]);
+                        mov(dword[r8 + rdx * 8], ecx);
+                        mov(dword[r8 + rdx * 8 + 4], eax);
+                        inc(edx);
+                        mov(dword[st + offsetof(State, write_count)], edx);
+                        jmp(emitted, T_NEAR);
+                        L(call_out);
+                    }
                     mov(arg2.cvt32(), eax);
                     mov(arg1.cvt32(), dword[st + offsetof(State, method)]);
                     mov(arg0, st);
                     call(ptr[st + offsetof(State, emit)]);
                     test(al, al);
                     jz(fail_emit, T_NEAR);
+                    if (batch) {
+                        L(emitted);
+                    }
                     mov(eax, dword[st + offsetof(State, increment)]);
                     add(dword[st + offsetof(State, method)], eax);
                 }
@@ -657,6 +771,9 @@ private:
 
     std::unique_ptr<Program> program;
     std::uint64_t compiled_generation{~std::uint64_t{0}};
+    /// Batch mode's program (PrepareBatched), compiled only when that mode is used.
+    std::unique_ptr<Program> batch_program;
+    std::uint64_t batch_generation{~std::uint64_t{0}};
 };
 
 } // namespace Tegra

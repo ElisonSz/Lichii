@@ -209,6 +209,7 @@ add_executable(tests
     video_core/ampere_compute_lowering.cpp
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
+    video_core/native_macro_batch.cpp
     video_core/native_macro_fifo.cpp
     video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp
