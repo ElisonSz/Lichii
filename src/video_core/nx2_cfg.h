@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -41,11 +43,19 @@ inline bool g_bank_stats{};
 /// every channel's image tables; texture memos hold while none of their views was deleted
 /// (DescriptorTable::ReadImageEntry, TextureCache::NoteDeletedViews).
 inline bool g_tic{};
+/// EDEN_NX2_CFG_VERTEX=1: a vertex stream that is disabled or empty is resolved without
+/// translating its address (the binding is null whatever it gives), and a vertex stream or index
+/// buffer whose address range and the page table are those of the slot's last translation reuses
+/// it (BufferCache::UpdateVertexBuffer, UpdateIndexBuffer).
+inline bool g_vertex{};
+/// EDEN_NX2_CFG_CBUF=1: a graphics uniform buffer bound at the address and with the page table of
+/// the slot's last bind reuses that bind's translation (BufferCache::BindGraphicsUniformBuffer).
+inline bool g_cbuf{};
 /// EDEN_NX2_CFG_VERIFY=1: every skipped Touch checks that the item's tick already is the frame's,
 /// every digest lookup also runs the base's search, every skipped Query runs, every kept texture
-/// header entry is resolved as the base would (without its side effects), and every texture memo
-/// hit is checked against the full resolve; a mismatch is counted, the first 16 of each window are
-/// logged, and the base's answer is used.
+/// header entry is resolved as the base would (without its side effects), every texture memo hit
+/// is checked against the full resolve, and every reused translation is made again; a mismatch is
+/// counted, the first 16 of each window are logged, and the base's answer is used.
 inline bool g_verify{};
 /// Any of the switches: the stats line every 10 s.
 inline bool g_any{};
@@ -69,6 +79,13 @@ enum class Counter : std::size_t {
     TicFull,              ///< deletions that invalidated a table in full (the page table changed)
     MemoKept,             ///< texture memo hits after a deletion of none of their views
     MemoDropped,          ///< texture memos dropped because one of their views was deleted
+    VertexSkipped,        ///< disabled or empty vertex streams resolved without a translation
+    VertexReused,         ///< vertex streams that reused the slot's last translation
+    VertexTranslated,     ///< vertex streams translated
+    IndexReused,          ///< index buffers that reused the last translation
+    IndexTranslated,      ///< index buffers translated
+    CbufReused,           ///< uniform buffer binds that reused the slot's last translation
+    CbufTranslated,       ///< uniform buffer binds translated
     Verified,             ///< verify: skipped work checked
     Mismatches,           ///< verify: checks that contradicted the skip
     Count,
@@ -220,6 +237,69 @@ private:
     std::vector<u32> deaths;
 };
 
+/// EDEN_NX2_CFG_VERTEX, _CBUF: the last translation of a binding slot's GPU address. A
+/// translation reads the address space's page table alone, which changes only in
+/// MemoryManager::PageTableOp and BigPageTableOp; each bumps MapSerial once it is done. So the
+/// translation of the same address in the same address space is the same while MapSerial is the
+/// one read before it was made. (An operation still running when MapSerial is read is a race the
+/// base has too: its translation may come before or after the change.)
+struct TranslationMemo {
+    const void* memory{}; ///< the address space (Tegra::MemoryManager) translated in
+    u64 map_serial{};     ///< its MapSerial, read before the translation
+    u64 gpu_begin{};      ///< the address translated
+    u64 gpu_end{};        ///< what else the result depends on (a vertex stream's end), else 0
+    u64 device_addr{};
+    u32 size{}; ///< a vertex stream's size after the continuous range clamp, else 0
+    bool mapped{};
+    bool valid{};
+};
+
+/// A translation result: the device address, if mapped, and the size that goes with it.
+using Translation = std::pair<std::optional<u64>, u32>;
+
+/// EDEN_NX2_CFG_VERTEX, _CBUF: the slot's last translation when it holds (same address space,
+/// MapSerial, address and end), else `translate()`, the base's computation, noted for next time.
+/// `map_serial` is to be read before the call. Verify makes the translation again and uses it.
+template <typename Translate>
+[[nodiscard]] Translation Translated(TranslationMemo& memo, const void* memory, u64 map_serial,
+                                     u64 gpu_begin, u64 gpu_end, Counter reused, Counter translated,
+                                     Translate&& translate) {
+    if (memo.valid && memo.memory == memory && memo.map_serial == map_serial &&
+        memo.gpu_begin == gpu_begin && memo.gpu_end == gpu_end) {
+        const Translation kept{memo.mapped ? std::optional<u64>{memo.device_addr} : std::nullopt,
+                               memo.size};
+        if (!g_verify) [[likely]] {
+            Count(reused);
+            return kept;
+        }
+        Count(Counter::Verified);
+        const Translation expected = translate();
+        if (expected == kept) {
+            Count(reused);
+            return kept;
+        }
+        Mismatch("a reused address translation differs from the page table's", gpu_begin,
+                 expected.first.value_or(0));
+        memo.device_addr = expected.first.value_or(0);
+        memo.size = expected.second;
+        memo.mapped = expected.first.has_value();
+        return expected;
+    }
+    const Translation result = translate();
+    memo = TranslationMemo{
+        .memory = memory,
+        .map_serial = map_serial,
+        .gpu_begin = gpu_begin,
+        .gpu_end = gpu_end,
+        .device_addr = result.first.value_or(0),
+        .size = result.second,
+        .mapped = result.first.has_value(),
+        .valid = true,
+    };
+    Count(translated);
+    return result;
+}
+
 [[nodiscard]] inline bool ReadFlag(const char* name) {
     const char* const value = std::getenv(name);
     return value != nullptr && value[0] == '1';
@@ -232,13 +312,16 @@ inline void ReadSwitches() {
     g_ssbo = ReadFlag("EDEN_NX2_CFG_SSBO");
     g_bank_stats = ReadFlag("EDEN_NX2_CFG_BANK_STATS");
     g_tic = ReadFlag("EDEN_NX2_CFG_TIC");
+    g_vertex = ReadFlag("EDEN_NX2_CFG_VERTEX");
+    g_cbuf = ReadFlag("EDEN_NX2_CFG_CBUF");
     g_verify = ReadFlag("EDEN_NX2_CFG_VERIFY");
-    g_any = g_touch || g_lookup || g_ssbo || g_bank_stats || g_tic || g_verify;
+    g_any =
+        g_touch || g_lookup || g_ssbo || g_bank_stats || g_tic || g_vertex || g_cbuf || g_verify;
     if (g_any) {
         LOG_INFO(HW_GPU,
                  "Track C draw preparation switches: touch={} lookup={} ssbo={} bank_stats={} "
-                 "tic={} verify={}",
-                 g_touch, g_lookup, g_ssbo, g_bank_stats, g_tic, g_verify);
+                 "tic={} vertex={} cbuf={} verify={}",
+                 g_touch, g_lookup, g_ssbo, g_bank_stats, g_tic, g_vertex, g_cbuf, g_verify);
     }
 }
 
@@ -279,6 +362,13 @@ inline void Report() {
     const u64 tic_full = Take(Counter::TicFull);
     const u64 memo_kept = Take(Counter::MemoKept);
     const u64 memo_dropped = Take(Counter::MemoDropped);
+    const u64 vertex_skipped = Take(Counter::VertexSkipped);
+    const u64 vertex_reused = Take(Counter::VertexReused);
+    const u64 vertex_translated = Take(Counter::VertexTranslated);
+    const u64 index_reused = Take(Counter::IndexReused);
+    const u64 index_translated = Take(Counter::IndexTranslated);
+    const u64 cbuf_reused = Take(Counter::CbufReused);
+    const u64 cbuf_translated = Take(Counter::CbufTranslated);
     const u64 verified = Take(Counter::Verified);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
@@ -287,13 +377,17 @@ inline void Report() {
              "compares, {} found; storage range queries {} skipped, {} made; bank re-uploads {} "
              "({} KiB), {} unchanged; texture headers after deletions {} kept, {} resolved again, "
              "{} tables invalidated in full; texture memos {} kept over deletions, {} dropped; "
-             "verify checked {}, mismatches {} ({} since start) | touch={} lookup={} ssbo={} "
-             "bank_stats={} tic={} verify={}",
+             "vertex streams {} without translation, {} reused, {} translated; index buffers {} "
+             "reused, {} translated; uniform binds {} reused, {} translated; verify checked {}, "
+             "mismatches {} ({} since start) | touch={} lookup={} ssbo={} bank_stats={} tic={} "
+             "vertex={} cbuf={} verify={}",
              seconds, buffer_skipped, buffer_touched, image_skipped, image_touched, searches,
              entries, compares, hits, range_skipped, range_queries, bank_uploads, bank_bytes >> 10,
-             bank_unchanged, tic_kept, tic_resolved, tic_full, memo_kept, memo_dropped, verified,
-             mismatches, g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup,
-             g_ssbo, g_bank_stats, g_tic, g_verify);
+             bank_unchanged, tic_kept, tic_resolved, tic_full, memo_kept, memo_dropped,
+             vertex_skipped, vertex_reused, vertex_translated, index_reused, index_translated,
+             cbuf_reused, cbuf_translated, verified, mismatches,
+             g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup, g_ssbo,
+             g_bank_stats, g_tic, g_vertex, g_cbuf, g_verify);
 }
 
 } // namespace VideoCommon::Cfg

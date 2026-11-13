@@ -686,3 +686,68 @@ TEST_CASE("Cfg: view deaths order deletions and reads, also across the count's w
     REQUIRE_FALSE(deaths.DiedAfter(3, 1));
     REQUIRE_FALSE(deaths.DiedAfter(4, 1));
 }
+
+TEST_CASE("Cfg: a reused translation is the page table's while the map serial holds",
+          "[video_core][nx2_cfg]") {
+    std::mt19937_64 rng{37};
+    MockMemory memory;
+    memory.pages.resize(32);
+    for (size_t page = 0; page < memory.pages.size(); ++page) {
+        if (rng() % 6 != 0) {
+            memory.pages[page] = rng() % 512 + 1;
+        }
+    }
+    u64 serial = 1;
+    std::array<Cfg::TranslationMemo, 4> memos{};
+    std::array<u64, 4> last_begin{};
+    u64 reused_total = 0;
+    for (int step = 0; step < 200000; ++step) {
+        if (rng() % 50 == 0) {
+            // Map or unmap a page: the serial changes after the table does.
+            memory.pages[rng() % memory.pages.size()] =
+                rng() % 3 == 0 ? std::nullopt : std::optional<u64>{rng() % 512 + 1};
+            ++serial;
+            continue;
+        }
+        const size_t slot = static_cast<size_t>(rng() % memos.size());
+        const u64 begin = rng() % 3 != 0 ? last_begin[slot]
+                                         : MockMemory::Base + rng() % (32 * MockMemory::PageSize);
+        last_begin[slot] = begin;
+        const u64 end = begin + (rng() % 2) * 0x100;
+        const u64 reused_before =
+            Cfg::g_counters.values[static_cast<size_t>(Cfg::Counter::VertexReused)];
+        const Cfg::Translation got =
+            Cfg::Translated(memos[slot], &memory, serial, begin, end, Cfg::Counter::VertexReused,
+                            Cfg::Counter::VertexTranslated, [&] {
+                                return Cfg::Translation{memory.GpuToCpuAddress(begin),
+                                                        static_cast<u32>(end - begin)};
+                            });
+        const Cfg::Translation expected{memory.GpuToCpuAddress(begin),
+                                        static_cast<u32>(end - begin)};
+        REQUIRE(got == expected);
+        reused_total +=
+            Cfg::g_counters.values[static_cast<size_t>(Cfg::Counter::VertexReused)] - reused_before;
+    }
+    REQUIRE(reused_total > 50000U);
+
+    SECTION("verify finds a translation kept over a page table change the serial missed") {
+        const SwitchScope verify{Cfg::g_verify, true};
+        Cfg::TranslationMemo memo{};
+        const u64 begin = MockMemory::Base + 5 * MockMemory::PageSize + 8;
+        memory.pages[5] = 77;
+        const auto translate = [&] { return Cfg::Translation{memory.GpuToCpuAddress(begin), 0}; };
+        (void)Cfg::Translated(memo, &memory, serial, begin, 0, Cfg::Counter::CbufReused,
+                              Cfg::Counter::CbufTranslated, translate);
+        memory.pages[5] = 78; // a change without a new serial: what verify is there to catch
+        const u64 mismatches_before = Cfg::g_mismatches_total.load();
+        const Cfg::Translation got =
+            Cfg::Translated(memo, &memory, serial, begin, 0, Cfg::Counter::CbufReused,
+                            Cfg::Counter::CbufTranslated, translate);
+        REQUIRE(got == translate());
+        REQUIRE(Cfg::g_mismatches_total.load() == mismatches_before + 1);
+        // The memo now holds the page table's answer.
+        REQUIRE(Cfg::Translated(memo, &memory, serial, begin, 0, Cfg::Counter::CbufReused,
+                                Cfg::Counter::CbufTranslated, translate) == translate());
+        REQUIRE(Cfg::g_mismatches_total.load() == mismatches_before + 1);
+    }
+}

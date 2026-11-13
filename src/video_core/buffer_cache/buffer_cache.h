@@ -1794,7 +1794,15 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    // EDEN_NX2_CFG_CBUF: the slot's last bind translation while it holds.
+    const std::optional<DAddr> device_addr =
+        Cfg::g_cbuf && stage < NUM_STAGES && index < NUM_GRAPHICS_UNIFORM_BUFFERS
+            ? Cfg::Translated(
+                  uniform_translations[stage][index], gpu_memory, gpu_memory->MapSerial(), gpu_addr,
+                  0, Cfg::Counter::CbufReused, Cfg::Counter::CbufTranslated,
+                  [&] { return Cfg::Translation{gpu_memory->GpuToCpuAddress(gpu_addr), 0}; })
+                  .first
+            : gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
         return;
@@ -3454,7 +3462,15 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+    // EDEN_NX2_CFG_VERTEX: the last translation of the start address while it holds.
+    const std::optional<DAddr> device_addr =
+        Cfg::g_vertex
+            ? Cfg::Translated(
+                  index_translation, gpu_memory, gpu_memory->MapSerial(), gpu_addr_begin, 0,
+                  Cfg::Counter::IndexReused, Cfg::Counter::IndexTranslated,
+                  [&] { return Cfg::Translation{gpu_memory->GpuToCpuAddress(gpu_addr_begin), 0}; })
+                  .first
+            : gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
     const u32 size = (std::min)(address_size, draw_size);
@@ -3496,16 +3512,53 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
-    if (array.enable == 0 || size == 0 || !device_addr) {
-        channel_state->vertex_buffers[index] = NULL_BINDING;
-        UpdateVertexBufferSlot(index, NULL_BINDING);
-        return;
-    }
-    if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
-        size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
+    std::optional<DAddr> device_addr;
+    if (Cfg::g_vertex) {
+        // EDEN_NX2_CFG_VERTEX: a disabled or empty stream is null whatever its address translates
+        // to; the others reuse the slot's last translation, size clamp included, while it holds
+        // (Cfg::Translated).
+        if (array.enable == 0 || size == 0) {
+            if (Cfg::g_verify) [[unlikely]] {
+                // The base translates here, and binds null whatever that gives.
+                Cfg::Count(Cfg::Counter::Verified);
+                (void)gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+            }
+            Cfg::Count(Cfg::Counter::VertexSkipped);
+            channel_state->vertex_buffers[index] = NULL_BINDING;
+            UpdateVertexBufferSlot(index, NULL_BINDING);
+            return;
+        }
+        const Cfg::Translation translation = Cfg::Translated(
+            vertex_translations[index], gpu_memory, gpu_memory->MapSerial(), gpu_addr_begin,
+            gpu_addr_end, Cfg::Counter::VertexReused, Cfg::Counter::VertexTranslated, [&] {
+                const std::optional<DAddr> translated = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+                u32 clamped = address_size;
+                if (translated &&
+                    (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || clamped >= 64_MiB)) {
+                    clamped =
+                        static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, clamped));
+                }
+                return Cfg::Translation{translated, clamped};
+            });
+        if (!translation.first) {
+            channel_state->vertex_buffers[index] = NULL_BINDING;
+            UpdateVertexBufferSlot(index, NULL_BINDING);
+            return;
+        }
+        device_addr = translation.first;
+        size = translation.second;
+    } else {
+        device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+        if (array.enable == 0 || size == 0 || !device_addr) {
+            channel_state->vertex_buffers[index] = NULL_BINDING;
+            UpdateVertexBufferSlot(index, NULL_BINDING);
+            return;
+        }
+        if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
+            size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
+        }
     }
     const BufferId buffer_id = FindBuffer(*device_addr, size, false);
     const Binding binding{

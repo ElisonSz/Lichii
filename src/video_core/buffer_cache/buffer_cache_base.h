@@ -1237,6 +1237,12 @@ private:
     static constexpr u32 NUM_SINGLE_RANGE_MEMOS = 16;
     std::array<std::array<SingleRangeMemo, NUM_SINGLE_RANGE_MEMOS>, NUM_STAGES>
         storage_single_ranges{};
+    /// EDEN_NX2_CFG_VERTEX: each vertex stream's and the index buffer's last translation.
+    std::array<Cfg::TranslationMemo, NUM_VERTEX_BUFFERS> vertex_translations{};
+    Cfg::TranslationMemo index_translation{};
+    /// EDEN_NX2_CFG_CBUF: each graphics uniform buffer slot's last bind translation.
+    std::array<std::array<Cfg::TranslationMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_translations{};
     u64 frame_tick = 0;
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
