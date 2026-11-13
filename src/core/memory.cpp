@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -618,6 +619,69 @@ struct Memory::Impl {
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
+    /// EDEN_NX2_PROTECT_STATS: what the reads that asked the caches got back, and whether a core
+    /// that kept its last 4 or 16 areas (instead of 1) would have had the read's address in one.
+    /// One line every 10 s.
+    void NoteAskedArea(size_t core, DAddr address, const VideoCore::RasterizerDownloadArea& area) {
+        struct Counters {
+            std::atomic<u64> asks{};
+            std::atomic<u64> preemptive{};
+            std::atomic<u64> in_flight{};
+            std::atomic<u64> page_sized{};
+            std::atomic<u64> in_last4{};
+            std::atomic<u64> in_last16{};
+            std::atomic<u64> bytes{};
+            std::atomic<u64> window_start{};
+        };
+        static Counters counters;
+        auto& recent = recent_read_areas[core];
+        bool in4 = false;
+        bool in16 = false;
+        for (size_t i = 0; i < recent.size(); ++i) {
+            const auto& old_area = recent[(recent_read_area_next[core] + recent.size() - 1 - i) %
+                                          recent.size()];
+            if (old_area.start_address <= address && address < old_area.end_address) {
+                in16 = true;
+                in4 = in4 || i < 4;
+            }
+        }
+        recent[recent_read_area_next[core]] = area;
+        recent_read_area_next[core] = (recent_read_area_next[core] + 1) % recent.size();
+        counters.asks.fetch_add(1, std::memory_order_relaxed);
+        counters.preemptive.fetch_add(area.preemtive ? 1 : 0, std::memory_order_relaxed);
+        counters.in_flight.fetch_add(area.in_flight ? 1 : 0, std::memory_order_relaxed);
+        counters.page_sized.fetch_add(
+            area.end_address - area.start_address <= YUZU_PAGESIZE ? 1 : 0,
+            std::memory_order_relaxed);
+        counters.in_last4.fetch_add(in4 ? 1 : 0, std::memory_order_relaxed);
+        counters.in_last16.fetch_add(in16 ? 1 : 0, std::memory_order_relaxed);
+        counters.bytes.fetch_add(area.end_address - area.start_address, std::memory_order_relaxed);
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+        u64 start = counters.window_start.load(std::memory_order_relaxed);
+        if (start == 0) {
+            counters.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - start < 10'000'000'000ULL ||
+            !counters.window_start.compare_exchange_strong(start, now,
+                                                           std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 asks = counters.asks.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_Memory,
+                 "Read areas {:.1f} s: {} asks, {} preemptive, {} in flight, {} of one page, "
+                 "average {} KiB; the address was in the core's last 4 areas {}, last 16 {}",
+                 static_cast<double>(now - start) / 1e9, asks,
+                 counters.preemptive.exchange(0, std::memory_order_relaxed),
+                 counters.in_flight.exchange(0, std::memory_order_relaxed),
+                 counters.page_sized.exchange(0, std::memory_order_relaxed),
+                 asks == 0 ? 0 : counters.bytes.exchange(0, std::memory_order_relaxed) / asks / 1024,
+                 counters.in_last4.exchange(0, std::memory_order_relaxed),
+                 counters.in_last16.exchange(0, std::memory_order_relaxed));
+    }
+
     /// EDEN_NX2_READ_AREAS=1: a GPU write invalidates only the cores' read areas it overlaps.
     [[nodiscard]] static bool ReadAreasTargeted() {
         static const bool targeted = [] {
@@ -1036,6 +1100,9 @@ struct Memory::Impl {
             }
             const u64 epoch = targeted ? arm_epoch.load(std::memory_order_seq_cst) : 0;
             current_area = system.GPU().OnCPURead(address, size);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                NoteAskedArea(core, address, current_area);
+            }
             if (targeted) {
                 // Publish the area, then look whether an invalidation ran meanwhile: it may have
                 // looked at the previous area, so this one is not kept.
@@ -1142,6 +1209,10 @@ struct Memory::Impl {
     };
     std::array<SharedReadArea, Core::Hardware::NUM_CPU_CORES> shared_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> seen_read_area_invalidations{};
+    /// EDEN_NX2_PROTECT_STATS (NoteAskedArea): each core's last 16 read areas.
+    std::array<std::array<VideoCore::RasterizerDownloadArea, 16>, Core::Hardware::NUM_CPU_CORES>
+        recent_read_areas{};
+    std::array<size_t, Core::Hardware::NUM_CPU_CORES> recent_read_area_next{};
     /// EDEN_NX2_READ_AREAS: counts InvalidateReadAreas calls, so a core that computed its area
     /// while one ran drops it.
     std::atomic<u64> arm_epoch{};
