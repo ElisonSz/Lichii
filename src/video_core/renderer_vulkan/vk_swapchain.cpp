@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -196,6 +197,18 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     }
 
     const auto wait_with_frame_pacing = [this, may_flush] {
+    // EDEN_NX2_FRAME_PACING=<fps> (diagnostic): the frame pacing mode's target for comparisons
+    // without changing the configuration (0 = Auto: no pacing).
+    static const double forced_target_fps = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRAME_PACING");
+        return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+    }();
+    if (forced_target_fps >= 0.0) {
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], forced_target_fps, may_flush);
+        });
+        return;
+    }
     switch (Settings::values.frame_pacing_mode.GetValue()) {
     case Settings::FramePacingMode::Target_Auto:
         VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
