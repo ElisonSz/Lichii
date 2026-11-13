@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -142,11 +143,43 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+/// Address ranges [first, second) of the modules loaded when sampling started, sorted.
+using ModuleRanges = std::vector<std::pair<DWORD64, DWORD64>>;
+
+ModuleRanges LoadedModules() {
+    ModuleRanges ranges;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return ranges;
+    }
+    MODULEENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = Module32First(snapshot, &entry); ok; ok = Module32Next(snapshot, &entry)) {
+        const auto base = reinterpret_cast<DWORD64>(entry.modBaseAddr);
+        ranges.emplace_back(base, base + entry.modBaseSize);
+    }
+    CloseHandle(snapshot);
+    std::sort(ranges.begin(), ranges.end());
+    return ranges;
+}
+
+bool InModule(const ModuleRanges& ranges, DWORD64 address) {
+    const auto next = std::upper_bound(
+        ranges.begin(), ranges.end(), address,
+        [](DWORD64 value, const std::pair<DWORD64, DWORD64>& range) { return value < range.first; });
+    return next != ranges.begin() && address < std::prev(next)->second;
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
 // stops once the stack pointer leaves the thread's stack.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib) {
+// `modules` (EDEN_NX2_SAMPLE_GUEST=1, for the guest cores): the walk records a frame outside
+// every module (the guest's JIT code) and stops there, without asking the unwinder about it. The
+// JIT code's unwind data need not describe its frames, so unwinding through it may read through
+// guest register values: the likely cause of the crash when the CPUCore threads were sampled.
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
+              const ModuleRanges* modules) {
     if (tib == nullptr) {
         return 0;
     }
@@ -157,6 +190,9 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
     unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
         frames[depth++] = context.Rip;
+        if (modules != nullptr && !InModule(*modules, context.Rip)) {
+            break;
+        }
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
         if (function == nullptr) {
@@ -396,6 +432,13 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     if (targets.empty()) {
         return "no thread matches";
     }
+    // EDEN_NX2_SAMPLE_GUEST=1: walks stop at frames outside the modules loaded now (Walk). Read
+    // before any thread is suspended: the snapshot takes the loader lock.
+    // A failed snapshot leaves no ranges: every walk then stops at its first frame.
+    const char* const guest = std::getenv("EDEN_NX2_SAMPLE_GUEST");
+    const bool guest_safe = guest != nullptr && guest[0] == '1';
+    const ModuleRanges modules = guest_safe ? LoadedModules() : ModuleRanges{};
+    const ModuleRanges* const module_filter = guest_safe ? &modules : nullptr;
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
@@ -411,7 +454,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib);
+                sample.depth = Walk(context, sample.frames, targets[i].tib, module_filter);
             }
             ResumeThread(handle);
         }
