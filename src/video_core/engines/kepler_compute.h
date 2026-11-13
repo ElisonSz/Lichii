@@ -288,8 +288,13 @@ public:
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
-                         u32 argument, bool from_macro);
+    /// `last_call`: the method's last word (the back's is_last_call; macro writes are their own).
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool from_macro, bool last_call);
+    /// EDEN_NX2_RUNAHEAD: keeps the inline upload's words for the QMD view
+    /// (FrontQmdView::NoteUpload).
+    void FrontKeepUpload(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool last_call);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control,
                          bool from_macro);
     void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);

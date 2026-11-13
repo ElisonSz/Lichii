@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -165,6 +167,26 @@ public:
         return scheduler.SameStates(other);
     }
 
+    /// EDEN_NX2_RUNAHEAD: the longest inline upload the view keeps (NoteUpload).
+    static constexpr u64 MaxUploadBytes = 1024;
+
+    /// EDEN_NX2_RUNAHEAD: a compute engine's front sent all of an inline upload of one linear
+    /// line: once the back ran the entries before `position`, `bytes` are in guest memory from
+    /// `address` of the address space `memory` (Memory::Id). Until then the front reads a QMD
+    /// they cover from here, if the upload is the last write sent there (ReadDescriptor).
+    void NoteUpload(const void* memory, GPUVAddr address, std::span<const u8> bytes, u64 position) {
+        if (bytes.empty() || bytes.size() > MaxUploadBytes) {
+            return;
+        }
+        KeptUpload& kept = uploads[uploads_count % uploads.size()];
+        ++uploads_count;
+        kept.memory = memory;
+        kept.address = address;
+        kept.size = bytes.size();
+        kept.position = position;
+        std::memcpy(kept.bytes.data(), bytes.data(), bytes.size());
+    }
+
     /// LOAD_INLINE_QMD_DATA was just sent: running it, the back writes `qmd` to the QMD at
     /// `device`. Until then the front reads it from here (ReadDescriptor).
     void NoteInlineWrite(const GpuSplit& split, u64 device, const Descriptor& qmd) {
@@ -272,8 +294,15 @@ private:
 
     /// A signal the front can't value, its table lost: no release of it is noted, and the view
     /// takes the back's table over once the back ran it.
-    void Unvalued(const GpuSplit& split, Nx2AcquireStats::QmdLost lost) {
+    void Unvalued(GpuSplit& split, Nx2AcquireStats::QmdLost lost) {
         checks_unvalued = true; // TEST
+        if (RunAhead::enabled) [[unlikely]] {
+            // Its releases may write anywhere until the back ran it (GpuSplit::RunAheadReach).
+            split.NoteUnvaluedSignal(false);
+            if (RunAhead::stats) {
+                ++RunAhead::counters.unvalued;
+            }
+        }
         Nx2AcquireStats::NoteQmdSignal(lost, WhatSent(split, lost));
     }
 
@@ -320,10 +349,16 @@ private:
 
     /// The signal sent at `position` waits, first (`why`: what it waits for) or behind the others.
     /// None of its releases is noted: they are placed once it is valued.
-    void Wait(const GpuSplit& split, u64 position, const void* memory_id, GPUVAddr address,
-              u32 argument, const Descriptor* inline_qmd,
-              std::optional<Nx2AcquireStats::QmdLost> why) {
+    void Wait(GpuSplit& split, u64 position, const void* memory_id, GPUVAddr address, u32 argument,
+              const Descriptor* inline_qmd, std::optional<Nx2AcquireStats::QmdLost> why) {
         checks_unvalued = true; // TEST
+        if (RunAhead::enabled) [[unlikely]] {
+            // Its releases are placed once it is valued, or stay unknown if it never is.
+            split.NoteUnvaluedSignal(true);
+            if (RunAhead::stats) {
+                ++RunAhead::counters.unvalued;
+            }
+        }
         if (waiting.size() >= MaxWaiting) {
             Nx2AcquireStats::NoteQmdLateLost(Nx2AcquireStats::QmdLost::TooMany,
                                              waiting.size()); // TEST
@@ -353,6 +388,10 @@ private:
     }
 
     void ClearWaiting() {
+        if (RunAhead::enabled && !waiting.empty()) [[unlikely]] {
+            // Dropped unvalued: their releases stay unknown until the back ran them.
+            GpuSplit::Get().NoteWaitingSignalsDone(true);
+        }
         waiting.clear();
         late_reads.clear();
         retry_after = 0;
@@ -392,6 +431,10 @@ private:
         }
         // Every signal sent before the reads made late is valued: none of their releases waits.
         late_reads.clear();
+        if (RunAhead::enabled) [[unlikely]] {
+            // Their releases are placed (Attempt, late): the split logs where they write.
+            split.NoteWaitingSignalsDone(false);
+        }
     }
 
     /// Runs the signal sent at `position` on the table as the back runs it, and notes what its
@@ -524,7 +567,47 @@ private:
             Nx2AcquireStats::NoteQmdInlineRead(); // TEST
             return std::nullopt;
         }
+        if (RunAhead::enabled) [[unlikely]] {
+            // An inline upload still queued wrote the whole QMD last (EDEN_NX2_RUNAHEAD): the
+            // back finds its words there, as the front sent them.
+            if (const KeptUpload* kept = QueuedUpload(split, memory.Id(), qmd_address);
+                kept != nullptr && kept->position == target) {
+                std::memcpy(descriptor.data(), kept->bytes.data() + (qmd_address - kept->address),
+                            sizeof(descriptor));
+                if (RunAhead::stats) {
+                    ++RunAhead::counters.upload_qmds;
+                }
+                return std::nullopt;
+            }
+        }
         return Outcome{false, target, lost, qmd_address};
+    }
+
+    /// EDEN_NX2_RUNAHEAD: an inline upload (NoteUpload) the back has not run yet.
+    struct KeptUpload {
+        const void* memory{};
+        GPUVAddr address{};
+        u64 size{};
+        u64 position{};
+        std::array<u8, MaxUploadBytes> bytes{};
+    };
+
+    /// The newest kept upload of `memory` the back has not run yet that covers the QMD at
+    /// `qmd_address`.
+    [[nodiscard]] const KeptUpload* QueuedUpload(const GpuSplit& split, const void* memory,
+                                                 GPUVAddr qmd_address) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (split.Ran(kept.position)) {
+                break; // The back wrote it, and the older ones
+            }
+            if (kept.memory == memory && kept.address <= qmd_address &&
+                qmd_address - kept.address + sizeof(Descriptor) <= kept.size) {
+                return &kept;
+            }
+        }
+        return nullptr;
     }
 
     /// The last inline QMD sent to the QMD at `device` that the back has not written yet.
@@ -674,6 +757,10 @@ private:
     /// behind has some ten to write, a few times that in long frames.
     std::array<InlineWrite, 256> inline_writes{};
     size_t inline_writes_count{};
+    /// EDEN_NX2_RUNAHEAD: the last inline uploads sent (NoteUpload), oldest first from
+    /// uploads_count on.
+    std::array<KeptUpload, 16> uploads{};
+    size_t uploads_count{};
     /// TEST (EDEN_NX2_DRAIN_CHECK): see TakeChecks.
     std::vector<Nx2DrainCheck::QmdRelease> checks;
     std::vector<Nx2DrainCheck::QmdRead> check_reads;

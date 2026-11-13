@@ -186,6 +186,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     profile_publishes = Nx2Profile::Enabled();
     log_methods = g_acquire_counting;
     ring = std::make_unique<u64[]>(RingWords);
+    if (RunAhead::enabled) {
+        run_ahead_log = std::make_unique<RunAheadWrite[]>(RunAheadLogSize);
+    }
     ++starts; // Before the back starts: it tags the entries of fenced writes with it (EntryTag)
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -232,6 +235,13 @@ void GpuSplit::Stop() {
     last_noted_write = 0;
     write_sets.fill({});
     coarse_sets.fill({});
+    run_ahead_log.reset();
+    run_ahead_count = 0;
+    run_ahead_lost = 0;
+    last_unknown_writer = 0;
+    run_ahead_waiting = 0;
+    watched_pages.fill({});
+    watched_count = 0;
     published_local = 0;
     publish_held = false;
     logged_method_count = 0;
@@ -447,6 +457,9 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
     if (SyncSuspend::enabled) [[unlikely]] {
         write.settle = SettleBefore(word, write, landing == Landing::AtRun);
     }
+    if (RunAhead::enabled) [[unlikely]] {
+        NoteRunAheadWord(word);
+    }
     semaphore_writes.insert_or_assign(word, write);
     if (SemRecorder::Relevant(word)) {
         SemRecorder::Add({.kind = "note",
@@ -623,6 +636,9 @@ void GpuSplit::NoteDeviceWriteAt(DAddr address, u64 size, u64 position) {
         NoteSetWrite(write_sets[WriteSlot(granule)], granule, position);
     }
     last_noted_write = std::max(last_noted_write, position);
+    if (RunAhead::enabled) [[unlikely]] {
+        LogRunAheadWrite(address, size, position);
+    }
 }
 
 void GpuSplit::NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position) {
@@ -631,6 +647,146 @@ void GpuSplit::NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position) {
         NoteSetWrite(coarse_sets[CoarseSlot(granule)], granule, position);
     }
     last_noted_write = std::max(last_noted_write, position);
+    if (RunAhead::enabled) [[unlikely]] {
+        LogRunAheadWrite(address, size, position);
+    }
+}
+
+const GpuSplit::WatchedPage* GpuSplit::FindWatchedPage(u64 page) const {
+    // Linear probing; pages are never removed during a start (Stop clears them all).
+    for (size_t i = 0, slot = WatchedSlot(page); i < WatchedPageSlots;
+         ++i, slot = (slot + 1) % WatchedPageSlots) {
+        const WatchedPage& watched = watched_pages[slot];
+        if (watched.key == page + 1) {
+            return &watched;
+        }
+        if (watched.key == 0) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+const GpuSplit::WatchedPage* GpuSplit::WatchPage(u64 page) {
+    if (const WatchedPage* const watched = FindWatchedPage(page)) {
+        return watched;
+    }
+    if (watched_count >= MaxWatchedPages) {
+        return nullptr;
+    }
+    for (size_t i = 0, slot = WatchedSlot(page); i < WatchedPageSlots;
+         ++i, slot = (slot + 1) % WatchedPageSlots) {
+        WatchedPage& watched = watched_pages[slot];
+        if (watched.key == 0) {
+            // Writes to the page sent before now were not logged: until the back ran them all,
+            // any may have written the word.
+            watched = {page + 1, write_position};
+            ++watched_count;
+            return &watched;
+        }
+    }
+    return nullptr;
+}
+
+void GpuSplit::LogRunAheadWrite(DAddr address, u64 size, u64 position) {
+    if (size == 0 || !run_ahead_log) {
+        return;
+    }
+    // Pieces of a write never cross a 4 KiB page (ForEachDeviceRange); check both ends anyway.
+    const u64 first_page = address >> 12;
+    const u64 last_page = (address + size - 1) >> 12;
+    if (FindWatchedPage(first_page) == nullptr &&
+        (last_page == first_page || FindWatchedPage(last_page) == nullptr)) {
+        return;
+    }
+    if (size > ~u32{0}) {
+        run_ahead_lost = (std::max)(run_ahead_lost, position);
+        return;
+    }
+    RunAheadWrite& entry = run_ahead_log[run_ahead_count % RunAheadLogSize];
+    if (run_ahead_count >= RunAheadLogSize && entry.appended > consumed_cache) {
+        // The back may not have run the write this slot held: it is no longer looked at.
+        run_ahead_lost = (std::max)(run_ahead_lost, entry.position);
+    }
+    entry = {address, position, write_position, static_cast<u32>(size), 0};
+    ++run_ahead_count;
+}
+
+void GpuSplit::NoteRunAheadWord(u64 word) {
+    if (!run_ahead_log) {
+        return;
+    }
+    // The release's own write was placed (logged) just before, at the same position.
+    const u64 newest = (std::min<u64>)(run_ahead_count, 4);
+    for (u64 i = 1; i <= newest; ++i) {
+        RunAheadWrite& entry = run_ahead_log[(run_ahead_count - i) % RunAheadLogSize];
+        if (entry.appended != write_position) {
+            return;
+        }
+        const u64 offset = word - entry.begin;
+        if (word >= entry.begin && offset + sizeof(u32) <= entry.size && offset % 4 == 0 &&
+            offset / 4 < 32) {
+            entry.noted |= u32{1} << (offset / 4);
+            return;
+        }
+    }
+}
+
+RunAhead::Answer GpuSplit::RunAheadReach(u64 word, u64 writers_before) {
+    using RunAhead::Reach;
+    const u64 base = (std::min)(writers_before, write_position);
+    if (Tegra::Nx2MayBeGpuWritten(word, sizeof(u32))) {
+        // Dispatches' shader stores may reach guest memory here (through the caches): each
+        // compute and copy entry may change the word, as the baseline counts.
+        return {base, Reach::GpuWritten};
+    }
+    const WatchedPage* const page = run_ahead_log ? WatchPage(word >> 12) : nullptr;
+    if (page == nullptr) {
+        return {base, Reach::Lost};
+    }
+    RunAhead::Answer answer{0, Reach::None};
+    const auto consider = [&answer](u64 position, Reach reason) {
+        if (position > answer.position) {
+            answer = {position, reason};
+        }
+    };
+    consider(page->since, Reach::NewPage);
+    consider((std::max)(last_unknown_writer, run_ahead_waiting), Reach::Unvalued);
+    consider(last_unplaced_write, Reach::Unplaced);
+    consider(run_ahead_lost, Reach::Lost);
+    // Newest first, down to the writes logged before the back's position: everything older was
+    // logged at a position the back has run, and none takes effect later than it was logged.
+    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 logged = (std::min<u64>)(run_ahead_count, RunAheadLogSize);
+    u64 scanned = 0;
+    for (u64 i = 1; i <= logged; ++i) {
+        const RunAheadWrite& entry = run_ahead_log[(run_ahead_count - i) % RunAheadLogSize];
+        if (entry.appended <= done) {
+            break;
+        }
+        ++scanned;
+        if (entry.position <= answer.position || entry.position <= done ||
+            entry.begin >= word + sizeof(u32) || word >= entry.begin + entry.size) {
+            continue;
+        }
+        const u64 offset = word - entry.begin;
+        const bool noted = word >= entry.begin && offset % 4 == 0 && offset / 4 < 32 &&
+                           ((entry.noted >> (offset / 4)) & 1) != 0;
+        if (!noted) {
+            consider(entry.position, Reach::Placed);
+        }
+    }
+    if (RunAhead::stats) {
+        RunAhead::counters.scanned += scanned;
+    }
+    if (answer.position <= done) {
+        answer = {0, Reach::None};
+    }
+    if (answer.position >= base) {
+        // Not before what the baseline waits for: its wait, counted by the cause found.
+        answer.position = base;
+    }
+    return answer;
 }
 
 u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) const {

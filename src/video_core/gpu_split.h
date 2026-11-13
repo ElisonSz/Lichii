@@ -23,6 +23,7 @@
 #include "common/common_types.h"
 #include "common/thread.h"
 #include "video_core/nx2_fast_wake.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/nx2_sem_recorder.h"
 #include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
@@ -416,6 +417,32 @@ public:
     [[nodiscard]] bool WritersPending() const {
         return !Ran(LastWriterPosition());
     }
+    /// EDEN_NX2_RUNAHEAD: a QMD signal was just sent whose releases the front did not note: they
+    /// may write anywhere. `waiting`: the view values it later, in order, and places them then
+    /// (NoteWaitingSignalsDone).
+    void NoteUnvaluedSignal(bool waiting) {
+        if (waiting) {
+            run_ahead_waiting = write_position;
+        } else {
+            last_unknown_writer = write_position;
+        }
+    }
+    /// EDEN_NX2_RUNAHEAD: the view valued every waiting signal (and placed their releases), or,
+    /// `lost`, dropped them unvalued: then their releases stay unknown until the back ran them.
+    void NoteWaitingSignalsDone(bool lost) {
+        if (lost) {
+            last_unknown_writer = (std::max)(last_unknown_writer, run_ahead_waiting);
+        }
+        run_ahead_waiting = 0;
+    }
+    /// EDEN_NX2_RUNAHEAD (front, at an acquire): the position after the last entry sent so far that
+    /// can change the 4 bytes at `word` (device address) other than through the releases noted at
+    /// the word, at most `writers_before` (the baseline's LastWriterPosition): QMD signals whose
+    /// releases were not noted, placed writes over the word that are not releases noted at it
+    /// (exact ranges, logged for the pages acquires look at), writes the front could not place,
+    /// and on a page GPU work wrote, `writers_before` itself (shader stores reach guest memory
+    /// only there, through the caches).
+    [[nodiscard]] RunAhead::Answer RunAheadReach(u64 word, u64 writers_before);
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
@@ -617,6 +644,7 @@ private:
     friend struct GpuSplitTestAccess;
     friend struct FastWakeTestAccess;
     friend struct SyncSuspendTestAccess;
+    friend struct RunAheadTestAccess;
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -843,6 +871,39 @@ private:
     /// EDEN_NX2_SYNC_SUSPEND: QueuedSemaphoreWrite::settle of `write` to `word`, about to replace
     /// what the front noted there; `lands_at_run`: the write itself lands as the back runs it.
     [[nodiscard]] u64 SettleBefore(u64 word, const SemaphoreWrite& write, bool lands_at_run) const;
+
+    /// EDEN_NX2_RUNAHEAD: a guest write the front placed on a watched page (RunAheadReach).
+    struct RunAheadWrite {
+        u64 begin;    ///< Device address
+        u64 position; ///< The back has made the write once it ran the entries before this
+        u64 appended; ///< write_position when it was logged (late QMD releases: after `position`)
+        u32 size;
+        u32 noted; ///< Bit i: the word at begin + 4 * i is a release noted at it
+                   ///< (NoteSemaphoreWrite)
+    };
+    static constexpr size_t RunAheadLogSize = 4096;
+    /// The pages acquires were asked on: only writes to them are logged. A page added late counts
+    /// every entry sent before as a possible writer until the back ran it (`since`).
+    struct WatchedPage {
+        u64 key;   ///< The device page number + 1; 0: free
+        u64 since; ///< write_position when it was added
+    };
+    static constexpr size_t WatchedPageSlots = 64;
+    static constexpr size_t MaxWatchedPages = 48;
+    [[nodiscard]] static size_t WatchedSlot(u64 page) {
+        return static_cast<size_t>((page * 0x9E3779B97F4A7C15ULL) >> 58);
+    }
+    [[nodiscard]] const WatchedPage* FindWatchedPage(u64 page) const;
+    [[nodiscard]] const WatchedPage* WatchPage(u64 page);
+    void LogRunAheadWrite(DAddr address, u64 size, u64 position);
+    void NoteRunAheadWord(u64 word);
+    std::unique_ptr<RunAheadWrite[]> run_ahead_log;
+    u64 run_ahead_count{};     ///< Writes logged so far (the log keeps the last RunAheadLogSize)
+    u64 run_ahead_lost{};      ///< The last position of a logged write the log dropped
+    u64 last_unknown_writer{}; ///< After the last QMD signal whose releases stay unknown
+    u64 run_ahead_waiting{};   ///< After the newest QMD signal that waits to be valued, or 0
+    std::array<WatchedPage, WatchedPageSlots> watched_pages{};
+    size_t watched_count{};
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
     /// NoteWrite placed, and the last placed write in each slot's granules.

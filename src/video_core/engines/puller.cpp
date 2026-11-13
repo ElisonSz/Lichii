@@ -29,6 +29,7 @@
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/nx2_sync_suspend.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -341,6 +342,74 @@ bool MetAfterDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
 bool FencedWritePending(DAddr device) {
     const auto queued = VideoCommon::GpuSplit::Get().QueuedSemaphoreWriteAt(device);
     return queued && queued->fenced;
+}
+
+// EDEN_NX2_RUNAHEAD_VERIFY: an acquire the view passed with its reach run but the baseline's
+// writers still queued, checked on the back at its place in the ring: everything sent before it
+// has run, as after the baseline's wait (which nothing between the reach and the acquire could
+// change). The word as acquires read it must still meet it, and the buffer cache must not hold
+// it GPU-written (the baseline's view would flush it first).
+struct RunAheadCheck {
+    VideoCore::RasterizerInterface* rasterizer;
+    MemoryManager* memory;
+    GPUVAddr address;
+    DAddr device;
+    u64 sent_at;
+    u64 reach;
+    u64 writers;
+    u32 value;
+    u32 operation;
+    VideoCommon::RunAhead::Reach reason;
+
+    void operator()() const {
+        auto& verified = VideoCommon::RunAhead::verified;
+        verified.checked.fetch_add(1, std::memory_order_relaxed);
+        const bool flush =
+            Nx2MayBeGpuWritten(device, sizeof(u32)) &&
+            rasterizer->MustFlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        const u32 guest = memory->Read<u32>(address);
+        const auto shadow = Nx2MirrorShadow::Get().Read(device, guest);
+        const u32 seen = shadow.value_or(guest);
+        const bool met = operation == Nx2SemaphoreWaiters::AcquireEqual    ? seen == value
+                         : operation == Nx2SemaphoreWaiters::AcquireGequal ? seen >= value
+                                                                           : (seen & value) != 0;
+        if (met && !flush) {
+            return;
+        }
+        verified.mismatches.fetch_add(1, std::memory_order_relaxed);
+        if (flush) {
+            verified.flushes.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 32) {
+            LOG_WARNING(HW_GPU,
+                        "Run-ahead verify: semaphore {:#x} (device {:#x}, op {}, {:#x}) passed "
+                        "before the writers at {:#x} ran (reach {:#x}, {}), acquire at {:#x}; "
+                        "now {:#x} (guest {:#x}, shadow {}), GPU-written in the buffer cache {}",
+                        address, device, operation, value, writers, reach,
+                        VideoCommon::RunAhead::reach_names[static_cast<size_t>(reason)], sent_at,
+                        seen, guest, shadow.has_value(), flush);
+        }
+    }
+};
+
+// EDEN_NX2_RUNAHEAD: a greater-or-equal acquire on the syncpoint shim (no device memory there:
+// the view does not apply, and the baseline drains the split, then reads the syncpoint) that the
+// guest syncpoint meets already. Syncpoints only grow, so the value read after the drain meets it
+// too: the baseline's decision without the drain.
+bool ShimAcquireMet(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    auto& memory = dma_pusher.memory_manager;
+    if (acquire.operation != Nx2SemaphoreWaiters::AcquireGequal || (acquire.address & 3) != 0 ||
+        !VideoCommon::GpuSplit::Get().Active() ||
+        !memory.OverlapsSyncpointShim(acquire.address, sizeof(u32)) ||
+        memory.GpuToCpuAddress(acquire.address)) {
+        return false;
+    }
+    const bool met = acquire.Matches(memory.Read<u32>(acquire.address));
+    if (VideoCommon::RunAhead::stats) {
+        ++(met ? VideoCommon::RunAhead::counters.shim_met
+               : VideoCommon::RunAhead::counters.shim_drained);
+    }
+    return met;
 }
 
 void DumpSemaphoreHistory(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
@@ -817,6 +886,12 @@ void Puller::ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher) {
         if (AcquireWithoutDrain<Track>(dma_pusher, acquire, capture.Data())) {
             return;
         }
+        if (VideoCommon::RunAhead::enabled && ShimAcquireMet(dma_pusher, acquire)) [[unlikely]] {
+            if constexpr (Track) {
+                capture.Data()->decision = Details::Decision::Memory;
+            }
+            return;
+        }
         auto& stats = VideoCommon::g_acquire_stats;
         VideoCommon::Count(stats.drained);
         VideoCommon::Count(dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)
@@ -894,6 +969,14 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     acquire.split_start = split.Starts();
     acquire.writers_before = split.LastWriterPosition();
     acquire.sent_at = split.Position();
+    // EDEN_NX2_RUNAHEAD: only the entries that can change the word count as its writers.
+    namespace RunAhead = VideoCommon::RunAhead;
+    const u64 base_writers = acquire.writers_before;
+    RunAhead::Answer reach{base_writers, RunAhead::Reach::None};
+    if (RunAhead::enabled) [[unlikely]] {
+        reach = split.RunAheadReach(*device, base_writers);
+        acquire.writers_before = reach.position;
+    }
     // Registered before the view reads the word: a release the back runs from now on latches the
     // waiter even if a later one overwrites it before a poll looks (no drain orders them).
     auto& waiters = Nx2SemaphoreWaiters::Get();
@@ -905,6 +988,20 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
         }
     }
     ViewAnswer answer = AskView(dma_pusher, acquire, *device);
+    // EDEN_NX2_RUNAHEAD_STATS / _VERIFY: whether the baseline would wait for its writers here (the
+    // view's answer with them), where the reach lets this acquire go on sooner.
+    bool base_waits = false;
+    if (RunAhead::stats) [[unlikely]] {
+        ++RunAhead::counters.acquires;
+        if (reach.position < base_writers) {
+            ++RunAhead::counters.earlier;
+            PendingAcquire base = acquire;
+            base.writers_before = base_writers;
+            const ViewAnswer base_answer = AskView(dma_pusher, base, *device);
+            base_waits = base_answer.kind == Kind::Unknown && !base_answer.write_dependency &&
+                         base_answer.position > reach.position;
+        }
+    }
     bool waited = false;
     if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
         ++VideoCommon::SyncSuspend::counters.acquires;
@@ -918,7 +1015,7 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     for (u32 waits = 0; answer.kind == Kind::Unknown && waits < 2; ++waits) {
         VideoCommon::Count(stats.positioned);
         bool actually_waited;
-        const auto wait_begin = VideoCommon::SyncSuspend::enabled
+        const auto wait_begin = VideoCommon::SyncSuspend::enabled || RunAhead::stats
                                     ? VideoCommon::SyncSuspend::Clock::now()
                                     : VideoCommon::SyncSuspend::Clock::time_point{};
         if constexpr (Track) {
@@ -932,6 +1029,13 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
         }
         if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
             VideoCommon::SyncSuspend::NoteWait(wait_begin);
+        }
+        if (RunAhead::stats && !answer.write_dependency) [[unlikely]] {
+            // A wait for the writers (the reach): counted by what the reach found.
+            ++RunAhead::counters.waits;
+            ++RunAhead::counters.wait_reasons[static_cast<size_t>(reach.reason)];
+            RunAhead::counters.wait_ns += VideoCommon::SyncSuspend::Nanoseconds(
+                VideoCommon::SyncSuspend::Clock::now() - wait_begin);
         }
         if (actually_waited) {
             VideoCommon::Count(stats.positioned_waited);
@@ -947,6 +1051,17 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     case Kind::Met:
     case Kind::MetByQueued:
         pass = VerifyPass(dma_pusher, acquire, this, *device, waited, DrainSite::Acquire);
+        if (pass && base_waits && !split.Ran(base_writers)) [[unlikely]] {
+            // The baseline would still wait for its writers here.
+            ++RunAhead::counters.sooner;
+            if (RunAhead::verify) {
+                split.Defer(
+                    RunAheadCheck{dma_pusher.rasterizer, &dma_pusher.memory_manager,
+                                  acquire.address, *device, acquire.sent_at, reach.position,
+                                  base_writers, acquire.value, acquire.operation, reach.reason},
+                    VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Noted);
+            }
+        }
         if (pass && answer.kind == Kind::MetByQueued) {
             // What the front reads after the acquire waits for the work sent before the release
             // (GpuSplit::NoteSync).

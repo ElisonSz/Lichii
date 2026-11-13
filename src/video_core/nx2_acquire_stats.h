@@ -356,9 +356,48 @@ inline void ReportSyncSuspend() {
     counts = {};
 }
 
+// EDEN_NX2_RUNAHEAD_STATS (or _VERIFY): what the reaches decided, every 10 s.
+inline void ReportRunAhead() {
+    if (!RunAhead::stats) {
+        return;
+    }
+    static u32 calls{};
+    if (++calls % 64 != 0) {
+        return;
+    }
+    static auto last_report = Clock::now();
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last_report = now;
+    auto& counts = RunAhead::counters;
+    std::string reasons;
+    for (size_t i = 0; i < counts.wait_reasons.size(); ++i) {
+        reasons += fmt::format("{}{} {}", i == 0 ? "" : ", ", RunAhead::reach_names[i],
+                               counts.wait_reasons[i]);
+    }
+    auto& verified = RunAhead::verified;
+    LOG_INFO(HW_GPU,
+             "Run-ahead {:.1f} s: {} acquires with a reach, {} before the baseline's writers, {} "
+             "passed while the baseline would still wait; writer waits {} {:.2f} ms ({}); {} "
+             "logged writes scanned; shim acquires met without a drain {}, drained {}; QMDs read "
+             "from queued uploads {}, QMD signals unvalued {}; verify {} checked, {} mismatches "
+             "({} GPU-written)",
+             seconds, counts.acquires, counts.earlier, counts.sooner, counts.waits,
+             static_cast<double>(counts.wait_ns) / 1e6, reasons, counts.scanned, counts.shim_met,
+             counts.shim_drained, counts.upload_qmds, counts.unvalued,
+             verified.checked.exchange(0, std::memory_order_relaxed),
+             verified.mismatches.exchange(0, std::memory_order_relaxed),
+             verified.flushes.exchange(0, std::memory_order_relaxed));
+    counts = {};
+}
+
 inline void Report() {
     ReportFastWake();
     ReportSyncSuspend();
+    ReportRunAhead();
     if (!g_enabled) {
         return;
     }

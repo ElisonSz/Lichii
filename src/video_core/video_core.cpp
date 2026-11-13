@@ -80,6 +80,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     Settings::UpdateRescalingInfo();
     VideoCommon::FastWake::ReadSwitch();
     VideoCommon::SyncSuspend::ReadSwitch();
+    VideoCommon::RunAhead::ReadSwitch();
     VideoCommon::SyncTrace::ReadSwitch();
     VideoCommon::StreamStats::ReadSwitch();
     VideoCommon::WaitStats::ReadSwitch();
