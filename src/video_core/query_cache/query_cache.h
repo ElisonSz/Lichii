@@ -352,6 +352,19 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             split_completion.reset();
         };
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+            if (RunAhead::landings_verify && True(query_base->flags & QueryFlagBits::IsFence))
+                [[unlikely]] {
+                // A window's release dropped never latches its check
+                // (GpuSplit::CheckConvertedLanding): told apart here.
+                RunAhead::landing_counts.dropped_reports.fetch_add(1, std::memory_order_relaxed);
+                if (static std::atomic<u32> logged{};
+                    logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "Run-ahead landings verify: a fence-flagged report of {:#x} to "
+                                "{:#x} was dropped before it landed (a write over it)",
+                                static_cast<u32>(query_base->value), cpu_addr);
+                }
+            }
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "

@@ -407,13 +407,21 @@ inline void ReportRunAhead() {
         kinds += fmt::format("{}{} {}/{}/{}", i == 0 ? "" : ", ", RunAhead::w1_kind_names[i],
                              operations[0], operations[1], operations[2]);
     }
+    std::string refusals;
+    for (size_t i = 0; i < counts.base_refusals.size(); ++i) {
+        refusals += fmt::format("{}{} {}", i == 0 ? "" : ", ", RunAhead::base_refusal_names[i],
+                                counts.base_refusals[i]);
+    }
     LOG_INFO(HW_GPU,
              "Run-ahead W1 releases {:.1f} s (acquires equal/greater or equal/mask): {}; made "
              "fenced by a landing window {}; maxima passed {} (verify confirmed {}, unconfirmed "
-             "{}); idle front waits with 1/2/3+ channels suspended {}/{}/{}",
+             "{}); QMD reductions and maxima valued from the window's order {} (no base: {}), "
+             "passed on them {} (verify confirmed {}, unconfirmed {}); idle front waits with "
+             "1/2/3+ channels suspended {}/{}/{}",
              seconds, kinds, counts.w1_windowed, counts.w1_max_passes, counts.w1_max_confirmed,
-             counts.w1_max_unconfirmed, counts.idle_channels[0], counts.idle_channels[1],
-             counts.idle_channels[2]);
+             counts.w1_max_unconfirmed, counts.window_bases, refusals, counts.w1_base_passes,
+             counts.w1_base_confirmed, counts.w1_base_unconfirmed, counts.idle_channels[0],
+             counts.idle_channels[1], counts.idle_channels[2]);
     if (RunAhead::landings) {
         auto& landing = RunAhead::landing_counts;
         const auto take = [](std::atomic<u64>& value) {
@@ -427,7 +435,7 @@ inline void ReportRunAhead() {
                  "({:.2f} ms); settled reads of a word with one pending: words that only grow {}, "
                  "held until it landed {}; reads after a drain that waited for one {} (gave up "
                  "{}); verify ordered {}, out of order {}, unchecked {}, windows without a check "
-                 "{}",
+                 "{}, fence-flagged reports dropped before they landed {}",
                  seconds, counts.windows_opened, counts.windows_extended, counts.windows_closed,
                  counts.windows_acked, counts.notes_fenced, take(landing.reports),
                  take(landing.operations), take(landing.pending_max), take(landing.extended),
@@ -435,7 +443,8 @@ inline void ReportRunAhead() {
                  static_cast<double>(take(landing.overwrite_ns)) / 1e6,
                  take(landing.advancing_reads), take(landing.held_reads), take(landing.drain_waits),
                  take(landing.early_reads), take(landing.ordered), take(landing.out_of_order),
-                 take(landing.unchecked), counts.checks_unregistered);
+                 take(landing.unchecked), counts.checks_unregistered,
+                 take(landing.dropped_reports));
     }
     const double lead_avg = counts.acquires == 0 ? 0.0
                                                  : static_cast<double>(counts.lead_sum) /

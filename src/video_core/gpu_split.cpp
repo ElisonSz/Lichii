@@ -453,6 +453,68 @@ std::shared_ptr<void> GpuSplit::ConvertedLanding(u64 device, bool report) {
     return std::make_shared<LandingToken>(*this, word, landing_check);
 }
 
+namespace {
+/// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: the check slot the next window takes (front only).
+size_t g_landing_slot{};
+} // Anonymous namespace
+
+u64 GpuSplit::StartLandingCheck(u64 device, u32 value, u32 operation, u64 address,
+                                const void* memory, const QueuedSemaphoreWrite& release,
+                                u64 release_entry, const void* waiter, bool met) {
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    auto& checks = RunAhead::landing_checks;
+    const size_t slot = g_landing_slot++ % checks.size();
+    auto& check = checks[slot];
+    // The new generation first: a reader that no longer finds the earlier window's waiter, or
+    // finds the latch cleared or this window's fields, finds the generation moved as well
+    // (CheckConvertedLanding): the earlier window's landings still pending count as unchecked.
+    const u32 generation = check.generation.load(std::memory_order_relaxed) + 1;
+    check.generation.store(generation, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    if (check.registered) {
+        waiters.Remove(&check);
+        check.registered = false;
+    }
+    check.latched.store(false, std::memory_order_relaxed);
+    check.device.store(device, std::memory_order_relaxed);
+    check.value.store(value, std::memory_order_relaxed);
+    check.operation.store(operation, std::memory_order_relaxed);
+    check.address.store(address, std::memory_order_relaxed);
+    check.memory.store(memory, std::memory_order_relaxed);
+    check.release_position.store(release.position, std::memory_order_relaxed);
+    check.release_entry.store(release_entry, std::memory_order_relaxed);
+    check.release_payload.store(release.payload, std::memory_order_relaxed);
+    check.release_writer.store(static_cast<u8>(release.writer), std::memory_order_relaxed);
+    check.release_at_least.store(release.at_least, std::memory_order_relaxed);
+    check.release_windowed.store(release.windowed, std::memory_order_relaxed);
+    if (!waiters.Add(&check, device, value, operation)) {
+        RunAhead::counters.checks_unregistered += 1;
+        return 0;
+    }
+    check.registered = true;
+    // A release that landed before the check's waiter was added latched the acquire's own, or,
+    // landed before the acquire's waiter was added too (its entry not complete yet), was in memory
+    // when the caller read the word (`met`).
+    if (met || waiters.Latched(waiter)) {
+        check.latched.store(true, std::memory_order_relaxed);
+    }
+    return RunAhead::PackLandingCheck(slot, generation);
+}
+
+void GpuSplit::SweepLandingChecks() {
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    for (auto& check : RunAhead::landing_checks) {
+        if (check.registered && waiters.Latched(&check)) {
+            // The flag before the waiter goes: a reader that no longer finds the waiter finds the
+            // flag set (CheckConvertedLanding looks at the waiter first).
+            check.latched.store(true, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+            waiters.Remove(&check);
+            check.registered = false;
+        }
+    }
+}
+
 void GpuSplit::CheckConvertedLanding(const std::shared_ptr<void>& token) {
     auto& counts = RunAhead::landing_counts;
     const auto* const landing = static_cast<const LandingToken*>(token.get());
@@ -463,27 +525,63 @@ void GpuSplit::CheckConvertedLanding(const std::shared_ptr<void>& token) {
     const size_t slot = static_cast<size_t>(landing->check & 0xff) - 1;
     const u32 generation = static_cast<u32>(landing->check >> 8);
     auto& check = RunAhead::landing_checks[slot % RunAhead::landing_checks.size()];
-    const bool latched = check.latched.load(std::memory_order_acquire) ||
-                         Tegra::Nx2SemaphoreWaiters::Get().Latched(&check);
     if (check.generation.load(std::memory_order_acquire) != generation) {
         counts.unchecked.fetch_add(1, std::memory_order_relaxed); // The slot went to a later window
         return;
     }
-    if (latched) {
+    // The waiter, then the flag, then the generation again (RunAhead::LandingCheck): a sweep moves
+    // a latch from the waiter to the flag, a later window moves the generation first.
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    const bool in_table = waiters.Latched(&check);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const bool flagged = check.latched.load(std::memory_order_relaxed);
+    const u64 device = check.device.load(std::memory_order_relaxed);
+    const u32 value = check.value.load(std::memory_order_relaxed);
+    const u32 operation = check.operation.load(std::memory_order_relaxed);
+    const u64 address = check.address.load(std::memory_order_relaxed);
+    const auto* const memory =
+        static_cast<const Tegra::MemoryManager*>(check.memory.load(std::memory_order_relaxed));
+    const u64 release_position = check.release_position.load(std::memory_order_relaxed);
+    const u64 release_entry = check.release_entry.load(std::memory_order_relaxed);
+    const u32 release_payload = check.release_payload.load(std::memory_order_relaxed);
+    const u32 release_writer = check.release_writer.load(std::memory_order_relaxed);
+    const bool release_at_least = check.release_at_least.load(std::memory_order_relaxed);
+    const bool release_windowed = check.release_windowed.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (check.generation.load(std::memory_order_relaxed) != generation) {
+        counts.unchecked.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (in_table || flagged) {
         counts.ordered.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     counts.out_of_order.fetch_add(1, std::memory_order_relaxed);
     if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        // What decides it in the next run: whether the release's entry landed by now (as the
+        // front counts it), the acquire's word now (the release dropped, or written over), and
+        // whether the check is latched now (a reader that ran into the front's bookkeeping).
+        const bool latched_now =
+            waiters.Latched(&check) || check.latched.load(std::memory_order_acquire);
+        const u32 generation_now = check.generation.load(std::memory_order_acquire);
+        const bool entry_landed =
+            Get().fenced_landed.load(std::memory_order_acquire) > release_entry;
+        const u32 guest = memory != nullptr ? memory->Read<u32>(address) : 0;
+        const auto shadow = Tegra::Nx2MirrorShadow::Get().Peek(device);
         LOG_ERROR(HW_GPU,
                   "Run-ahead landings verify: a converted landing (word {:#x}) was applied before "
                   "its window's release landed (the window's acquire: device {:#x}, op {}, {:#x}; "
-                  "its release: {}{:#x} at {:#x}, writer {}, {}; check slot {}, generation {})",
-                  landing->device, check.device, check.operation, check.value,
-                  check.release_at_least ? "at least " : "", check.release_payload,
-                  check.release_position, check.release_writer,
-                  check.release_windowed ? "fenced by a window" : "fence-flagged", slot,
-                  generation);
+                  "its release: {}{:#x} at {:#x}, writer {}, {}; check slot {}, generation {}). "
+                  "Now: the release's entry {} as the front counts, the acquire's word holds "
+                  "{:#x}{}, the check is {}latched (generation {})",
+                  landing->device, device, operation, value, release_at_least ? "at least " : "",
+                  release_payload, release_position, release_writer,
+                  release_windowed ? "fenced by a window" : "fence-flagged", slot, generation,
+                  entry_landed ? "landed" : "not landed", guest,
+                  shadow ? fmt::format(" (mirror shadow {:#x} set over {:#x})", shadow->first,
+                                       shadow->second)
+                         : std::string{},
+                  latched_now ? "" : "not ", generation_now);
     }
 }
 
@@ -537,6 +635,17 @@ bool GpuSplit::LandingPendingAt(u64 device) const {
     }
     std::scoped_lock lock{landing_words_mutex};
     return landing_words.contains(device & ~u64{3});
+}
+
+bool GpuSplit::WaitForLandingsAt(u64 device, std::chrono::milliseconds limit) const {
+    const auto start = std::chrono::steady_clock::now();
+    while (LandingPendingAt(device)) {
+        if (std::chrono::steady_clock::now() - start > limit) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
 }
 
 bool GpuSplit::LandingPendingIn(u64 device, u64 size) const {
@@ -746,7 +855,7 @@ bool GpuSplit::WaitForSync() {
 }
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing,
-                                  bool at_least, SemaphoreWriter writer) {
+                                  bool at_least, SemaphoreWriter writer, bool window_base) {
     bool windowed = false;
     if (landing == Landing::AtRun && (landing_window_open || landing_close_pending)) [[unlikely]] {
         // EDEN_NX2_RUNAHEAD_LANDINGS: the back may make it a fence operation (OpenLandingWindow).
@@ -773,18 +882,31 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         .settle = 0,
         .windowed = windowed,
         .raced = false,
+        .ordered = false,
+        .window_base = window_base,
     };
     const u64 word = device_address & ~u64{3};
-    if (const auto it = semaphore_writes.find(word);
-        !write.fenced && it != semaphore_writes.end() && it->second.fenced &&
-        fenced_landed.load(std::memory_order_acquire) <= it->second.entry) {
+    const auto previous = semaphore_writes.find(word);
+    // A fenced write sent before that has not landed (one landing at run that such a write made
+    // fenced as well).
+    const bool earlier_pending =
+        previous != semaphore_writes.end() && previous->second.fenced &&
+        fenced_landed.load(std::memory_order_acquire) <= previous->second.entry;
+    if (!write.fenced && earlier_pending) {
         // A fenced write sent before may land after this one: until it did, the word holds
         // either.
-        write.entry = it->second.entry;
+        write.entry = previous->second.entry;
         write.known = false;
         write.fenced = true;
         write.raced = true;
     }
+    // EDEN_NX2_RUNAHEAD_WINDOW_BASE: it lands after every write sent to the word before it, for
+    // certain, when it lands as the back runs it (nothing fenced before it pending: else it is
+    // raced), when it is fence-flagged (fences run in order), when a window is open (the back makes
+    // it a fence operation), or, with only a close pending (the back may land it at run), when no
+    // fenced write sent before is pending.
+    write.ordered =
+        !write.raced && (!write.fenced || !windowed || landing_window_open || !earlier_pending);
     if (SyncSuspend::enabled) [[unlikely]] {
         write.settle = SettleBefore(word, write, landing == Landing::AtRun);
     }
@@ -847,9 +969,62 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     if (!queued) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known,    it->second.at_least,
-                                it->second.fenced,  it->second.writer,   it->second.position,
-                                it->second.settle,  it->second.windowed, it->second.raced};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known,      it->second.at_least,
+                                it->second.fenced,  it->second.writer,     it->second.position,
+                                it->second.settle,  it->second.windowed,   it->second.raced,
+                                it->second.ordered, it->second.window_base};
+}
+
+std::optional<u32> GpuSplit::WindowBase(u64 device, u64 target, bool gpu_written) const {
+    using Refusal = RunAhead::BaseRefusal;
+    const auto refuse = [](Refusal why) -> std::optional<u32> {
+        RunAhead::counters.base_refusals[static_cast<size_t>(why)] += RunAhead::stats ? 1 : 0;
+        return std::nullopt;
+    };
+    const auto queued = QueuedSemaphoreWriteAt(device);
+    if (!queued) {
+        return std::nullopt; // In memory as far as the front knows: memory decides
+    }
+    if (!landing_window_open) {
+        return refuse(Refusal::Closing);
+    }
+    if (!queued->known || queued->at_least) {
+        return refuse(Refusal::PreviousUnknown);
+    }
+    if (!queued->ordered) {
+        return refuse(Refusal::PreviousRacing);
+    }
+    // The last write sent over the word: that release's own (placed when it was noted), unless
+    // something was written there since. Both answers bound it from above.
+    u64 written = target;
+    if (const auto logged = LoggedWritesTarget(device & ~u64{3}, sizeof(u32))) {
+        written = (std::min)(written, (std::max)({*logged, last_unplaced_write, run_ahead_lost}));
+    }
+    if (written > queued->position) {
+        return refuse(Refusal::WrittenAfter);
+    }
+    // Their releases are noted nowhere: they may write the word, and land between the two.
+    if ((std::max)(last_unknown_writer, run_ahead_waiting) > queued->position) {
+        return refuse(Refusal::UnvaluedAfter);
+    }
+    if (gpu_written) {
+        return refuse(Refusal::GpuWritten); // Shader stores may reach it through the caches
+    }
+    return queued->payload;
+}
+
+bool GpuSplit::MemoryHoldsBase(u64 device, u64 target, bool gpu_written) const {
+    if (gpu_written || !Ran(target)) {
+        return false;
+    }
+    if (LandingPendingAt(device)) [[unlikely]] {
+        // It lands there before the reduction: memory does not hold what that combines with yet.
+        using Refusal = RunAhead::BaseRefusal;
+        RunAhead::counters.base_refusals[static_cast<size_t>(Refusal::LandingPending)] +=
+            RunAhead::stats ? 1 : 0;
+        return false;
+    }
+    return true;
 }
 
 u64 GpuSplit::SettleBefore(u64 word, const SemaphoreWrite& write, bool lands_at_run) const {
@@ -883,9 +1058,9 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::SemaphoreWriteForStats(
         return std::nullopt;
     }
     const auto& write = it->second;
-    return QueuedSemaphoreWrite{write.payload, write.known,    write.at_least,
-                                write.fenced,  write.writer,   write.position,
-                                write.settle,  write.windowed, write.raced};
+    return QueuedSemaphoreWrite{write.payload, write.known,    write.at_least,   write.fenced,
+                                write.writer,  write.position, write.settle,     write.windowed,
+                                write.raced,   write.ordered,  write.window_base};
 }
 
 namespace {

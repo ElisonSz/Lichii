@@ -758,8 +758,10 @@ private:
         const auto device = memory.Device(address);
         // The word a reduction or a maximum combines the payload with, before this write.
         std::optional<u32> base;
+        bool window_base = false;
         if (device && (reduction || maximum)) {
-            base = WordAt(split, memory, address, *device);
+            base = WordAt(split, memory, address, *device, &window_base);
+            RunAhead::counters.window_bases += window_base && RunAhead::stats ? 1 : 0;
         }
         memory.NoteWrite(split, address, size);
         if (!device) {
@@ -783,7 +785,7 @@ private:
                                          : at_least ? Note::AtLeast
                                                     : Note::Exact);
             if (checks_pending) {
-                checks.push_back({word, value, known, at_least});
+                checks.push_back({word, value, known, at_least, nullptr});
             }
         };
         SemRecorder::Add({.kind = "front-qmd",
@@ -797,7 +799,7 @@ private:
             const u32 value =
                 base ? Tegra::ReduceSemaphore((flags >> 20) & 7, is_signed, *base, payload) : 0;
             split.NoteSemaphoreWrite(*device, value, base.has_value(), GpuSplit::Landing::AtRun,
-                                     false, GpuSplit::SemaphoreWriter::QmdReduction);
+                                     false, GpuSplit::SemaphoreWriter::QmdReduction, window_base);
             check(*device, value, base.has_value(), false);
         } else if (four_words) {
             // The payload as 64 bits, a timestamp after it.
@@ -811,7 +813,7 @@ private:
             // Whatever the word held, it holds the payload at least.
             const u32 value = base ? (std::max)(*base, payload) : payload;
             split.NoteSemaphoreWrite(*device, value, true, !base.has_value(),
-                                     GpuSplit::SemaphoreWriter::QmdReduction);
+                                     GpuSplit::SemaphoreWriter::QmdReduction, window_base);
             check(*device, value, true, !base.has_value());
         } else {
             split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced, false,
@@ -829,9 +831,16 @@ private:
     /// over it, else memory, once the back ran every write sent there before the entry. The entry
     /// itself is held unpublished (PublishHold): an idle back that ran it before this read would
     /// leave its own increment in memory, and the front would count it twice.
+    ///
+    /// EDEN_NX2_RUNAHEAD_LANDINGS: in a landing window a reduction or maximum lands as a fence
+    /// operation instead, after every write to the word before it: the last release noted there
+    /// when the window's order tells it (EDEN_NX2_RUNAHEAD_WINDOW_BASE, GpuSplit::WindowBase:
+    /// `window_base` set), and memory only while no landing the back made a fence operation is
+    /// pending there (one the front did not note: a QMD signal it could not value).
     template <typename Memory>
     [[nodiscard]] std::optional<u32> WordAt(const GpuSplit& split, const Memory& memory,
-                                            GPUVAddr address, u64 device) const {
+                                            GPUVAddr address, u64 device,
+                                            bool* window_base = nullptr) const {
         // The back reads the syncpoint shim from the syncpoints.
         if (memory.InSyncpointShim(address, sizeof(u32)) ||
             Tegra::Nx2MirrorShadow::Get().Diverts(device)) {
@@ -844,9 +853,17 @@ private:
                 queued->position >= target) {
                 return queued->payload;
             }
+            if (RunAhead::window_base && RunAhead::landings) [[unlikely]] {
+                const auto base =
+                    split.WindowBase(device, target, memory.GpuWritten(device, sizeof(u32)));
+                if (base && window_base != nullptr) {
+                    *window_base = true;
+                }
+                return base;
+            }
             return std::nullopt;
         }
-        if (memory.GpuWritten(device, sizeof(u32)) || !split.Ran(target)) {
+        if (!split.MemoryHoldsBase(device, target, memory.GpuWritten(device, sizeof(u32)))) {
             return std::nullopt;
         }
         return memory.ReadWord(address);

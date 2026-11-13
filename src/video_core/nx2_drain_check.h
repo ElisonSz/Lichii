@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -87,6 +88,10 @@ struct State {
     std::atomic<u64> qmd_late_wrong{};
     std::atomic<u64> qmd_late_missing{};
     std::atomic<u64> qmd_published_early{};
+    /// EDEN_NX2_RUNAHEAD_LANDINGS: releases the back made fence operations, compared once landed
+    /// (LandingRelease), and of those, landed otherwise than noted.
+    std::atomic<u64> qmd_landed{};
+    std::atomic<u64> qmd_landed_wrong{};
     std::chrono::steady_clock::time_point last_report{}; ///< The front's
 };
 
@@ -122,13 +127,27 @@ inline void LogWord(bool skipped, Path path, u64 entry_address, u64 word_address
 }
 
 /// front could not tell (`known` false), or that value at least (`at_least`).
+struct LandingRelease;
 struct QmdRelease {
     u64 device;
     u32 value;
     bool known;
     bool at_least;
+    /// The back's record of a release it made a fence operation (EDEN_NX2_RUNAHEAD_LANDINGS): its
+    /// value is compared once it landed (`value` is not the value then).
+    std::shared_ptr<LandingRelease> landing;
 
     bool operator==(const QmdRelease&) const = default;
+};
+
+/// A QMD release the back made a fence operation (EDEN_NX2_RUNAHEAD_LANDINGS) lands on the fencing
+/// thread, with the value the word holds then: known once it landed (QmdReleaseLanded), and the
+/// front's note for it once the back compared the method's releases (CheckQmdReleases). Whichever
+/// comes second compares them.
+struct LandingRelease {
+    std::mutex mutex;
+    std::optional<u32> landed;
+    std::optional<QmdRelease> noted;
 };
 
 /// A QMD the scheduling read (NativeQmdScheduler::Signal's read): its GPU address and words.
@@ -187,7 +206,56 @@ inline void NotePublishedEarly() {
 /// The split's back runs a release of a QMD launch (KeplerCompute::ProcessNativeMethod).
 inline void NoteQmdRelease(u64 device_address, u32 value, bool on_back) {
     if (on_back) {
-        BackQmdReleases().push_back({device_address, value, true, false});
+        BackQmdReleases().push_back({device_address, value, true, false, nullptr});
+    }
+}
+
+/// The split's back made a release of a QMD launch a fence operation (EDEN_NX2_RUNAHEAD_LANDINGS):
+/// recorded in its place, compared once it landed. The fence operation reports the value
+/// (QmdReleaseLanded).
+[[nodiscard]] inline std::shared_ptr<LandingRelease> NoteQmdReleaseLanding(u64 device_address,
+                                                                           bool on_back) {
+    if (!on_back) {
+        return nullptr;
+    }
+    auto landing = std::make_shared<LandingRelease>();
+    BackQmdReleases().push_back({device_address, 0, true, false, landing});
+    return landing;
+}
+
+/// With `landing.mutex` held, both known.
+inline void CompareLanding(const LandingRelease& landing, u64 device) {
+    State& state = Get();
+    state.qmd_landed.fetch_add(1, std::memory_order_relaxed);
+    const QmdRelease& note = *landing.noted;
+    const u32 value = *landing.landed;
+    if (!note.known || (note.at_least ? value >= note.value : value == note.value)) {
+        return;
+    }
+    state.qmd_landed_wrong.fetch_add(1, std::memory_order_relaxed);
+    if (state.qmd_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_ERROR(HW_GPU,
+                  "QMD view check: a release the back made a fence operation landed {:#x}={:#x}, "
+                  "noted {}{:#x}",
+                  device, value, note.at_least ? ">=" : "=", note.value);
+    }
+}
+
+/// The fencing thread: the release landed with `value` in its word.
+inline void QmdReleaseLanded(LandingRelease& landing, u64 device, u32 value) {
+    std::scoped_lock lock{landing.mutex};
+    landing.landed = value;
+    if (landing.noted) {
+        CompareLanding(landing, device);
+    }
+}
+
+/// The back: the front's note for the release.
+inline void ExpectQmdRelease(LandingRelease& landing, const QmdRelease& note) {
+    std::scoped_lock lock{landing.mutex};
+    landing.noted = QmdRelease{note.device, note.value, note.known, note.at_least, nullptr};
+    if (landing.landed) {
+        CompareLanding(landing, note.device);
     }
 }
 
@@ -334,16 +402,27 @@ inline void CheckQmdReleases(std::span<const QmdRelease> predicted,
     bool same = released.size() == predicted.size();
     for (size_t i = 0; same && i < released.size(); ++i) {
         const QmdRelease& note = predicted[i];
-        same = released[i].device == note.device &&
-               (!note.known || (note.at_least ? released[i].value >= note.value
-                                              : released[i].value == note.value));
+        // One made a fence operation is compared once it landed.
+        same =
+            released[i].device == note.device &&
+            (released[i].landing || !note.known ||
+             (note.at_least ? released[i].value >= note.value : released[i].value == note.value));
+    }
+    if (same) {
+        for (size_t i = 0; i < released.size(); ++i) {
+            if (released[i].landing) {
+                ExpectQmdRelease(*released[i].landing, predicted[i]);
+            }
+        }
     }
     if (!same) {
         state.qmd_wrong.fetch_add(1, std::memory_order_relaxed);
         if (state.qmd_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             std::string text;
             for (const QmdRelease& release : released) {
-                text += fmt::format(" {:#x}={:#x}", release.device, release.value);
+                text += release.landing
+                            ? fmt::format(" {:#x}=(as it lands)", release.device)
+                            : fmt::format(" {:#x}={:#x}", release.device, release.value);
             }
             text += " | noted";
             for (const QmdRelease& note : predicted) {
@@ -437,14 +516,17 @@ inline void MaybeReport() {
     const u64 qmd_late_wrong = take(state.qmd_late_wrong);
     const u64 qmd_late_missing = take(state.qmd_late_missing);
     const u64 qmd_published_early = take(state.qmd_published_early);
+    const u64 qmd_landed = take(state.qmd_landed);
+    const u64 qmd_landed_wrong = take(state.qmd_landed_wrong);
     LOG_INFO(HW_GPU,
              "QMD drain checks in {:.1f} s: methods valued {} with {} releases, released otherwise "
              "than noted {}, with {} descriptors read, read otherwise {}; valued after the back "
              "could run them {}; signals valued late {}, read otherwise {}, not compared {}; "
-             "tables compared {} (after valuing late {}), differing {}; not valued {}",
+             "tables compared {} (after valuing late {}), differing {}; not valued {}; releases "
+             "made fence operations compared as they landed {}, landed otherwise than noted {}",
              seconds, qmd_methods, qmd_releases, qmd_wrong, qmd_reads, qmd_reads_wrong,
              qmd_published_early, qmd_late_signals, qmd_late_wrong, qmd_late_missing, qmd_tables,
-             qmd_tables_late, qmd_tables_wrong, qmd_unvalued);
+             qmd_tables_late, qmd_tables_wrong, qmd_unvalued, qmd_landed, qmd_landed_wrong);
 }
 
 } // namespace VideoCommon::Nx2DrainCheck

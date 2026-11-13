@@ -536,12 +536,16 @@ public:
     /// A semaphore release was just sent: once it landed (`landing`), the word at
     /// `device_address` holds `payload`, or a value the front can't tell (`known` false: a
     /// reduction, a counter report).
+    /// `window_base`: the value is combined with a base from the window's order (WindowBase).
     void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known,
                             Landing landing = Landing::AtRun, bool at_least = false,
-                            SemaphoreWriter writer = SemaphoreWriter::Other);
+                            SemaphoreWriter writer = SemaphoreWriter::Other,
+                            bool window_base = false);
     void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least,
-                            SemaphoreWriter writer = SemaphoreWriter::Other) {
-        NoteSemaphoreWrite(device_address, payload, known, Landing::AtRun, at_least, writer);
+                            SemaphoreWriter writer = SemaphoreWriter::Other,
+                            bool window_base = false) {
+        NoteSemaphoreWrite(device_address, payload, known, Landing::AtRun, at_least, writer,
+                           window_base);
     }
     struct QueuedSemaphoreWrite {
         u32 payload;
@@ -562,6 +566,11 @@ public:
         /// word that may land after it made it fenced and unknown.
         bool windowed{};
         bool raced{};
+        /// EDEN_NX2_RUNAHEAD_WINDOW_BASE: it lands after every write sent to the word before it,
+        /// whether the back makes it a fence operation or lands it as it runs it (WindowBase).
+        bool ordered{};
+        /// Diagnostic: its value was combined with a base from the window's order.
+        bool window_base{};
     };
     /// The last write sent to the semaphore word at `device_address`, if it may not be in memory
     /// yet.
@@ -664,6 +673,41 @@ public:
     /// once its releases landed, and takes the back's acknowledgement of a close. Notes stay fenced
     /// until then: the back converts landings past a close while converted ones are pending.
     void CheckLandingWindow(VideoCore::RasterizerInterface* rasterizer);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (front): a landing window is open (not closing): the back makes
+    /// every guest-visible landing of what is sent now a fence operation.
+    [[nodiscard]] bool LandingWindowOpen() const {
+        return landing_window_open;
+    }
+    /// EDEN_NX2_RUNAHEAD_WINDOW_BASE (front, a QMD reduction or maximum to the word at `device`
+    /// about to be noted): the value it combines with as it lands, where the window's order tells.
+    /// It is sent while a window is open, so the back makes it a fence operation, run after every
+    /// one made before (FIFO fences) and after every landing at run before it: the word then holds
+    /// the last release noted there if that one is exact, lands after every earlier write to the
+    /// word for certain (`ordered`), and nothing else was written there since (placed writes by
+    /// their exact ranges where logged, `target` otherwise: the last write sent there; writes the
+    /// front could not place; QMD signals it did not value). `gpu_written`: shaders wrote the
+    /// word's page. None otherwise (counted by RunAhead::BaseRefusal), or when no release noted
+    /// there is pending (memory decides: FrontQmdView::WordAt).
+    [[nodiscard]] std::optional<u32> WindowBase(u64 device, u64 target, bool gpu_written) const;
+    /// (front) Whether memory holds what a QMD reduction or maximum to the word at `device`
+    /// combines with when no release noted there is pending: the back ran every write sent there
+    /// (`target`, the last one; `gpu_written`: shaders wrote the page), and,
+    /// EDEN_NX2_RUNAHEAD_LANDINGS, no landing the back made a fence operation is pending there (one
+    /// the front did not note: a QMD signal it could not value).
+    [[nodiscard]] bool MemoryHoldsBase(u64 device, u64 target, bool gpu_written) const;
+    /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY (front): the check of the window an acquire on `device`
+    /// (`value`, `operation`; at GPU `address` of the Tegra::MemoryManager `memory`) opens or
+    /// extends, going on before `release` (of the entry `release_entry`) landed: the next check
+    /// slot's waiter, which the release must latch. `met`: the acquire's word met it before the
+    /// waiter was added (the release landed before any waiter could see it); `waiter`: the
+    /// acquire's own, still registered. Returns the check as entries carry it
+    /// (RunAhead::PackLandingCheck), or 0 when no waiter slot is free.
+    static u64 StartLandingCheck(u64 device, u32 value, u32 operation, u64 address,
+                                 const void* memory, const QueuedSemaphoreWrite& release,
+                                 u64 release_entry, const void* waiter, bool met);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY (front): retires the checks whose waiters latched, so
+    /// waiter slots stay free for acquires.
+    static void SweepLandingChecks();
     /// EDEN_NX2_RUNAHEAD_LANDINGS (back): whether a guest-visible landing now must become a fence
     /// operation (query cache reports, FenceManager::SignalFence in a RunAhead::LandingScope).
     [[nodiscard]] bool ConvertsLandings() const {
@@ -686,6 +730,9 @@ public:
     /// EDEN_NX2_RUNAHEAD_LANDINGS: a converted landing to a word in [device, device + size) is
     /// pending (a write there must wait for it: WaitBeforeOverwrite).
     [[nodiscard]] bool LandingPendingIn(u64 device, u64 size) const;
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (front): waits up to `limit` until no converted landing to the
+    /// word at `device` is pending. Returns whether none is.
+    bool WaitForLandingsAt(u64 device, std::chrono::milliseconds limit) const;
     /// EDEN_NX2_RUNAHEAD_LANDINGS (back, no cache lock held): a write is about to drop the reports
     /// still to land where it writes (QueryCacheBase::InvalidateRegion), or to write words a
     /// converted landing still has to land on (an inline upload, before it writes:
@@ -1053,8 +1100,10 @@ private:
         bool fenced;
         SemaphoreWriter writer;
         u64 settle; ///< QueuedSemaphoreWrite::settle
-        bool windowed; ///< QueuedSemaphoreWrite::windowed
-        bool raced;    ///< QueuedSemaphoreWrite::raced
+        bool windowed;    ///< QueuedSemaphoreWrite::windowed
+        bool raced;       ///< QueuedSemaphoreWrite::raced
+        bool ordered;     ///< QueuedSemaphoreWrite::ordered
+        bool window_base; ///< QueuedSemaphoreWrite::window_base
     };
     /// The front's NoteSemaphoreWrite, by word address.
     std::unordered_map<u64, SemaphoreWrite> semaphore_writes;

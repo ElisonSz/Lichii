@@ -54,11 +54,18 @@ namespace {
 }
 
 // EDEN_NX2_RUNAHEAD_LANDINGS with EDEN_NX2_DRAIN_CHECK: a QMD release the fence manager is about to
-// make a fence operation lands off the back, where the check does not look: record it now with the
-// value it would write now (the baseline writes it now), as the check compares the front's notes.
-[[nodiscard]] bool RecordsConvertedRelease() {
-    return VideoCommon::Nx2DrainCheck::g_enabled && VideoCommon::RunAhead::landings &&
-           VideoCommon::GpuSplit::Get().ConvertsLandings();
+// make a fence operation lands off the back, where the check does not look: recorded in its place
+// now, its value compared with the front's note once it landed, with what the word held then.
+[[nodiscard]] std::shared_ptr<VideoCommon::Nx2DrainCheck::LandingRelease> RecordConvertedRelease(
+    MemoryManager& memory, GPUVAddr address) {
+    if (!VideoCommon::Nx2DrainCheck::g_enabled || !VideoCommon::RunAhead::landings ||
+        !VideoCommon::GpuSplit::Get().ConvertsLandings()) {
+        return nullptr;
+    }
+    const auto device = memory.GpuToCpuAddress(address);
+    return device ? VideoCommon::Nx2DrainCheck::NoteQmdReleaseLanding(
+                        *device, VideoCommon::GpuSplit::OnBackThread())
+                  : nullptr;
 }
 } // Anonymous namespace
 
@@ -475,12 +482,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // (FenceManager::SignalFence).
                     const VideoCommon::RunAhead::LandingScope landing_scope{
                         LandingDevice(memory_manager, address)};
-                    if (RecordsConvertedRelease()) [[unlikely]] {
-                        checked(0, ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
-                                                   memory_manager.Read<u32>(address), payload));
-                    }
+                    auto landed = RecordConvertedRelease(memory_manager, address);
                     rasterizer->SignalFence([this, address, payload, flags, checked,
-                                             recorder_device, recorder_entry] {
+                                             recorder_device, recorder_entry,
+                                             landed = std::move(landed)] {
                         const auto combine = [&](u32 current) {
                             return ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1, current, payload);
                         };
@@ -504,6 +509,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                                                        .entry = recorder_entry,
                                                        .flags = flags});
                         checked(0, value);
+                        if (landed) [[unlikely]] {
+                            VideoCommon::Nx2DrainCheck::QmdReleaseLanded(
+                                *landed, memory_manager.GpuToCpuAddress(address).value_or(0),
+                                value);
+                        }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                                 *device,
@@ -538,11 +548,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // (FenceManager::SignalFence).
                     const VideoCommon::RunAhead::LandingScope landing_scope{
                         LandingDevice(memory_manager, address)};
-                    if (RecordsConvertedRelease()) [[unlikely]] {
-                        checked(0, (std::max)(memory_manager.Read<u32>(address), payload));
-                    }
+                    auto landed = RecordConvertedRelease(memory_manager, address);
                     rasterizer->SignalFence([this, address, payload, checked, recorder_device,
-                                             recorder_entry] {
+                                             recorder_entry, landed = std::move(landed)] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
                         const u32 guest = memory_manager.Read<u32>(address);
                         const u32 value = combine(guest);
@@ -562,6 +570,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                                                        .after = value,
                                                        .entry = recorder_entry});
                         checked(0, value);
+                        if (landed) [[unlikely]] {
+                            VideoCommon::Nx2DrainCheck::QmdReleaseLanded(
+                                *landed, memory_manager.GpuToCpuAddress(address).value_or(0),
+                                value);
+                        }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                                 *device,

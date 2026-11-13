@@ -72,6 +72,13 @@ inline bool landings_verify{};
 /// waiter (GpuSplit::W1Release). In a landing window every such release is fenced: without this
 /// the acquire waits for the fence after it.
 inline bool w1_max{};
+/// EDEN_NX2_RUNAHEAD_WINDOW_BASE=1 (with LANDINGS; implies EDEN_NX2_RUNAHEAD, whose write log and
+/// unvalued-signal bookkeeping it reads): a QMD reduction or maximum sent while a landing
+/// window is open lands as a fence operation, in fence order right after every earlier write to
+/// its word. When the last release noted there is exact and lands before it for certain, and
+/// nothing else was written there since, its payload is what the reduction combines with: the
+/// front notes the exact value (GpuSplit::WindowBase), and W1 passes acquires that value meets.
+inline bool window_base{};
 /// EDEN_NX2_RUNAHEAD_QMD=1: the QMD view places the writes to the QMDs it reads by exact range from
 /// the run-ahead write log, not by hashed 256-byte granule (FrontQmdView::ReadDescriptor).
 inline bool qmd{};
@@ -90,8 +97,10 @@ inline void ReadSwitch() {
     verify = SwitchIs("EDEN_NX2_RUNAHEAD_VERIFY", '1');
     qmd = SwitchIs("EDEN_NX2_RUNAHEAD_QMD", '1');
     qmd_patch = SwitchIs("EDEN_NX2_RUNAHEAD_QMD_PATCH", '1');
-    // The QMD view's exact targets come from the write log the reach keeps; kept uploads need it.
-    enabled = verify || qmd || qmd_patch || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
+    window_base = SwitchIs("EDEN_NX2_RUNAHEAD_WINDOW_BASE", '1');
+    // The QMD view's exact targets come from the write log the reach keeps; kept uploads need it,
+    // and so do window bases (and the QMD signals the view could not value).
+    enabled = verify || qmd || qmd_patch || window_base || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
     valve_verify = SwitchIs("EDEN_NX2_RUNAHEAD_VALVE_VERIFY", '1');
     valve = valve_verify || SwitchIs("EDEN_NX2_RUNAHEAD_VALVE", '1');
     w1_verify = SwitchIs("EDEN_NX2_RUNAHEAD_W1_VERIFY", '1');
@@ -164,6 +173,35 @@ inline constexpr std::array<const char*, static_cast<size_t>(W1Kind::Count)> w1_
     return operation == 0x4 ? 1 : operation == 0x8 ? 2 : 0;
 }
 
+/// What a W1 pass relied on, for its verify (counted apart).
+enum class W1PassKind : u8 {
+    Plain,      ///< A payload the front knows
+    Maximum,    ///< EDEN_NX2_RUNAHEAD_W1_MAX: a maximum that meets a greater-or-equal acquire
+    WindowBase, ///< EDEN_NX2_RUNAHEAD_WINDOW_BASE: a value combined with the window's base
+};
+
+/// EDEN_NX2_RUNAHEAD_WINDOW_BASE: why a QMD reduction or maximum got no base from the window's
+/// order (GpuSplit::WindowBase), or, last, from memory (FrontQmdView::WordAt).
+enum class BaseRefusal : u8 {
+    Closing,         ///< No window open: the back may land it as it runs it
+    PreviousUnknown, ///< The release before it is a value the front can't tell
+    PreviousRacing,  ///< That release may land before an earlier one still pending
+    WrittenAfter,    ///< Something else was written there after that release
+    UnvaluedAfter,   ///< A QMD signal the front did not value was sent after that release
+    GpuWritten,      ///< Shaders wrote the word's page
+    LandingPending,  ///< Memory: a converted landing the front did not note is pending there
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(BaseRefusal::Count)>
+    base_refusal_names{"no window",
+                       "previous unknown",
+                       "previous may race",
+                       "written after it",
+                       "unvalued QMD after it",
+                       "GPU-written page",
+                       "memory with a landing pending"};
+
 /// The front's counts, logged every 10 s and cleared (ReportCounters; EDEN_NX2_RUNAHEAD_STATS).
 struct Counters {
     u64 acquires{}; ///< Acquires the view decided with a reach
@@ -203,6 +241,11 @@ struct Counters {
     u64 w1_max_passes{};      ///< EDEN_NX2_RUNAHEAD_W1_MAX: passes on a maximum (poll ones too)
     u64 w1_max_confirmed{};   ///< ..._W1_VERIFY: of their checks, latched
     u64 w1_max_unconfirmed{}; ///< ..._W1_VERIFY: of their checks, not latched within 250 ms
+    u64 window_bases{};       ///< ..._WINDOW_BASE: QMD reductions and maxima valued that way
+    std::array<u64, static_cast<size_t>(BaseRefusal::Count)> base_refusals{};
+    u64 w1_base_passes{};      ///< ..._WINDOW_BASE: W1 passes on such a value
+    u64 w1_base_confirmed{};   ///< ..._W1_VERIFY: of their checks, latched
+    u64 w1_base_unconfirmed{}; ///< ..._W1_VERIFY: of their checks, not latched within 250 ms
     /// Idle front waits (EDEN_NX2_SYNC_SUSPEND) by the channels suspended then: 1, 2, 3 or more.
     std::array<u64, 3> idle_channels{};
     u64 windows_opened{};      ///< LANDINGS: landing windows opened at a W1 pass
@@ -252,24 +295,36 @@ struct LandingCounters {
     std::atomic<u64> drain_waits{};     ///< LANDINGS: reads after a drain that waited for one
     std::atomic<u64> overwrite_waits{}; ///< Writes over reports waiting for the window to land
     std::atomic<u64> overwrite_ns{};
+    /// ..._VERIFY: fence-flagged reports a write over their words dropped before they landed
+    /// (QueryCacheBase::InvalidateRegion): a window's release dropped so never latches its check.
+    std::atomic<u64> dropped_reports{};
 };
 inline LandingCounters landing_counts;
 
 /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: a window's check, a waiter its release must latch (the
-/// waiter's owner is the slot). The front registers and retires it; anyone reads it.
+/// waiter's owner is the slot). The front registers and retires it (GpuSplit::StartLandingCheck,
+/// SweepLandingChecks); anyone reads it (GpuSplit::CheckConvertedLanding).
+///
+/// Order: a new window moves `generation` before it removes the earlier window's waiter and
+/// writes the rest; a sweep sets `latched` before it removes a latched waiter. A reader looks at
+/// the generation, the waiter, then `latched` and the rest, then the generation again.
 struct LandingCheck {
     std::atomic<u32> generation{};
-    u64 device{}; ///< The window's acquire (written before `generation`), for the log
-    u32 value{};
-    u32 operation{};
-    /// The release the acquire went on before, as the front noted it (for the log).
-    u64 release_position{};
-    u32 release_payload{};
-    u8 release_writer{};
-    bool release_at_least{};
-    bool release_windowed{};
     std::atomic<bool> latched{}; ///< Seen latched by the front (set before it removed the waiter)
     bool registered{};           ///< Front only: the waiter is registered
+    /// For the log: the window's acquire, the release it went on before as the front noted it,
+    /// and where to read the acquire's word.
+    std::atomic<u64> device{};
+    std::atomic<u32> value{};
+    std::atomic<u32> operation{};
+    std::atomic<u64> address{};        ///< GPU address
+    std::atomic<const void*> memory{}; ///< Its Tegra::MemoryManager
+    std::atomic<u64> release_position{};
+    std::atomic<u64> release_entry{}; ///< GpuSplit::EntryTag of the release's entry
+    std::atomic<u32> release_payload{};
+    std::atomic<u8> release_writer{};
+    std::atomic<bool> release_at_least{};
+    std::atomic<bool> release_windowed{};
 };
 inline std::array<LandingCheck, 16> landing_checks;
 /// A check as an entry carries it: slot + 1 in the low byte (0: none), generation above.

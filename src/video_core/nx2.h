@@ -250,6 +250,20 @@ public:
         return it->second.value;
     }
 
+    /// The mirrored value held for the word and the guest value it was set with, without dropping
+    /// a stale one (for logs).
+    std::optional<std::pair<u32, u32>> Peek(u64 device_address) const {
+        if (!has_words.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        std::scoped_lock lock{mutex};
+        const auto it = words.find(device_address & ~u64{3});
+        if (it == words.end()) {
+            return std::nullopt;
+        }
+        return std::pair{it->second.value, it->second.guest};
+    }
+
     void Clear() {
         std::scoped_lock lock{mutex};
         direct_words.clear();
