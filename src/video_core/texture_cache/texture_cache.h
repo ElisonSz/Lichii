@@ -46,6 +46,7 @@
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/host_mip_limits.h"
+#include "video_core/texture_cache/image_join.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/memory_accounting.h"
 #include "video_core/texture_cache/memory_trace.h"
@@ -3682,6 +3683,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     join_bad_overlap_ids.clear();
     join_copies_to_do.clear();
     join_alias_indices.clear();
+    ImageJoin::Metadata join_metadata;
     const bool this_is_linear = info.type == ImageType::Linear;
     const auto region_check = [&](ImageId overlap_id, ImageBase& overlap) {
         if (True(overlap.flags & ImageFlagBits::Remapped)) {
@@ -3709,6 +3711,27 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_info.resources = solution->resources;
             join_overlap_ids.push_back(overlap_id);
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
+            join_metadata.Invalidate();
+            return;
+        }
+        if (ImageJoin::reuse_metadata) {
+            const auto relation = ImageJoin::Classify(join_metadata, new_info, gpu_addr, cpu_addr,
+                                                       overlap, broken_views, native_bgr);
+            switch (relation) {
+            case ImageJoin::Relation::LeftAlias:
+                join_left_aliased_ids.push_back(overlap_id);
+                overlap.flags |= ImageFlagBits::Alias;
+                join_copies_to_do.emplace_back(JoinCopy{true, overlap_id});
+                break;
+            case ImageJoin::Relation::RightAlias:
+                join_right_aliased_ids.push_back(overlap_id);
+                overlap.flags |= ImageFlagBits::Alias;
+                join_copies_to_do.emplace_back(JoinCopy{true, overlap_id});
+                break;
+            case ImageJoin::Relation::BadOverlap:
+                join_bad_overlap_ids.push_back(overlap_id);
+                break;
+            }
             return;
         }
         constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
@@ -3877,8 +3900,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ++images_created;
     }
 
-    if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
-        new_info.is_sparse) {
+    if (ImageJoin::IsSparse(new_info.is_sparse, ImageJoin::sparse_check, [&] {
+            return gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes);
+        })) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
 
