@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "common/nx2_map_stats.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_system_control.h"
@@ -165,7 +166,16 @@ Result SetHeapSize64(Core::System& system, uint64_t* out_address, uint64_t size)
 }
 
 Result MapPhysicalMemory64(Core::System& system, uint64_t address, uint64_t size) {
+    namespace MapStats = Common::Nx2MapStats;
+    const bool map_stats = MapStats::Enabled();
+    const u64 begin_ns = map_stats ? MapStats::NowNs() : 0;
     const Result result = MapPhysicalMemory(system, address, size);
+    if (map_stats) {
+        MapStats::Add(MapStats::Counter::SvcMapCalls, 1);
+        MapStats::Add(MapStats::Counter::SvcMapBytes, size);
+        MapStats::Add(MapStats::Counter::SvcMapNs, MapStats::NowNs() - begin_ns);
+        MapStats::MaybeReport();
+    }
     static u64 total{};
     if (MemTrace()) {
         if (result.IsSuccess()) {
@@ -181,7 +191,16 @@ Result MapPhysicalMemory64(Core::System& system, uint64_t address, uint64_t size
 }
 
 Result UnmapPhysicalMemory64(Core::System& system, uint64_t address, uint64_t size) {
+    namespace MapStats = Common::Nx2MapStats;
+    const bool map_stats = MapStats::Enabled();
+    const u64 begin_ns = map_stats ? MapStats::NowNs() : 0;
     const Result result = UnmapPhysicalMemory(system, address, size);
+    if (map_stats) {
+        MapStats::Add(MapStats::Counter::SvcUnmapCalls, 1);
+        MapStats::Add(MapStats::Counter::SvcUnmapBytes, size);
+        MapStats::Add(MapStats::Counter::SvcUnmapNs, MapStats::NowNs() - begin_ns);
+        MapStats::MaybeReport();
+    }
     if (MemTrace()) {
         static u32 logs{};
         if (result.IsError() || logs++ < 400) {

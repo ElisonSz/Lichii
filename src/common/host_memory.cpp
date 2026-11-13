@@ -7,6 +7,7 @@
 #ifdef _WIN32
 
 #include <iterator>
+#include <map>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
@@ -67,6 +68,7 @@
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/nx2_map_stats.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -235,8 +237,17 @@ public:
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         std::unique_lock lock{placeholder_mutex};
+        const bool map_stats = Nx2MapStats::Enabled();
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
+            if (map_stats) [[unlikely]] {
+                Nx2MapStats::Add(Nx2MapStats::Counter::HostMapSplits, 1);
+            }
+        }
+        if (map_stats) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::SameBackingBytes,
+                             SameBackingBytes(virtual_offset, virtual_offset + length, host_offset));
+            ForgetUnmapped(virtual_offset, virtual_offset + length);
         }
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
         TrackPlaceholder(virtual_offset, host_offset, length);
@@ -248,7 +259,12 @@ public:
         std::scoped_lock lock{placeholder_mutex};
 
         // Unmap until there are no more placeholders
+        u64 unmapped_placeholders = 0;
         while (UnmapOnePlaceholder(virtual_offset, length)) {
+            ++unmapped_placeholders;
+        }
+        if (Nx2MapStats::Enabled()) [[unlikely]] {
+            Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmapPlaceholders, unmapped_placeholders);
         }
     }
 
@@ -357,6 +373,10 @@ private:
         const auto host_pointer_it = placeholder_host_pointers.find(placeholder_begin);
         ASSERT(host_pointer_it != placeholder_host_pointers.end());
         const size_t host_offset = host_pointer_it->second;
+        if (Nx2MapStats::Enabled()) [[unlikely]] {
+            RememberUnmapped(unmap_begin, unmap_end,
+                             host_offset + (unmap_begin - placeholder_begin));
+        }
 
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
@@ -442,6 +462,61 @@ private:
         placeholders.erase(it);
     }
 
+    /// EDEN_NX2_MAP_STATS: bytes of [begin, end) whose view unmapped last mapped the backing that
+    /// a new view at host_offset maps there.
+    [[nodiscard]] u64 SameBackingBytes(size_t begin, size_t end, size_t host_offset) const {
+        u64 same = 0;
+        auto it = unmapped_views.upper_bound(begin);
+        if (it != unmapped_views.begin()) {
+            --it;
+        }
+        for (; it != unmapped_views.end() && it->first < end; ++it) {
+            const size_t lower = it->first;
+            const auto [upper, backing] = it->second;
+            if (upper <= begin) {
+                continue;
+            }
+            const size_t overlap_begin = (std::max)(lower, begin);
+            const size_t overlap_end = (std::min)(upper, end);
+            if (backing + (overlap_begin - lower) == host_offset + (overlap_begin - begin)) {
+                same += overlap_end - overlap_begin;
+            }
+        }
+        return same;
+    }
+
+    /// EDEN_NX2_MAP_STATS: drops [begin, end) from the remembered unmapped views.
+    void ForgetUnmapped(size_t begin, size_t end) {
+        auto it = unmapped_views.upper_bound(begin);
+        if (it != unmapped_views.begin()) {
+            --it;
+        }
+        while (it != unmapped_views.end() && it->first < end) {
+            const size_t lower = it->first;
+            const auto [upper, backing] = it->second;
+            if (upper <= begin) {
+                ++it;
+                continue;
+            }
+            it = unmapped_views.erase(it);
+            if (lower < begin) {
+                unmapped_views.emplace(lower, std::pair{begin, backing});
+            }
+            if (upper > end) {
+                unmapped_views.emplace(end, std::pair{upper, backing + (end - lower)});
+            }
+        }
+    }
+
+    /// EDEN_NX2_MAP_STATS: remembers the backing a view unmapped from [begin, end) mapped.
+    void RememberUnmapped(size_t begin, size_t end, size_t backing) {
+        if (unmapped_views.size() > 65536) {
+            unmapped_views.clear();
+        }
+        ForgetUnmapped(begin, end);
+        unmapped_views.emplace(begin, std::pair{end, backing});
+    }
+
     /// Return true when a given memory region is a "nieche" and the placeholders don't have to be
     /// split.
     bool IsNiechePlaceholder(size_t virtual_offset, size_t length) const {
@@ -465,6 +540,8 @@ private:
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
+    /// EDEN_NX2_MAP_STATS: views unmapped since, by start: {end, backing offset at start}.
+    std::map<size_t, std::pair<size_t, size_t>> unmapped_views;
 };
 
 #elif defined(__OPENORBIS__) || defined(__managarm__)
@@ -1064,7 +1141,14 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    const bool map_stats = Nx2MapStats::Enabled();
+    const u64 begin_ns = map_stats ? Nx2MapStats::NowNs() : 0;
     impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
+    if (map_stats) [[unlikely]] {
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostMaps, 1);
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostMapBytes, length);
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostMapNs, Nx2MapStats::NowNs() - begin_ns);
+    }
 #endif
 }
 
@@ -1076,7 +1160,14 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    const bool map_stats = Nx2MapStats::Enabled();
+    const u64 begin_ns = map_stats ? Nx2MapStats::NowNs() : 0;
     impl->Unmap(virtual_offset + virtual_base_offset, length);
+    if (map_stats) [[unlikely]] {
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmaps, 1);
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmapBytes, length);
+        Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmapNs, Nx2MapStats::NowNs() - begin_ns);
+    }
 #endif
 }
 
