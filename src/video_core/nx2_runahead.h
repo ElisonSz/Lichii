@@ -129,6 +129,7 @@ struct Counters {
     u64 valve_ns{};
     u64 valve_requests{};     ///< EDEN_NX2_RUNAHEAD_VALVE: valves that only asked for the submit
     u64 valve_drain_passes{}; ///< ..._VERIFY: of those, passes only the drain found
+    u64 valve_wait_max_ns{};  ///< ...VALVE: the longest an acquire had waited at one of them
     u64 w1_candidates{};      ///< Acquires a fence-flagged release sent before them decides
     u64 w1_passes{};          ///< EDEN_NX2_RUNAHEAD_W1: of those, passed at once
     u64 w1_poll_passes{};     ///< Suspended acquires a fenced release sent since let go on

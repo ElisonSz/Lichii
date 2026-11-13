@@ -826,7 +826,14 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
             split.RequestIdleHook();
             MaybeReleaseFences(dma_pusher, acquire);
             if (VideoCommon::RunAhead::stats) {
-                ++VideoCommon::RunAhead::counters.valve_requests;
+                auto& counts = VideoCommon::RunAhead::counters;
+                ++counts.valve_requests;
+                // A release that only a drain lands would show here first (and at 2 s below).
+                counts.valve_wait_max_ns = (std::max)(
+                    counts.valve_wait_max_ns,
+                    static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(now - acquire.since)
+                            .count()));
             }
             if (!VideoCommon::RunAhead::valve_verify) {
                 ReportLongWait(dma_pusher, acquire, std::nullopt);

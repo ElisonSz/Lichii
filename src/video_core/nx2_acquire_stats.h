@@ -380,22 +380,23 @@ inline void ReportRunAhead() {
     }
     auto& verified = RunAhead::verified;
     // Round 2: the valve, W1 passes, the QMD view's exact placement and the uploads it may read.
-    LOG_INFO(HW_GPU,
-             "Run-ahead front {:.1f} s: valves without a drain {} (only the drain found {}); W1 "
-             "candidates {}, passed {} (not plain {}, payload unmet {}, no waiter slot {}), "
-             "suspended ones passed at a poll {}, holds {} (the back waited {}, {:.2f} ms), verify "
-             "confirmed {}, unconfirmed {}, unchecked {}; QMD reads placed exactly {} (read sooner "
-             "{}); compute uploads {} (not one linear line {}, too long {}, with list placeholders "
-             "{}), QMDs last written by part of an upload {}",
-             seconds, counts.valve_requests, counts.valve_drain_passes, counts.w1_candidates,
-             counts.w1_passes, counts.w1_not_plain, counts.w1_unmet, counts.w1_unlatched,
-             counts.w1_poll_passes, counts.w1_holds,
-             RunAhead::holds.waits.exchange(0, std::memory_order_relaxed),
-             static_cast<double>(RunAhead::holds.wait_ns.exchange(0, std::memory_order_relaxed)) /
-                 1e6,
-             counts.w1_confirmed, counts.w1_unconfirmed, counts.w1_unchecked, counts.qmd_exact,
-             counts.qmd_sooner, counts.uploads, counts.upload_rejects[0], counts.upload_rejects[1],
-             counts.upload_rejects[2], counts.upload_rejects[3]);
+    LOG_INFO(
+        HW_GPU,
+        "Run-ahead front {:.1f} s: valves without a drain {} (only the drain found {}, longest "
+        "wait at one {:.1f} ms); W1 "
+        "candidates {}, passed {} (not plain {}, payload unmet {}, no waiter slot {}), "
+        "suspended ones passed at a poll {}, holds {} (the back waited {}, {:.2f} ms), verify "
+        "confirmed {}, unconfirmed {}, unchecked {}; QMD reads placed exactly {} (read sooner "
+        "{}); compute uploads {} (not one linear line {}, too long {}, with list placeholders "
+        "{}), QMDs last written by part of an upload {}",
+        seconds, counts.valve_requests, counts.valve_drain_passes,
+        static_cast<double>(counts.valve_wait_max_ns) / 1e6, counts.w1_candidates, counts.w1_passes,
+        counts.w1_not_plain, counts.w1_unmet, counts.w1_unlatched, counts.w1_poll_passes,
+        counts.w1_holds, RunAhead::holds.waits.exchange(0, std::memory_order_relaxed),
+        static_cast<double>(RunAhead::holds.wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+        counts.w1_confirmed, counts.w1_unconfirmed, counts.w1_unchecked, counts.qmd_exact,
+        counts.qmd_sooner, counts.uploads, counts.upload_rejects[0], counts.upload_rejects[1],
+        counts.upload_rejects[2], counts.upload_rejects[3]);
     const double lead_avg = counts.acquires == 0 ? 0.0
                                                  : static_cast<double>(counts.lead_sum) /
                                                        static_cast<double>(counts.acquires);
