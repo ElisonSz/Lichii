@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
 
@@ -22,13 +23,18 @@ namespace Tegra::Control {
 void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
+    // EDEN_NX2_DRAWX_CALLS2: binding the channel bound already does nothing on the back
+    // (GPU::BindChannel returns at once), so it doesn't end the fast draw chain there.
+    const bool rebind = bind_id == last_bind_id;
+    last_bind_id = bind_id;
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer(
             [this, gpu_ptr = &gpu, bind_id] {
                 std::scoped_lock lk{scheduling_guard};
                 gpu_ptr->BindChannel(bind_id);
             },
-            0, VideoCommon::GpuSplit::Writes::Noted);
+            rebind ? VideoCommon::Nx2FastDraw::CallFlags2() : 0,
+            VideoCommon::GpuSplit::Writes::Noted);
         return;
     }
     std::scoped_lock lk{scheduling_guard};

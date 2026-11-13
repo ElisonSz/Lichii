@@ -572,6 +572,12 @@ public:
     [[nodiscard]] bool NotedWritesLost() const noexcept {
         return uniform_keep.memory_writes_lost;
     }
+    /// EDEN_NX2_DRAWX_CALLS2: guest memory written behind the caches' back (query results written
+    /// out), noted as the caches note a CPU write (NoteUniformWrite) without changing what they
+    /// hold. The caller holds `mutex`.
+    void NoteWrittenBehind(DAddr device_addr, u64 size) {
+        NoteUniformWrite(device_addr, size);
+    }
     /// EDEN_NX2_DRAWX_UNIFORMS statistics: uniform buffers kept and streamed so far (the counts
     /// TickFrame reports and resets).
     [[nodiscard]] std::pair<u64, u64> UniformKeepCounts() const noexcept {

@@ -3304,6 +3304,8 @@ private:
             switch (FastDraw::DrawXRegisterClass(method)) {
             case FastDraw::DrawXRegister::Neutral:
             case FastDraw::DrawXRegister::DynamicState:
+            case FastDraw::DrawXRegister::Clear:
+            case FastDraw::DrawXRegister::Clip:
                 FastDraw::g_delta.drawx_skipped = true;
                 return true;
             case FastDraw::DrawXRegister::PipelineState:

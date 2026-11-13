@@ -23,6 +23,7 @@
 
 #include "common/common_types.h"
 #include "common/thread.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_runahead.h"
 #include "video_core/nx2_sem_recorder.h"
@@ -330,16 +331,19 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
         NoteWrites(writes);
+        if (Nx2CallSites::g_enabled) [[unlikely]] {
+            Nx2CallSites::NameOnce<Func, false>(reinterpret_cast<u64>(&CallThunk<Func>));
+        }
     }
-    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>). `flags` as Defer's.
     template <typename Func>
-    void DeferWords(const Func& func, std::span<const u32> words,
-                    Writes writes = Writes::Anywhere) {
+    void DeferWords(const Func& func, std::span<const u32> words, Writes writes = Writes::Anywhere,
+                    u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         const size_t payload = function_words + 1 + (words.size() + 1) / 2;
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         entry[2 + function_words] = words.size();
@@ -349,6 +353,9 @@ public:
         }
         Commit(2 + payload);
         NoteWrites(writes);
+        if (Nx2CallSites::g_enabled) [[unlikely]] {
+            Nx2CallSites::NameOnce<Func, true>(reinterpret_cast<u64>(&CallWordsThunk<Func>));
+        }
     }
     void DeferFunction(std::function<void()>&& func, Writes writes = Writes::Anywhere);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer

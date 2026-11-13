@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/nx2_call_sites.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -131,8 +132,9 @@ inline bool g_drawx_coalesce{};
 inline bool g_drawx_coalesce_verify{};
 /// EDEN_NX2_DRAWX_DYNSTATE=1: depth bias values (read only by UpdateDepthBias, dynamic state on
 /// both paths) and sub_tiling_perf (read by nothing) no longer end the chain, nor does
-/// SET_SHADOW_RAM_CONTROL (it only selects how later register writes are taken); the early-Z
-/// registers (in the pipeline key) mark the delta for a pipeline lookup as fixed-function state.
+/// SET_SHADOW_RAM_CONTROL, as a method or as a register write (it only selects how later register
+/// writes are taken); the early-Z registers (in the pipeline key) mark the delta for a pipeline
+/// lookup as fixed-function state.
 inline bool g_drawx_dynstate{};
 /// EDEN_NX2_DRAWX_TWIN2=1 (implies EDEN_NX2_DRAWX_TWIN): a twin may also differ in a stage whose
 /// image descriptors are the same (GraphicsPipeline::KeepsImageStateOf).
@@ -140,8 +142,23 @@ inline bool g_drawx_twin2{};
 /// EDEN_NX2_DRAWX_CALLS=1, only with EDEN_NX2_DRAW_REUSE: deferred calls that change nothing a
 /// delta draw keeps without ending the chain themselves go to the back as neutral (CallFlags).
 inline bool g_drawx_calls{};
-/// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate: the one flag the
-/// register write path tests.
+/// EDEN_NX2_DRAWX_CALLS2=1, only with EDEN_NX2_DRAW_REUSE: as CALLS for more call sites
+/// (CallFlags2): back-run macros (their writes are classified as any other, and query results a
+/// DMA read writes out are recorded as written: RasterizerVulkan::FlushQueryResults), channel
+/// binds that keep the bound channel, fence signals and waits (SignalSyncPoint, SignalReference,
+/// ReleaseFences), semaphore word flushes, cache invalidations and list slot bookkeeping.
+inline bool g_drawx_calls2{};
+/// EDEN_NX2_DRAWX_CLEARS=1: CLEAR_SURFACE (the method and its register) no longer ends the chain.
+/// A clear records into the render pass the next draw uses (which then goes on), or ends it, or
+/// binds a helper pipeline (then the next draw is full anyway); images it retires break as
+/// deletions do.
+inline bool g_drawx_clears{};
+/// EDEN_NX2_DRAWX_CLIP=1: SURFACE_CLIP no longer ends the chain. It sizes the framebuffer
+/// (UpdateRenderTargets, which delta draws run too, without looking images up for it), the
+/// viewports (dynamic state) and the render area words (computed again by delta draws).
+inline bool g_drawx_clip{};
+/// g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate || g_drawx_clears ||
+/// g_drawx_clip: the one flag the register write path tests.
 inline bool g_drawx_registers{};
 /// Reads the switches above; called by VideoCore::CreateGPU after ReadDrawReuseSwitches.
 void ReadDrawXSwitches();
@@ -202,6 +219,10 @@ inline constexpr u64 SplitFastDrawNeutral = u64{1} << 7;
 [[nodiscard]] inline u64 CallFlags() noexcept {
     return g_drawx_calls ? SplitFastDrawNeutral : 0;
 }
+/// EDEN_NX2_DRAWX_CALLS2: as CallFlags, for the sites g_drawx_calls2 lists. Off: 0, as before.
+[[nodiscard]] inline u64 CallFlags2() noexcept {
+    return g_drawx_calls2 ? SplitFastDrawNeutral : 0;
+}
 
 /// What a 3D register write does to the delta chain under the switches above.
 enum class DrawXRegister : u8 {
@@ -211,6 +232,8 @@ enum class DrawXRegister : u8 {
     Shader,          ///< Shader programs: Delta::pipeline_state (EDEN_NX2_DRAWX_TWIN)
     DynamicState,    ///< Dynamic state only, or read by nothing: no break (EDEN_NX2_DRAWX_DYNSTATE)
     DynamicPipeline, ///< In the pipeline key: Delta::pipeline_state (EDEN_NX2_DRAWX_DYNSTATE)
+    Clear,           ///< CLEAR_SURFACE: no break (EDEN_NX2_DRAWX_CLEARS)
+    Clip,            ///< SURFACE_CLIP: no break (EDEN_NX2_DRAWX_CLIP)
 };
 /// One entry per 3D register (Maxwell3D::Regs::NUM_REGS), filled by ReadDrawXSwitches.
 inline std::array<DrawXRegister, 0xe00> g_drawx_register_class{};
@@ -449,6 +472,9 @@ inline std::atomic<u32> g_last_break{};
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
+        if (Nx2CallSites::g_enabled && reason != Reason::Call) [[unlikely]] {
+            Nx2CallSites::g_other_break.store(true, std::memory_order_relaxed);
+        }
         if (g_drawx_uniforms && reason != Reason::Register) {
             g_keep_serial.fetch_add(1, std::memory_order_relaxed);
         }

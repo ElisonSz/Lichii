@@ -170,6 +170,16 @@ void NoteReleaseForFastDraw(VideoCore::RasterizerInterface* rasterizer, GPUVAddr
     rasterizer->NoteFastDrawWrite(address, ReleaseBytes);
 }
 
+// EDEN_NX2_DRAWX_CALLS2: fence work (ReleaseFences, SignalSyncPoint, SignalReference) writes no
+// guest memory on the back but through fence operations, which the fencing thread runs between
+// breaks; what SignalFence does besides either ends the chain itself (a submit, a render pass
+// ended by recorded downloads) or is noted (CPU writes applied: BufferCache::WriteMemory) or breaks
+// (texture and shader invalidations). A syncpoint's guest actions composite a frame, which breaks.
+// A semaphore word flush downloads GPU-written bytes the host buffers hold alike.
+[[nodiscard]] u64 FenceWorkFlags() noexcept {
+    return VideoCommon::Nx2FastDraw::CallFlags2();
+}
+
 constexpr auto FenceWrites = VideoCommon::GpuSplit::Writes::Caches;
 
 void DrainBack(VideoCommon::DrainSite site = VideoCommon::DrainSite::Acquire) {
@@ -307,7 +317,7 @@ void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, DAddr 
                          address, target, before, memory_manager->Read<u32>(address));
             }
         },
-        0, VideoCommon::GpuSplit::Writes::Caches);
+        FenceWorkFlags(), VideoCommon::GpuSplit::Writes::Caches);
     acquire.flush_position = split.Position();
     if constexpr (Track) {
         acquire.stats_flushed = true;
@@ -323,7 +333,8 @@ void MaybeReleaseFences(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire) 
         return;
     }
     acquire.fences_released = true;
-    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites);
+    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites,
+           FenceWorkFlags());
 }
 
 // Logs once an acquire that waits for more than 2 s. `current`: the word as read after a drain,
@@ -1068,14 +1079,15 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites);
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites,
+               FenceWorkFlags());
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer,
                 id = static_cast<u32>(
                     regs.fence_action.syncpoint_id.Value())] { rasterizer->SignalSyncPoint(id); },
-               FenceWrites);
+               FenceWrites, FenceWorkFlags());
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -1598,7 +1610,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         // acquire waits for the work sent before it, as after a drain.
         auto& split = VideoCommon::GpuSplit::Get();
         split.NoteSync();
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites);
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites,
+               FenceWorkFlags());
         const auto queued = split.QueuedSemaphoreWriteAt(*device);
         if (!queued || queued->fenced) {
             word = ReadSemaphoreMemory(dma_pusher, address, device);
@@ -1642,8 +1655,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WrcacheFlush:
         break;
     case BufferMethods::RefCnt:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); },
-               FenceWrites);
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); }, FenceWrites,
+               FenceWorkFlags());
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
@@ -1667,8 +1680,10 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
+        // EDEN_NX2_DRAWX_CALLS2: applying collected CPU writes notes them (BufferCache::
+        // WriteMemory) or breaks (texture and shader invalidations).
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
-               VideoCommon::GpuSplit::Writes::Caches);
+               VideoCommon::GpuSplit::Writes::Caches, VideoCommon::Nx2FastDraw::CallFlags2());
         break;
     }
     case BufferMethods::MemOpC:

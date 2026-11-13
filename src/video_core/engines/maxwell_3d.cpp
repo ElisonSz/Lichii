@@ -425,6 +425,15 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
             // EDEN_NX2_DRAWX_DYNSTATE: it only selects how later register writes are taken
             // (ProcessShadowRam), and those break as any other write.
             VideoCommon::Nx2FastDraw::g_delta.drawx_skipped = true;
+        } else if (VideoCommon::Nx2FastDraw::g_drawx_clears &&
+                   method == MAXWELL3D_REG_INDEX(clear_surface)) [[unlikely]] {
+            // EDEN_NX2_DRAWX_CLEARS: RasterizerVulkan::Clear records into the render pass the next
+            // draw uses, defers the clear to the next render pass (none is active then: the next
+            // draw is full), or draws with a helper pipeline (no longer the bound one: full). What
+            // it changes besides is per-draw state both paths set again (render targets' images
+            // prepared, viewports, query segment); images a full clear retires are deleted, which
+            // breaks.
+            VideoCommon::Nx2FastDraw::g_delta.drawx_skipped = true;
         } else {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
         }
@@ -2064,7 +2073,11 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
                 AsyncReadback::MaybeReport();
             }
         },
-        fs.parameters, VideoCommon::GpuSplit::Writes::Caches);
+        // EDEN_NX2_DRAWX_CALLS2: what the macro does reaches draws through the methods it calls
+        // (which break by their kind) and its DMA reads, whose write-outs are noted or end the
+        // chain (RasterizerVulkan::FlushQueryResults, FlushRegion).
+        fs.parameters, VideoCommon::GpuSplit::Writes::Caches,
+        VideoCommon::Nx2FastDraw::CallFlags2());
     const u64 position = split.Position();
     fs.back_last = position;
     const bool tracked = fs.control == Regs::ShadowRamControl::Track ||

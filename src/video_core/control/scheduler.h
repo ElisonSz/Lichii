@@ -51,6 +51,9 @@ private:
     std::mutex scheduling_guard;
     std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
     std::atomic<bool> any_pending{};
+    /// The channel the last BindChannel bound: the GPU's once the binds sent before ran (the
+    /// front's thread only).
+    s32 last_bind_id = -1;
 };
 
 } // namespace Control

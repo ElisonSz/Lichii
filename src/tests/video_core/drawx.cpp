@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/drawx_twin.h"
 
@@ -34,7 +35,8 @@ void SetSwitch(const char* name, bool on) {
 
 /// Sets the switches as the environment would and rebuilds the register table.
 void ReadSwitches(bool neutral, bool pipestate, bool uniforms, bool twin = false,
-                  bool dynstate = false, bool coalesce = false) {
+                  bool dynstate = false, bool coalesce = false, bool clears = false,
+                  bool clip = false) {
     SetSwitch("EDEN_NX2_DRAWX_NEUTRAL", neutral);
     SetSwitch("EDEN_NX2_DRAWX_PIPESTATE", pipestate);
     SetSwitch("EDEN_NX2_DRAWX_UNIFORMS", uniforms);
@@ -45,6 +47,10 @@ void ReadSwitches(bool neutral, bool pipestate, bool uniforms, bool twin = false
     SetSwitch("EDEN_NX2_DRAWX_COALESCE_VERIFY", coalesce);
     SetSwitch("EDEN_NX2_DRAWX_TWIN2", false);
     SetSwitch("EDEN_NX2_DRAWX_CALLS", false);
+    SetSwitch("EDEN_NX2_DRAWX_CALLS2", false);
+    SetSwitch("EDEN_NX2_DRAWX_CLEARS", clears);
+    SetSwitch("EDEN_NX2_DRAWX_CLIP", clip);
+    SetSwitch("EDEN_NX2_DRAWX_CALL_SITES", false);
     FastDraw::ReadDrawXSwitches();
 }
 
@@ -119,7 +125,10 @@ TEST_CASE("DrawX: what a delta draw keeps still ends the chain", "[video_core][d
     CHECK(breaks(MAXWELL3D_REG_INDEX(vertex_attrib_format)));
     CHECK(breaks(MAXWELL3D_REG_INDEX(vertex_streams)));
     CHECK(breaks(MAXWELL3D_REG_INDEX(transform_feedback_enabled)));
-    CHECK(breaks(MAXWELL3D_REG_INDEX(surface_clip)));
+    // The surface clip only sizes the framebuffer, which delta draws update as full ones do: its
+    // own switch (EDEN_NX2_DRAWX_CLIP), breaking without it.
+    CHECK(FastDraw::ClassifyDrawXRegister(MAXWELL3D_REG_INDEX(surface_clip)) ==
+          DrawXRegister::Clip);
     // Fixed-function examples.
     CHECK(FastDraw::ClassifyDrawXRegister(MAXWELL3D_REG_INDEX(scissor_test)) ==
           DrawXRegister::PipelineState);
@@ -130,13 +139,16 @@ TEST_CASE("DrawX: what a delta draw keeps still ends the chain", "[video_core][d
 }
 
 TEST_CASE("DrawX: the register table follows the switches", "[video_core][drawx]") {
-    for (int mask = 0; mask < 16; ++mask) {
+    for (int mask = 0; mask < 64; ++mask) {
         const bool neutral = (mask & 1) != 0;
         const bool pipestate = (mask & 2) != 0;
         const bool twin = (mask & 4) != 0;
         const bool dynstate = (mask & 8) != 0;
-        ReadSwitches(neutral, pipestate, false, twin, dynstate);
-        CHECK(FastDraw::g_drawx_registers == (neutral || pipestate || twin || dynstate));
+        const bool clears = (mask & 16) != 0;
+        const bool clip = (mask & 32) != 0;
+        ReadSwitches(neutral, pipestate, false, twin, dynstate, false, clears, clip);
+        CHECK(FastDraw::g_drawx_registers ==
+              (neutral || pipestate || twin || dynstate || clears || clip));
         for (u32 method = 0; method < NumRegs; ++method) {
             const DrawXRegister full = FastDraw::ClassifyDrawXRegister(method);
             DrawXRegister expected = full;
@@ -144,7 +156,9 @@ TEST_CASE("DrawX: the register table follows the switches", "[video_core][drawx]
                 (full == DrawXRegister::PipelineState && !pipestate) ||
                 (full == DrawXRegister::Shader && !twin) ||
                 ((full == DrawXRegister::DynamicState || full == DrawXRegister::DynamicPipeline) &&
-                 !dynstate)) {
+                 !dynstate) ||
+                (full == DrawXRegister::Clear && !clears) ||
+                (full == DrawXRegister::Clip && !clip)) {
                 expected = DrawXRegister::Breaks;
             }
             CHECK(FastDraw::DrawXRegisterClass(method) == expected);
@@ -223,11 +237,14 @@ TEST_CASE("DrawX: uniform keep chains end at draws that never bound their unifor
     CHECK(!chain.Keeps(taken, 6, false));
 }
 
-TEST_CASE("DrawX: dynamic state registers are exactly the depth bias, sub tiling and early-Z ones",
+TEST_CASE("DrawX: dynamic state registers are exactly the depth bias, sub tiling, shadow RAM "
+          "control and early-Z ones",
           "[video_core][drawx]") {
-    const std::array<u32, 3> depth_bias{MAXWELL3D_REG_INDEX(depth_bias),
-                                        MAXWELL3D_REG_INDEX(slope_scale_depth_bias),
-                                        MAXWELL3D_REG_INDEX(depth_bias_clamp)};
+    // SET_SHADOW_RAM_CONTROL also as a register write (ProcessDirtyRegisters breaks before the
+    // method's own handler runs).
+    const std::array<u32, 4> depth_bias{
+        MAXWELL3D_REG_INDEX(depth_bias), MAXWELL3D_REG_INDEX(slope_scale_depth_bias),
+        MAXWELL3D_REG_INDEX(depth_bias_clamp), MAXWELL3D_REG_INDEX(shadow_ram_control)};
     u32 dynamic = 0;
     for (u32 method = 0; method < NumRegs; ++method) {
         const DrawXRegister kind = FastDraw::ClassifyDrawXRegister(method);
@@ -246,7 +263,7 @@ TEST_CASE("DrawX: dynamic state registers are exactly the depth bias, sub tiling
                   FastDraw::ClassBit(FastDraw::BreakClass::Other));
         }
     }
-    CHECK(dynamic == 3 + sizeof(Maxwell3D::Regs::SubTilingPerf) / 4 +
+    CHECK(dynamic == 4 + sizeof(Maxwell3D::Regs::SubTilingPerf) / 4 +
                          sizeof(Maxwell3D::Regs::OpportunisticEarlyZ) / 4);
     // Depth bias enables come from the polygon offset registers, in the pipeline key: unchanged.
     CHECK(FastDraw::ClassifyDrawXRegister(MAXWELL3D_REG_INDEX(polygon_offset_point_enable)) ==
@@ -503,4 +520,169 @@ TEST_CASE("DrawX: twins by image descriptors resolve the same image state", "[vi
     Shader::Info other_hash = programmed_too;
     other_hash.handle_shader_hash = 0x4321;
     CHECK(!ResolvesSameImageState(program_lhs, GraphicsStageInfo{other_hash}));
+}
+
+TEST_CASE("DrawX: clear and clip registers are exactly CLEAR_SURFACE and SURFACE_CLIP",
+          "[video_core][drawx]") {
+    u32 clears = 0;
+    u32 clips = 0;
+    for (u32 method = 0; method < NumRegs; ++method) {
+        const DrawXRegister kind = FastDraw::ClassifyDrawXRegister(method);
+        CHECK((kind == DrawXRegister::Clear) == (method == MAXWELL3D_REG_INDEX(clear_surface)));
+        CHECK((kind == DrawXRegister::Clip) == InRange(method, MAXWELL3D_REG_INDEX(surface_clip),
+                                                       sizeof(Maxwell3D::Regs::SurfaceClip)));
+        clears += kind == DrawXRegister::Clear ? 1 : 0;
+        clips += kind == DrawXRegister::Clip ? 1 : 0;
+        if (kind == DrawXRegister::Clear || kind == DrawXRegister::Clip) {
+            // Not in a class another switch takes already.
+            CHECK(FastDraw::ClassifyBreak(FastDraw::Reason::Register, method) ==
+                  FastDraw::ClassBit(FastDraw::BreakClass::Other));
+        }
+    }
+    CHECK(clears == 1);
+    CHECK(clips == 2);
+    // Off: they break as before; on: no break, attributed to the switches.
+    ReadSwitches(false, false, false);
+    CHECK(FastDraw::DrawXRegisterClass(MAXWELL3D_REG_INDEX(clear_surface)) ==
+          DrawXRegister::Breaks);
+    CHECK(FastDraw::DrawXRegisterClass(MAXWELL3D_REG_INDEX(surface_clip)) == DrawXRegister::Breaks);
+    ReadSwitches(false, false, false, false, false, false, true, true);
+    CHECK(FastDraw::g_drawx_clears);
+    CHECK(FastDraw::g_drawx_clip);
+    CHECK(FastDraw::g_drawx_registers);
+    CHECK(FastDraw::DrawXRegisterClass(MAXWELL3D_REG_INDEX(clear_surface)) == DrawXRegister::Clear);
+    CHECK(FastDraw::DrawXRegisterClass(MAXWELL3D_REG_INDEX(surface_clip) + 1) ==
+          DrawXRegister::Clip);
+    ReadSwitches(false, false, false);
+}
+
+TEST_CASE("DrawX: CALLS2 flags only with CALLS2 and REUSE", "[video_core][drawx]") {
+    const auto read = [](bool calls2, bool reuse) {
+        SetSwitch("EDEN_NX2_DRAW_REUSE", reuse);
+        SetSwitch("EDEN_NX2_DRAW_DELTA", false);
+        FastDraw::g_draw_delta = false;
+        FastDraw::ReadDrawReuseSwitches();
+        ReadSwitches(false, false, false);
+        SetSwitch("EDEN_NX2_DRAWX_CALLS2", calls2);
+        FastDraw::ReadDrawXSwitches();
+    };
+    read(false, false);
+    CHECK(FastDraw::CallFlags2() == 0);
+    read(true, false);
+    CHECK(!FastDraw::g_drawx_calls2);
+    CHECK(FastDraw::CallFlags2() == 0);
+    read(false, true);
+    CHECK(FastDraw::CallFlags2() == 0);
+    CHECK(FastDraw::CallFlags() == 0);
+    read(true, true);
+    CHECK(FastDraw::g_drawx_calls2);
+    CHECK(FastDraw::CallFlags2() == FastDraw::SplitFastDrawNeutral);
+    // Independent of CALLS.
+    CHECK(FastDraw::CallFlags() == 0);
+    read(false, false);
+    FastDraw::g_draw_delta = false;
+}
+
+TEST_CASE("DrawX: call site names keep the lambda's file and line or the type",
+          "[video_core][drawx]") {
+    namespace Sites = VideoCommon::Nx2CallSites;
+    CHECK(Sites::ShortName("const char *VideoCommon::Nx2CallSites::NameOf() [Func = (lambda at "
+                           "C:\\work\\lichii\\src\\video_core\\engines\\puller.cpp:871:13)]") ==
+          "video_core\\engines\\puller.cpp:871:13");
+    CHECK(Sites::ShortName("const char *VideoCommon::Nx2CallSites::NameOf() [Func = (lambda at "
+                           "/home/x/src/lichii/src/video_core/gpu_thread.cpp:232:21)]") ==
+          "video_core/gpu_thread.cpp:232:21");
+    CHECK(
+        Sites::ShortName("constexpr const char* VideoCommon::Nx2CallSites::NameOf() [with Func = "
+                         "Tegra::Control::Scheduler::BindChannel(Tegra::GPU&, s32)::<lambda()>]") ==
+        "Tegra::Control::Scheduler::BindChannel(Tegra::GPU&, s32)::<lambda()>");
+    CHECK(Sites::ShortName("const char *__cdecl VideoCommon::Nx2CallSites::NameOf<struct "
+                           "Tegra::Engines::RunAheadCheck>(void) noexcept") ==
+          "struct Tegra::Engines::RunAheadCheck");
+    CHECK(Sites::ShortName("plain") == "plain");
+    [[maybe_unused]] const auto lambda = [] {};
+    const std::string_view own = Sites::ShortName(Sites::NameOf<decltype(lambda)>());
+#if defined(__clang__)
+    CHECK(own.find("drawx.cpp:") != std::string_view::npos);
+    CHECK(own.find("src") == std::string_view::npos);
+#elif defined(__GNUC__)
+    CHECK(own.find("lambda") != std::string_view::npos);
+#endif
+    CHECK(!own.empty());
+}
+
+TEST_CASE("DrawX: call sites count the calls and the full draws they broke",
+          "[video_core][drawx]") {
+    namespace Sites = VideoCommon::Nx2CallSites;
+    Sites::ResetForTests();
+    Sites::g_enabled = true;
+    constexpr u64 macro_thunk = 0x1000;
+    constexpr u64 bind_thunk = 0x2000;
+    Sites::Name(macro_thunk, "[Func = (lambda at /src/video_core/engines/maxwell_3d.cpp:1865:9)]");
+    Sites::Name(bind_thunk, "[Func = (lambda at /src/video_core/control/scheduler.cpp:27:13)]");
+    CHECK(Sites::SiteCountForTests() == 2);
+
+    // A back macro alone before a draw: its only cause and its last break.
+    Sites::NoteBreak(macro_thunk);
+    Sites::NoteBreak(macro_thunk);
+    auto breaks = Sites::TakeDraw();
+    CHECK(breaks.sites == 1);
+    CHECK(breaks.last == 1);
+    CHECK(!breaks.other);
+    Sites::NoteFullDraw(breaks, true);
+    // A bind, then a macro: both sites (several), the macro last.
+    Sites::NoteBreak(bind_thunk);
+    Sites::NoteBreak(macro_thunk);
+    breaks = Sites::TakeDraw();
+    CHECK(breaks.sites == 3);
+    Sites::NoteFullDraw(breaks, true);
+    // A macro, then a register break: the call is neither the last break nor the only cause.
+    Sites::NoteBreak(macro_thunk);
+    FastDraw::Break(FastDraw::Reason::Register, 0x123);
+    breaks = Sites::TakeDraw();
+    CHECK(breaks.other);
+    Sites::NoteFullDraw(breaks, false);
+    // A register break, then a bind: the bind is the last break, not the only cause.
+    FastDraw::Break(FastDraw::Reason::Register, 0x123);
+    FastDraw::Break(FastDraw::Reason::Call);
+    Sites::NoteBreak(bind_thunk);
+    breaks = Sites::TakeDraw();
+    CHECK(breaks.other);
+    Sites::NoteFullDraw(breaks, true);
+    // A call of a site never named: counted apart.
+    Sites::NoteBreak(0x3000);
+    breaks = Sites::TakeDraw();
+    CHECK(breaks.unnamed);
+    CHECK(breaks.last == 0);
+    Sites::NoteFullDraw(breaks, true);
+    // Neutral calls are counted as such.
+    Sites::NoteNeutral(bind_thunk);
+    // Nothing since: an empty set.
+    breaks = Sites::TakeDraw();
+    CHECK(breaks.sites == 0);
+    CHECK(!breaks.other);
+
+    const auto macro = Sites::CountsForTests(0);
+    const auto bind = Sites::CountsForTests(1);
+    CHECK(Sites::ShortName(macro.name) == "video_core/engines/maxwell_3d.cpp:1865:9");
+    CHECK(macro.breaks == 4);
+    CHECK(macro.last_draws == 2);
+    CHECK(macro.sole_draws == 1);
+    CHECK(bind.breaks == 2);
+    CHECK(bind.neutral == 1);
+    CHECK(bind.last_draws == 1);
+    CHECK(bind.sole_draws == 0);
+    // The window's report logs and starts over.
+    Sites::Report(1.0);
+    CHECK(Sites::CountsForTests(0).breaks == 0);
+    CHECK(Sites::CountsForTests(0).last_draws == 0);
+    CHECK(Sites::SiteCountForTests() == 2);
+
+    // Named once per function object type.
+    [[maybe_unused]] const auto first = [] {};
+    Sites::NameOnce<decltype(first), false>(0x4000);
+    Sites::NameOnce<decltype(first), false>(0x4000);
+    CHECK(Sites::SiteCountForTests() == 3);
+    Sites::g_enabled = false;
+    Sites::ResetForTests();
 }

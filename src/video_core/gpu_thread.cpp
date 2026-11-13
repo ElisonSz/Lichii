@@ -29,6 +29,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sync_suspend.h"
@@ -229,11 +230,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                                  size = flush->size] { rasterizer_ptr->FlushRegion(addr, size); },
                                 0, VideoCommon::GpuSplit::Writes::Caches);
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+                    // EDEN_NX2_DRAWX_CALLS2: the caches note the write (BufferCache::
+                    // WriteMemory) or break (texture and shader invalidations), as for the CPU
+                    // writes other threads apply directly.
                     split.Defer(
                         [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                             rasterizer_ptr->OnCacheInvalidation(addr, size);
                         },
-                        0, VideoCommon::GpuSplit::Writes::Noted);
+                        VideoCommon::Nx2FastDraw::CallFlags2(),
+                        VideoCommon::GpuSplit::Writes::Noted);
                 } else {
                     ASSERT(false);
                 }

@@ -500,6 +500,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     if (FastDraw::g_drawx_coalesce_verify) [[unlikely]] {
         FastDraw::CheckCoalesced(delta);
     }
+    // EDEN_NX2_DRAWX_CALL_SITES: the deferred calls (and other breaks) since the previous draw.
+    const auto call_breaks = VideoCommon::Nx2CallSites::g_enabled
+                                 ? VideoCommon::Nx2CallSites::TakeDraw()
+                                 : VideoCommon::Nx2CallSites::DrawBreaks{};
     matched_candidate = false;
     twin_source = nullptr;
     if (FastDraw::g_draw_reuse || FastDraw::g_drawx_twin) {
@@ -534,6 +538,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     if (serial_changed) {
         const u32 last_break = FastDraw::g_last_break.load(std::memory_order_relaxed);
         ++fast_draw_stats.breaks[last_break & 0xff];
+        if (VideoCommon::Nx2CallSites::g_enabled) [[unlikely]] {
+            VideoCommon::Nx2CallSites::NoteFullDraw(
+                call_breaks, (last_break & 0xff) == static_cast<u32>(FastDraw::Reason::Call));
+        }
         if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
             ++fast_draw_stats.break_methods[method];
         }
@@ -874,7 +882,9 @@ void RasterizerVulkan::ReportFastDraws() {
         VideoCommon::Nx2FastDraw::g_drawx_uniforms || VideoCommon::Nx2FastDraw::g_drawx_twin ||
         VideoCommon::Nx2FastDraw::g_drawx_verify || VideoCommon::Nx2FastDraw::g_drawx_keep_audit ||
         VideoCommon::Nx2FastDraw::g_drawx_no_keeps || VideoCommon::Nx2FastDraw::g_drawx_coalesce ||
-        VideoCommon::Nx2FastDraw::g_drawx_dynstate || VideoCommon::Nx2FastDraw::g_drawx_calls) {
+        VideoCommon::Nx2FastDraw::g_drawx_dynstate || VideoCommon::Nx2FastDraw::g_drawx_calls ||
+        VideoCommon::Nx2FastDraw::g_drawx_calls2 || VideoCommon::Nx2FastDraw::g_drawx_clears ||
+        VideoCommon::Nx2FastDraw::g_drawx_clip || VideoCommon::Nx2CallSites::g_enabled) {
         // Track D, every window the switches are on (cost stats or not).
         const double window = static_cast<double>(now - stats.window_start) / 1e9;
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
@@ -912,16 +922,21 @@ void RasterizerVulkan::ReportFastDraws() {
                  "DrawX round 3: {:.1f} s | coalesced writes/s={:.0f} lists still overflowing/s="
                  "{:.0f} | coalesce verify checked={} mismatches={} | twins by descriptors/s="
                  "{:.0f} | neutral list ends/s={:.0f} release targets/s={:.0f} | coalesce={} "
-                 "dynstate={} twin2={} calls={}",
+                 "dynstate={} twin2={} calls={} calls2={} clears={} clip={}",
                  window, rate(FastDraw::g_coalesced_writes), rate(FastDraw::g_coalesce_overflows),
                  FastDraw::g_coalesce_verify.checked, FastDraw::g_coalesce_verify.mismatches,
                  rate(drawx.twins_by_descriptors), rate(FastDraw::g_neutral_list_ends),
                  rate(FastDraw::g_neutral_releases), FastDraw::g_drawx_coalesce,
-                 FastDraw::g_drawx_dynstate, FastDraw::g_drawx_twin2, FastDraw::g_drawx_calls);
+                 FastDraw::g_drawx_dynstate, FastDraw::g_drawx_twin2, FastDraw::g_drawx_calls,
+                 FastDraw::g_drawx_calls2, FastDraw::g_drawx_clears, FastDraw::g_drawx_clip);
         FastDraw::g_coalesced_writes = 0;
         FastDraw::g_coalesce_overflows = 0;
         FastDraw::g_neutral_list_ends = 0;
         FastDraw::g_neutral_releases = 0;
+        if (VideoCommon::Nx2CallSites::g_enabled) {
+            // EDEN_NX2_DRAWX_CALL_SITES: "DrawX call sites" and the top "DrawX call site" lines.
+            VideoCommon::Nx2CallSites::Report(window);
+        }
         drawx_stats = {};
         drawx_keep_chain.ended_early = 0;
     }
@@ -3676,7 +3691,22 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::Query};
-    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    if (VideoCommon::Nx2FastDraw::g_drawx_calls2 && query_cache.HoldsQueries(addr, size)) {
+        // EDEN_NX2_DRAWX_CALLS2 (back-run macros' DMA reads go on with the delta chain): the
+        // finalized reports SemiFlushRegion writes out land in guest memory now, without a break.
+        // It visits the reports whose first word reaches into the range (all of which HoldsQueries
+        // finds), and each writes at most 16 bytes from its address: noted as a CPU write is, for
+        // texture headers, handle inputs and uniform keeps. Those still waiting for host results
+        // land on the fencing thread, which breaks the chain around them.
+        constexpr u64 ReportBytes = 16;
+        const DAddr begin = addr >= ReportBytes ? addr - ReportBytes : 0;
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.NoteWrittenBehind(begin, addr + size + ReportBytes - begin);
+    }
+    if (!query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation

@@ -1462,6 +1462,11 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Call: {
         if ((head & FastDrawNeutral) == 0) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+            if (Nx2CallSites::g_enabled) [[unlikely]] {
+                Nx2CallSites::NoteBreak(entry[1]); // EDEN_NX2_DRAWX_CALL_SITES
+            }
+        } else if (Nx2CallSites::g_enabled) [[unlikely]] {
+            Nx2CallSites::NoteNeutral(entry[1]);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);

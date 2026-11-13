@@ -48,30 +48,42 @@ void ReadDrawXSwitches() {
     // The calls' neutrality leans on REUSE's checks of the writes the caches heard of (texture
     // headers, handle inputs), which the plain delta path does not make.
     g_drawx_calls = on("EDEN_NX2_DRAWX_CALLS") && g_draw_reuse;
-    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate;
+    g_drawx_calls2 = on("EDEN_NX2_DRAWX_CALLS2") && g_draw_reuse;
+    g_drawx_clears = on("EDEN_NX2_DRAWX_CLEARS");
+    g_drawx_clip = on("EDEN_NX2_DRAWX_CLIP");
+    Nx2CallSites::g_enabled = on("EDEN_NX2_DRAWX_CALL_SITES");
+    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate || g_drawx_twin || g_drawx_dynstate ||
+                        g_drawx_clears || g_drawx_clip;
     for (u32 method = 0; method < g_drawx_register_class.size(); ++method) {
         DrawXRegister kind = ClassifyDrawXRegister(method);
         if ((kind == DrawXRegister::Neutral && !g_drawx_neutral) ||
             (kind == DrawXRegister::PipelineState && !g_drawx_pipestate) ||
             (kind == DrawXRegister::Shader && !g_drawx_twin) ||
             ((kind == DrawXRegister::DynamicState || kind == DrawXRegister::DynamicPipeline) &&
-             !g_drawx_dynstate)) {
+             !g_drawx_dynstate) ||
+            (kind == DrawXRegister::Clear && !g_drawx_clears) ||
+            (kind == DrawXRegister::Clip && !g_drawx_clip)) {
             kind = DrawXRegister::Breaks;
         }
         g_drawx_register_class[method] = kind;
     }
     if (g_drawx_registers || g_drawx_uniforms || g_drawx_twin || g_drawx_verify ||
-        g_drawx_keep_audit || g_drawx_no_keeps || g_drawx_coalesce || g_drawx_calls) {
+        g_drawx_keep_audit || g_drawx_no_keeps || g_drawx_coalesce || g_drawx_calls ||
+        g_drawx_calls2 || Nx2CallSites::g_enabled) {
         LOG_INFO(HW_GPU,
                  "Track D draw switches: neutral={} pipestate={} uniforms={} twin={} verify={} "
                  "keep_audit={} no_keeps={} coalesce={} coalesce_verify={} dynstate={} twin2={} "
-                 "calls={}",
+                 "calls={} calls2={} clears={} clip={} call_sites={}",
                  g_drawx_neutral, g_drawx_pipestate, g_drawx_uniforms, g_drawx_twin, g_drawx_verify,
                  g_drawx_keep_audit, g_drawx_no_keeps, g_drawx_coalesce, g_drawx_coalesce_verify,
-                 g_drawx_dynstate, g_drawx_twin2, g_drawx_calls);
+                 g_drawx_dynstate, g_drawx_twin2, g_drawx_calls, g_drawx_calls2, g_drawx_clears,
+                 g_drawx_clip, Nx2CallSites::g_enabled);
     }
     if (on("EDEN_NX2_DRAWX_CALLS") && !g_draw_reuse) {
         LOG_WARNING(HW_GPU, "EDEN_NX2_DRAWX_CALLS needs EDEN_NX2_DRAW_REUSE=1: left off");
+    }
+    if (on("EDEN_NX2_DRAWX_CALLS2") && !g_draw_reuse) {
+        LOG_WARNING(HW_GPU, "EDEN_NX2_DRAWX_CALLS2 needs EDEN_NX2_DRAW_REUSE=1: left off");
     }
 }
 
@@ -127,9 +139,12 @@ DrawXRegister ClassifyDrawXRegister(u32 method) {
     const auto within = [method](u32 first, size_t bytes) {
         return method >= first && method < first + bytes / sizeof(u32);
     };
+    // SET_SHADOW_RAM_CONTROL as a register write (ProcessDirtyRegisters): read by no draw
+    // preparation; the method that sets the mode is taken in Maxwell3D::ProcessMethodCall.
     if (method == MAXWELL3D_REG_INDEX(depth_bias) ||
         method == MAXWELL3D_REG_INDEX(slope_scale_depth_bias) ||
         method == MAXWELL3D_REG_INDEX(depth_bias_clamp) ||
+        method == MAXWELL3D_REG_INDEX(shadow_ram_control) ||
         within(MAXWELL3D_REG_INDEX(sub_tiling_perf), sizeof(Regs::SubTilingPerf)) ||
         within(MAXWELL3D_REG_INDEX(opportunistic_early_z), sizeof(Regs::OpportunisticEarlyZ))) {
         return DrawXRegister::DynamicState;
@@ -137,6 +152,18 @@ DrawXRegister ClassifyDrawXRegister(u32 method) {
     // mandated_early_z is in the pipeline key (FixedPipelineState::early_z) and read nowhere else.
     if (method == MAXWELL3D_REG_INDEX(mandated_early_z)) {
         return DrawXRegister::DynamicPipeline;
+    }
+    // EDEN_NX2_DRAWX_CLEARS: CLEAR_SURFACE's register is read by clears only (RasterizerVulkan::
+    // Clear, TextureCache::ClearCovers).
+    if (method == MAXWELL3D_REG_INDEX(clear_surface)) {
+        return DrawXRegister::Clear;
+    }
+    // EDEN_NX2_DRAWX_CLIP: SURFACE_CLIP sets the RenderTargets and Viewports dirty flags only (not
+    // the ColorBuffer or ZetaBuffer ones that look render target images up): delta draws run
+    // UpdateRenderTargets (the framebuffer's size), UpdateDynamicStates and the render area words
+    // again (GraphicsPipeline::ConfigureDelta), as a full resolve does.
+    if (within(MAXWELL3D_REG_INDEX(surface_clip), sizeof(Regs::SurfaceClip))) {
+        return DrawXRegister::Clip;
     }
     // Fixed-function state feeds the pipeline key and dynamic state only: no part of a resolve
     // the delta path keeps reads it, and UpdateDynamicStates runs on both paths.
