@@ -110,6 +110,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::Nx2FastDraw::ReadDrawCostStatsSwitch();
     VideoCommon::Nx2FastDraw::ReadDrawDeltaSwitch();
     VideoCommon::Nx2FastDraw::ReadDrawReuseSwitches();
+    VideoCommon::Nx2FastDraw::ReadDrawXSwitches();
     VideoCommon::StaleTargets::ReadSwitch();
     VideoCommon::ImageJoin::ReadSwitches();
     VideoCommon::Nx2Protect::ReadSwitch();

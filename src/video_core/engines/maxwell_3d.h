@@ -3298,6 +3298,21 @@ private:
     /// pipeline and reapplies vertex input; query methods still execute their side effects.
     bool NoteFastDrawState(u32 method) {
         namespace FastDraw = VideoCommon::Nx2FastDraw;
+        // EDEN_NX2_DRAWX_NEUTRAL / _PIPESTATE: registers no resolve reads, and fixed-function
+        // state the next draw checks by looking its pipeline up again.
+        if (FastDraw::g_drawx_registers) [[unlikely]] {
+            switch (FastDraw::DrawXRegisterClass(method)) {
+            case FastDraw::DrawXRegister::Neutral:
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
+            case FastDraw::DrawXRegister::PipelineState:
+                FastDraw::g_delta.pipeline_state = true;
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
+            case FastDraw::DrawXRegister::Breaks:
+                break;
+            }
+        }
         if (FastDraw::g_draw_delta) {
             constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
             constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);

@@ -10,6 +10,7 @@ add_executable(tests
     video_core/buffer_cache_ports.cpp
     video_core/draw_delta.cpp
     video_core/draw_reuse.cpp
+    video_core/drawx.cpp
     video_core/oot_whiteout.cpp
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp

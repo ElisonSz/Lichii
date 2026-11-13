@@ -535,6 +535,23 @@ private:
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
     FastDrawStats fast_draw_stats;
+    /// Track D (EDEN_NX2_DRAWX_*), logged with the fast draw windows.
+    struct DrawXStats {
+        u64 converted{};            ///< Delta draws whose chain a skipped break kept
+        u64 pipeline_state_same{};  ///< Fixed-function candidates: same pipeline looked up
+        u64 pipeline_state_other{}; ///< ... another pipeline (full resolve)
+        u64 uniform_full_draws{};   ///< Full draws taking uniform keeps
+        u64 uniform_full_blocked{}; ///< Full draws without: a non-register break came first
+        u64 uniform_full_kept{};    ///< Uniform buffers kept on those full draws
+        u64 uniform_full_streamed{};
+        u64 verified{}; ///< Candidates a skipped break kept, prepared in full and compared
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+    } drawx_stats;
+    /// EDEN_NX2_DRAWX_UNIFORMS: Nx2FastDraw::g_keep_serial when the previous draw began binding
+    /// uniforms (0: none since fast draws turned on).
+    u64 drawx_keep_serial{};
     u32 taken_break_classes{};
     bool matched_candidate{};
     u64 fast_draw_window{};

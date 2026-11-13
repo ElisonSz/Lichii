@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "common/logging.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -25,6 +26,56 @@ void ReadDrawReuseSwitches() {
     g_draw_vertex_input = on("EDEN_NX2_DRAW_VERTEX_INPUT");
     g_draw_handle_eval = on("EDEN_NX2_DRAW_HANDLE_EVAL");
     Shader::g_lean_handle_programs = g_draw_handle_eval;
+}
+
+void ReadDrawXSwitches() {
+    const auto on = [](const char* name) {
+        const char* const value = std::getenv(name);
+        return value != nullptr && value[0] == '1';
+    };
+    g_drawx_neutral = on("EDEN_NX2_DRAWX_NEUTRAL");
+    g_drawx_pipestate = on("EDEN_NX2_DRAWX_PIPESTATE");
+    g_drawx_uniforms = on("EDEN_NX2_DRAWX_UNIFORMS");
+    g_drawx_verify = on("EDEN_NX2_DRAWX_VERIFY");
+    g_drawx_registers = g_drawx_neutral || g_drawx_pipestate;
+    for (u32 method = 0; method < g_drawx_register_class.size(); ++method) {
+        DrawXRegister kind = ClassifyDrawXRegister(method);
+        if ((kind == DrawXRegister::Neutral && !g_drawx_neutral) ||
+            (kind == DrawXRegister::PipelineState && !g_drawx_pipestate)) {
+            kind = DrawXRegister::Breaks;
+        }
+        g_drawx_register_class[method] = kind;
+    }
+    if (g_drawx_registers || g_drawx_uniforms || g_drawx_verify) {
+        LOG_INFO(HW_GPU, "Track D draw switches: neutral={} pipestate={} uniforms={} verify={}",
+                 g_drawx_neutral, g_drawx_pipestate, g_drawx_uniforms, g_drawx_verify);
+    }
+}
+
+DrawXRegister ClassifyDrawXRegister(u32 method) {
+    using Maxwell3D = Tegra::Engines::Maxwell3D;
+    using Regs = Maxwell3D::Regs;
+    // Turing MME memory reads: SET_MME_MEM_ADDRESS_A/B, the data RAM address and the two read
+    // triggers (MME_DMA_READ, MME_DMA_READ_FIFOED). Only the macro engines read them (the macro
+    // DMA read, Maxwell3D::FrontDmaRead); the words it reads reach draws through the registers
+    // the macro writes, which break as any other write.
+    constexpr u32 mme_memory_first = 0x154;
+    constexpr u32 mme_memory_end = 0x159;
+    if (method >= mme_memory_first && method < mme_memory_end) {
+        return DrawXRegister::Neutral;
+    }
+    // SET_CONSTANT_COLOR_RENDERING: nothing in the emulator reads it.
+    constexpr u32 constant_color = MAXWELL3D_REG_INDEX(const_color_rendering);
+    if (method >= constant_color &&
+        method < constant_color + sizeof(Regs::ConstantColorRendering) / sizeof(u32)) {
+        return DrawXRegister::Neutral;
+    }
+    // Fixed-function state feeds the pipeline key and dynamic state only: no part of a resolve
+    // the delta path keeps reads it, and UpdateDynamicStates runs on both paths.
+    if (ClassifyBreak(Reason::Register, method) == ClassBit(BreakClass::FixedFunction)) {
+        return DrawXRegister::PipelineState;
+    }
+    return DrawXRegister::Breaks;
 }
 
 u32 ClassifyBreak(Reason reason, u32 method) {

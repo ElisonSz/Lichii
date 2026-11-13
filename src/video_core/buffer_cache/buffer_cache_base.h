@@ -571,6 +571,11 @@ public:
     [[nodiscard]] bool NotedWritesLost() const noexcept {
         return uniform_keep.memory_writes_lost;
     }
+    /// EDEN_NX2_DRAWX_UNIFORMS statistics: uniform buffers kept and streamed so far (the counts
+    /// TickFrame reports and resets).
+    [[nodiscard]] std::pair<u64, u64> UniformKeepCounts() const noexcept {
+        return {uniform_keep.kept, uniform_keep.streamed_binds};
+    }
 
     template <typename Func>
     void BufferOperations(Func&& func) {
@@ -850,10 +855,13 @@ private:
         keep.memory_writes.emplace_back(device_addr, device_addr + size);
     }
     /// EDEN_NX2_UBO_KEEP_VERIFY=1: binds what a keep would skip the original way and logs where
-    /// guest memory changed.
+    /// guest memory changed. EDEN_NX2_DRAWX_VERIFY=1 turns it on too (keeps on full draws).
     const bool ubo_keep_verify = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBO_KEEP_VERIFY");
-        return value != nullptr && value[0] == '1';
+        const auto on = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        return on("EDEN_NX2_UBO_KEEP_VERIFY") || on("EDEN_NX2_DRAWX_VERIFY");
     }();
     /// TEST: EDEN_NX2_UBO_STATS=1 times the streamed uniform binds and logs them every 600
     /// frames, without EDEN_NX2_GPU_PROFILE (which selects the slower method path).

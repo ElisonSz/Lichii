@@ -92,6 +92,45 @@ inline bool g_draw_handle_eval{};
 /// Reads the four switches above; called by VideoCore::CreateGPU after ReadDrawDeltaSwitch.
 void ReadDrawReuseSwitches();
 
+/// Track D (EDEN_NX2_DRAWX_*): the delta chain ends only on what it keeps.
+/// EDEN_NX2_DRAWX_NEUTRAL=1: writes to 3D registers that no draw preparation reads (the MME memory
+/// read registers, the constant colour rendering block) no longer end it.
+inline bool g_drawx_neutral{};
+/// EDEN_NX2_DRAWX_PIPESTATE=1: a fixed-function register write marks the delta (pipeline_state)
+/// instead of ending it; the next draw looks its pipeline up again and keeps the delta only when
+/// the same pipeline object comes back (as the vertex layout case does).
+inline bool g_drawx_pipestate{};
+/// EDEN_NX2_DRAWX_UNIFORMS=1: uniform keeps (BufferCache::UniformRangeKept) also on full draws
+/// when nothing but register writes ended the delta chain since the previous draw (g_keep_serial).
+inline bool g_drawx_uniforms{};
+/// EDEN_NX2_DRAWX_VERIFY=1: delta candidates are prepared in full and compared (as
+/// EDEN_NX2_FAST_DRAW_VERIFY), kept uniforms are compared with guest memory; counted per window.
+inline bool g_drawx_verify{};
+/// g_drawx_neutral || g_drawx_pipestate: the one flag the register write path tests.
+inline bool g_drawx_registers{};
+/// Reads the switches above; called by VideoCore::CreateGPU after ReadDrawReuseSwitches.
+void ReadDrawXSwitches();
+
+/// What a 3D register write does to the delta chain under the switches above.
+enum class DrawXRegister : u8 {
+    Breaks,        ///< As without the switches
+    Neutral,       ///< Read by no draw preparation: no break (EDEN_NX2_DRAWX_NEUTRAL)
+    PipelineState, ///< Fixed-function state: Delta::pipeline_state (EDEN_NX2_DRAWX_PIPESTATE)
+};
+/// One entry per 3D register (Maxwell3D::Regs::NUM_REGS), filled by ReadDrawXSwitches.
+inline std::array<DrawXRegister, 0xe00> g_drawx_register_class{};
+[[nodiscard]] inline DrawXRegister DrawXRegisterClass(u32 method) {
+    return method < g_drawx_register_class.size() ? g_drawx_register_class[method]
+                                                  : DrawXRegister::Breaks;
+}
+/// The class each register has when both switches are on (tests and ReadDrawXSwitches).
+[[nodiscard]] DrawXRegister ClassifyDrawXRegister(u32 method);
+
+/// Every break other than a 3D register write (methods, macros, other engines, fences, tick work,
+/// invalidations, maps, overflowing write lists, ...): what can write guest memory unseen by the
+/// write lists. Counted only with EDEN_NX2_DRAWX_UNIFORMS (any thread).
+inline std::atomic<u64> g_keep_serial{1};
+
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
 [[nodiscard]] inline bool Enabled() {
@@ -315,6 +354,9 @@ inline std::atomic<u32> g_last_break{};
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
+        if (g_drawx_uniforms && reason != Reason::Register) {
+            g_keep_serial.fetch_add(1, std::memory_order_relaxed);
+        }
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
         if (DrawCostStatsEnabled()) {
             // Sample only the optional bookkeeping, including its extra serial. The clock pair
@@ -376,6 +418,12 @@ struct Delta {
     std::array<DAddr, MaxWrites> device_end{};
     u32 num_device_writes{};
     bool vertex_layout{}; ///< Requires a fresh pipeline lookup, then dynamic vertex input.
+    /// EDEN_NX2_DRAWX_PIPESTATE: a fixed-function register changed; requires a fresh pipeline
+    /// lookup that selects the same pipeline object.
+    bool pipeline_state{};
+    /// EDEN_NX2_DRAWX_NEUTRAL / _PIPESTATE: a write that ends the chain without the switches did
+    /// not (statistics and verify attribution only).
+    bool drawx_skipped{};
     bool queries{};       ///< Query side effects already ran, including conditional rendering.
     bool vertex_id{};
     u8 match_cases{};  ///< Three-bit experiment class, observed in both on and off windows.
