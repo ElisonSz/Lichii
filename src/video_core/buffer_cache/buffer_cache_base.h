@@ -615,6 +615,9 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// TEST: EDEN_NX2_CFG_BANK_STATS: the bytes each bank's last re-upload read.
+    std::unordered_map<DAddr, std::vector<u8>> bank_upload_shadows;
+    void NoteBankUpload(DAddr device_addr, u64 size);
 
 private:
     template <typename Mask, typename Func>

@@ -29,6 +29,11 @@ inline bool g_lookup{};
 /// VirtualRangeCache::Query found in one piece skips the Query while the range cache has not
 /// changed since and no unmap is pending (BufferCache::ResolveMultiRangeStorage).
 inline bool g_ssbo{};
+/// TEST: EDEN_NX2_CFG_BANK_STATS=1 (diagnostic, costs a copy and a compare per re-upload): counts
+/// the once-a-frame re-uploads of native programs' 64 KiB banks
+/// (BufferCache::BindHostGraphicsUniformBuffer) and how many found the bank's bytes unchanged
+/// since its previous re-upload, the share an exact skip could save.
+inline bool g_bank_stats{};
 /// EDEN_NX2_CFG_VERIFY=1: every skipped Touch checks that the item's tick already is the frame's,
 /// every digest lookup also runs the base's search, and every skipped Query runs; a mismatch is
 /// counted, the first 16 are logged, and the base's answer is used.
@@ -47,6 +52,9 @@ enum class Counter : std::size_t {
     SearchHits,           ///< searches that found the key
     RangeQueries,         ///< storage range queries made (graphics, with the memo)
     RangeQueriesSkipped,  ///< storage range queries skipped (or, with verify, checked)
+    BankUploads,          ///< bank re-uploads (EDEN_NX2_CFG_BANK_STATS)
+    BankBytes,            ///< their bytes
+    BankUnchanged,        ///< re-uploads of the bytes the bank's previous re-upload read
     Verified,             ///< verify: skipped touches and searches checked
     Mismatches,           ///< verify: checks that contradicted the skip
     Count,
@@ -155,11 +163,14 @@ inline void ReadSwitches() {
     g_touch = ReadFlag("EDEN_NX2_CFG_TOUCH");
     g_lookup = ReadFlag("EDEN_NX2_CFG_LOOKUP");
     g_ssbo = ReadFlag("EDEN_NX2_CFG_SSBO");
+    g_bank_stats = ReadFlag("EDEN_NX2_CFG_BANK_STATS");
     g_verify = ReadFlag("EDEN_NX2_CFG_VERIFY");
-    g_any = g_touch || g_lookup || g_ssbo || g_verify;
+    g_any = g_touch || g_lookup || g_ssbo || g_bank_stats || g_verify;
     if (g_any) {
-        LOG_INFO(HW_GPU, "Track C draw preparation switches: touch={} lookup={} ssbo={} verify={}",
-                 g_touch, g_lookup, g_ssbo, g_verify);
+        LOG_INFO(HW_GPU,
+                 "Track C draw preparation switches: touch={} lookup={} ssbo={} bank_stats={} "
+                 "verify={}",
+                 g_touch, g_lookup, g_ssbo, g_bank_stats, g_verify);
     }
 }
 
@@ -190,17 +201,22 @@ inline void Report() {
     const u64 hits = Take(Counter::SearchHits);
     const u64 range_queries = Take(Counter::RangeQueries);
     const u64 range_skipped = Take(Counter::RangeQueriesSkipped);
+    const u64 bank_uploads = Take(Counter::BankUploads);
+    const u64 bank_bytes = Take(Counter::BankBytes);
+    const u64 bank_unchanged = Take(Counter::BankUnchanged);
     const u64 verified = Take(Counter::Verified);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
              "Track C {:.1f} s: buffer LRU touches {} skipped, {} made; image LRU touches {} "
              "skipped, {} made; pipeline transition searches {} over {} entries, {} whole key "
-             "compares, {} found; storage range queries {} skipped, {} made; verify checked {}, "
-             "mismatches {} ({} since start) | touch={} lookup={} ssbo={} verify={}",
+             "compares, {} found; storage range queries {} skipped, {} made; bank re-uploads {} "
+             "({} KiB), {} unchanged; verify checked {}, mismatches {} ({} since start) | "
+             "touch={} lookup={} ssbo={} bank_stats={} verify={}",
              seconds, buffer_skipped, buffer_touched, image_skipped, image_touched, searches,
-             entries, compares, hits, range_skipped, range_queries, verified, mismatches,
+             entries, compares, hits, range_skipped, range_queries, bank_uploads, bank_bytes >> 10,
+             bank_unchanged, verified, mismatches,
              g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup, g_ssbo,
-             g_verify);
+             g_bank_stats, g_verify);
 }
 
 } // namespace VideoCommon::Cfg

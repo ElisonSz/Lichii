@@ -2901,6 +2901,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
         if (upload_size != 0) {
+            if (Cfg::g_bank_stats) [[unlikely]] {
+                NoteBankUpload(device_addr, upload_size);
+            }
             std::array<BufferCopy, 1> copies{BufferCopy{
                 .src_offset = 0,
                 .dst_offset = buffer.Offset(device_addr),
@@ -3012,6 +3015,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         runtime.BindUniformBuffer(buffer, offset, size);
     }
     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+}
+
+template <class P>
+void BufferCache<P>::NoteBankUpload(DAddr device_addr, u64 size) {
+    // TEST: EDEN_NX2_CFG_BANK_STATS. Bounded: the map forgets everything past 4096 banks.
+    if (bank_upload_shadows.size() > 4096) {
+        bank_upload_shadows.clear();
+    }
+    std::vector<u8> bytes(size);
+    device_memory.ReadBlockUnsafe(device_addr, bytes.data(), size);
+    std::vector<u8>& previous = bank_upload_shadows[device_addr];
+    Cfg::Count(Cfg::Counter::BankUploads);
+    Cfg::Count(Cfg::Counter::BankBytes, size);
+    if (previous == bytes) {
+        Cfg::Count(Cfg::Counter::BankUnchanged);
+    }
+    previous = std::move(bytes);
 }
 
 template <class P>
