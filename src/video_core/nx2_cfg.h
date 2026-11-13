@@ -60,21 +60,30 @@ enum class Counter : std::size_t {
     Count,
 };
 
-inline std::array<std::atomic<u64>, static_cast<std::size_t>(Counter::Count)> g_counters{};
+/// On cache lines of their own (the size rounds up to whole lines): the back thread writes them
+/// for every touch.
+struct alignas(64) Counters {
+    std::array<std::atomic<u64>, static_cast<std::size_t>(Counter::Count)> values{};
+};
+inline Counters g_counters{};
 
 /// The GPU back thread counts: a plain load and store, not a locked add (another thread's rare
 /// count may be lost; the counters are statistics).
 inline void Count(Counter counter, u64 amount = 1) noexcept {
-    auto& value = g_counters[static_cast<std::size_t>(counter)];
+    auto& value = g_counters.values[static_cast<std::size_t>(counter)];
     value.store(value.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
 }
 
 inline std::atomic<u64> g_mismatches_total{};
+/// Mismatches logged in the current stats window (Report resets it).
+inline std::atomic<u64> g_mismatches_logged{};
 
-/// Verify: a check contradicted a skip. The caller then does what the base does.
+/// Verify: a check contradicted a skip. The caller then does what the base does. The first 16 of
+/// each 10 s window are logged.
 inline void Mismatch(const char* what, u64 first, u64 second) {
     Count(Counter::Mismatches);
-    if (g_mismatches_total.fetch_add(1, std::memory_order_relaxed) < 16) {
+    g_mismatches_total.fetch_add(1, std::memory_order_relaxed);
+    if (g_mismatches_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
         LOG_ERROR(HW_GPU, "Track C verify mismatch: {} ({:#x}, {:#x})", what, first, second);
     }
 }
@@ -175,7 +184,8 @@ inline void ReadSwitches() {
 }
 
 [[nodiscard]] inline u64 Take(Counter counter) {
-    return g_counters[static_cast<std::size_t>(counter)].exchange(0, std::memory_order_relaxed);
+    return g_counters.values[static_cast<std::size_t>(counter)].exchange(0,
+                                                                         std::memory_order_relaxed);
 }
 
 /// The stats line, at most once every 10 s (called once a frame by PipelineCache::TickFrame).
@@ -191,6 +201,7 @@ inline void Report() {
     }
     const double seconds = std::chrono::duration<double>(now - window_start).count();
     window_start = now;
+    g_mismatches_logged.store(0, std::memory_order_relaxed);
     const u64 buffer_skipped = Take(Counter::BufferTouchesSkipped);
     const u64 buffer_touched = Take(Counter::BufferTouches);
     const u64 image_skipped = Take(Counter::ImageTouchesSkipped);
