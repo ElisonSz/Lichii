@@ -6,6 +6,7 @@
 
 #ifdef _WIN32
 
+#include <condition_variable>
 #include <iterator>
 #include <map>
 #include "common/container/unordered_map.h"
@@ -258,10 +259,20 @@ public:
         return ptr;
     }
 
+    // Locking. Map and Unmap change the placeholders and views: they hold structure_mutex through
+    // their system calls, one at a time, so only they write `placeholders`, and they read it without
+    // placeholder_mutex. Every write and every other reader takes placeholder_mutex, held for
+    // bookkeeping only, never for a system call. A Protect changes views that stay mapped: it waits
+    // only for an Unmap over its range (`unmapping`), and an Unmap waits for the Protects already
+    // in their calls over its views (`protecting`). A Map works on free address space, which no
+    // Protect touches, and the view shows to readers once it is mapped. Before, every protection
+    // (the GPU threads' cached-page tracking, ~20,000 a second in game) waited behind whatever map
+    // or unmap was in the kernel; with the working-set lock contended those took ~190 us each.
+
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         const bool map_stats = Nx2MapStats::Enabled();
         const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
-        std::unique_lock lock{placeholder_mutex};
+        std::scoped_lock structure{structure_mutex};
         if (map_stats) [[unlikely]] {
             Nx2MapStats::Add(Nx2MapStats::Counter::MapLockNs, Nx2MapStats::NowNs() - lock_start);
         }
@@ -277,17 +288,31 @@ public:
             ForgetUnmapped(virtual_offset, virtual_offset + length);
         }
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
-        TrackPlaceholder(virtual_offset, host_offset, length);
-
         MapView(virtual_offset, host_offset, length);
+
+        std::scoped_lock lock{placeholder_mutex};
+        TrackPlaceholder(virtual_offset, host_offset, length);
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
         const bool map_stats = Nx2MapStats::Enabled();
         const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
-        std::scoped_lock lock{placeholder_mutex};
+        std::scoped_lock structure{structure_mutex};
         if (map_stats) [[unlikely]] {
             Nx2MapStats::Add(Nx2MapStats::Counter::UnmapLockNs, Nx2MapStats::NowNs() - lock_start);
+        }
+        // The views overlapping the range are unmapped whole, and the parts outside it mapped
+        // again (UnmapOnePlaceholder): Protects over any of them stay out until it is done.
+        const auto views = placeholders.equal_range({virtual_offset, virtual_offset + length});
+        if (views.first == views.second) {
+            return;
+        }
+        const size_t busy_begin = views.first->lower();
+        const size_t busy_end = std::prev(views.second)->upper();
+        {
+            std::unique_lock lock{placeholder_mutex};
+            unmapping = {busy_begin, busy_end};
+            range_cv.wait(lock, [&] { return !ProtectingOverlaps(busy_begin, busy_end); });
         }
 
         // Unmap until there are no more placeholders
@@ -295,6 +320,11 @@ public:
         while (UnmapOnePlaceholder(virtual_offset, length)) {
             ++unmapped_placeholders;
         }
+        {
+            std::scoped_lock lock{placeholder_mutex};
+            unmapping = {};
+        }
+        range_cv.notify_all();
         if (map_stats) [[unlikely]] {
             Nx2MapStats::Add(Nx2MapStats::Counter::HostUnmapPlaceholders, unmapped_placeholders);
         }
@@ -313,26 +343,48 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        // The pieces of the mapped views in the range, found under the lock and protected outside
+        // it while registered in `protecting` (see Map).
+        thread_local std::vector<std::pair<size_t, size_t>> pieces;
+        pieces.clear();
         const bool map_stats = Nx2MapStats::Enabled();
         const u64 lock_start = map_stats ? Nx2MapStats::NowNs() : 0;
-        std::scoped_lock lock{placeholder_mutex};
-        if (map_stats) [[unlikely]] {
-            Nx2MapStats::Add(Nx2MapStats::Counter::Protects, 1);
-            Nx2MapStats::Add(Nx2MapStats::Counter::ProtectLockNs,
-                             Nx2MapStats::NowNs() - lock_start);
+        {
+            std::unique_lock lock{placeholder_mutex};
+            range_cv.wait(lock, [&] {
+                return !(unmapping.first < virtual_end && virtual_offset < unmapping.second);
+            });
+            if (map_stats) [[unlikely]] {
+                Nx2MapStats::Add(Nx2MapStats::Counter::Protects, 1);
+                Nx2MapStats::Add(Nx2MapStats::Counter::ProtectLockNs,
+                                 Nx2MapStats::NowNs() - lock_start);
+            }
+            const auto views = placeholders.equal_range({virtual_offset, virtual_end});
+            for (auto it = views.first; it != views.second; ++it) {
+                const size_t offset = (std::max)(it->lower(), virtual_offset);
+                pieces.emplace_back(offset, (std::min)(it->upper(), virtual_end) - offset);
+            }
+            if (pieces.empty()) {
+                return;
+            }
+            protecting.emplace_back(virtual_offset, virtual_end);
         }
-        auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
-        while (it != end) {
-            const size_t offset = (std::max)(it->lower(), virtual_offset);
-            const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
+        for (const auto& [offset, protect_length] : pieces) {
             DWORD old_flags{};
             const Nx2MapStats::Timer timer{Nx2MapStats::Counter::VirtualProtects,
                                            Nx2MapStats::Counter::VirtualProtectNs};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
-            ++it;
         }
+        {
+            std::scoped_lock lock{placeholder_mutex};
+            const auto it = std::find(protecting.begin(), protecting.end(),
+                                      std::pair{virtual_offset, virtual_end});
+            ASSERT(it != protecting.end());
+            protecting.erase(it);
+        }
+        range_cv.notify_all();
     }
 
     /// A mapped view: [lower, upper) of the virtual range and the backing offset at lower.
@@ -493,6 +545,7 @@ private:
             }
         }
         // Remove and reinsert placeholder trackers
+        std::scoped_lock lock{placeholder_mutex};
         UntrackPlaceholder(it);
         if (split_left) {
             TrackPlaceholder(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
@@ -595,6 +648,13 @@ private:
         unmapped_views.emplace(begin, std::pair{end, backing});
     }
 
+    /// Whether a Protect in its calls covers part of [begin, end). Under placeholder_mutex.
+    [[nodiscard]] bool ProtectingOverlaps(size_t begin, size_t end) const {
+        return std::any_of(protecting.begin(), protecting.end(), [&](const auto& range) {
+            return range.first < end && begin < range.second;
+        });
+    }
+
     /// Return true when a given memory region is a "nieche" and the placeholders don't have to be
     /// split.
     bool IsNiechePlaceholder(size_t virtual_offset, size_t length) const {
@@ -615,7 +675,11 @@ private:
     PFN_MapViewOfFile3 pfn_MapViewOfFile3{};
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
-    std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
+    std::mutex structure_mutex;   ///< Map and Unmap, one at a time, through their system calls
+    std::mutex placeholder_mutex; ///< Bookkeeping below, never held for a system call
+    std::condition_variable range_cv;             ///< `unmapping` or `protecting` got smaller
+    std::pair<size_t, size_t> unmapping{};        ///< Views an Unmap is changing (empty: none)
+    std::vector<std::pair<size_t, size_t>> protecting; ///< Ranges of the Protects in their calls
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
     /// EDEN_NX2_MAP_STATS: views unmapped since, by start: {end, backing offset at start}.
