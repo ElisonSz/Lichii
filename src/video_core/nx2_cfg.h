@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -34,9 +36,16 @@ inline bool g_ssbo{};
 /// (BufferCache::BindHostGraphicsUniformBuffer) and how many found the bank's bytes unchanged
 /// since its previous re-upload, the share an exact skip could save.
 inline bool g_bank_stats{};
+/// EDEN_NX2_CFG_TIC=1: deleting an image view resolves again only the texture header entries
+/// bound to a view deleted since they were read (and those bound to nothing), not every entry of
+/// every channel's image tables; texture memos hold while none of their views was deleted
+/// (DescriptorTable::ReadImageEntry, TextureCache::NoteDeletedViews).
+inline bool g_tic{};
 /// EDEN_NX2_CFG_VERIFY=1: every skipped Touch checks that the item's tick already is the frame's,
-/// every digest lookup also runs the base's search, and every skipped Query runs; a mismatch is
-/// counted, the first 16 are logged, and the base's answer is used.
+/// every digest lookup also runs the base's search, every skipped Query runs, every kept texture
+/// header entry is resolved as the base would (without its side effects), and every texture memo
+/// hit is checked against the full resolve; a mismatch is counted, the first 16 of each window are
+/// logged, and the base's answer is used.
 inline bool g_verify{};
 /// Any of the switches: the stats line every 10 s.
 inline bool g_any{};
@@ -55,7 +64,12 @@ enum class Counter : std::size_t {
     BankUploads,          ///< bank re-uploads (EDEN_NX2_CFG_BANK_STATS)
     BankBytes,            ///< their bytes
     BankUnchanged,        ///< re-uploads of the bytes the bank's previous re-upload read
-    Verified,             ///< verify: skipped touches and searches checked
+    TicKept,              ///< texture header entries read again after a view deletion and kept
+    TicResolved,          ///< such entries resolved again (view deleted, bound to nothing, map)
+    TicFull,              ///< deletions that invalidated a table in full (the page table changed)
+    MemoKept,             ///< texture memo hits after a deletion of none of their views
+    MemoDropped,          ///< texture memos dropped because one of their views was deleted
+    Verified,             ///< verify: skipped work checked
     Mismatches,           ///< verify: checks that contradicted the skip
     Count,
 };
@@ -162,6 +176,50 @@ template <typename Equal>
     return digests.size();
 }
 
+/// EDEN_NX2_CFG_TIC: image view deletions, counted from 1 (Clock), and per view slot the count of
+/// its last deletion. An image table entry stamped with the count at its last read
+/// (DescriptorTable::stamps) is bound to a view deleted since exactly when DiedAfter(its view's
+/// slot, its stamp): a deletion after the stamp gives the slot a larger count, and a view the slot
+/// held before was deleted before the view the entry was bound to was made, so before the read.
+class ViewDeaths {
+public:
+    explicit ViewDeaths(u32 start = 1) : deletions{start} {}
+
+    [[nodiscard]] u32 Clock() const noexcept {
+        return deletions;
+    }
+
+    /// One deletion of the views whose slots `slots` lists. True when the count started again
+    /// from 1 first: every table must then be invalidated in full, so that no entry and no memo
+    /// keeps a count from before (what the base does for every deletion anyway).
+    template <typename Slots>
+    bool Note(const Slots& slots) {
+        bool restarted = false;
+        if (deletions == (std::numeric_limits<u32>::max)()) [[unlikely]] {
+            std::fill(deaths.begin(), deaths.end(), u32{0});
+            deletions = 1;
+            restarted = true;
+        }
+        ++deletions;
+        for (const auto slot_value : slots) {
+            const std::size_t slot = static_cast<std::size_t>(slot_value);
+            if (slot >= deaths.size()) {
+                deaths.resize((std::max)(slot + 1, deaths.size() * 2));
+            }
+            deaths[slot] = deletions;
+        }
+        return restarted;
+    }
+
+    [[nodiscard]] bool DiedAfter(u32 slot, u32 stamp) const noexcept {
+        return slot < deaths.size() && deaths[slot] > stamp;
+    }
+
+private:
+    u32 deletions;
+    std::vector<u32> deaths;
+};
+
 [[nodiscard]] inline bool ReadFlag(const char* name) {
     const char* const value = std::getenv(name);
     return value != nullptr && value[0] == '1';
@@ -173,13 +231,14 @@ inline void ReadSwitches() {
     g_lookup = ReadFlag("EDEN_NX2_CFG_LOOKUP");
     g_ssbo = ReadFlag("EDEN_NX2_CFG_SSBO");
     g_bank_stats = ReadFlag("EDEN_NX2_CFG_BANK_STATS");
+    g_tic = ReadFlag("EDEN_NX2_CFG_TIC");
     g_verify = ReadFlag("EDEN_NX2_CFG_VERIFY");
-    g_any = g_touch || g_lookup || g_ssbo || g_bank_stats || g_verify;
+    g_any = g_touch || g_lookup || g_ssbo || g_bank_stats || g_tic || g_verify;
     if (g_any) {
         LOG_INFO(HW_GPU,
                  "Track C draw preparation switches: touch={} lookup={} ssbo={} bank_stats={} "
-                 "verify={}",
-                 g_touch, g_lookup, g_ssbo, g_bank_stats, g_verify);
+                 "tic={} verify={}",
+                 g_touch, g_lookup, g_ssbo, g_bank_stats, g_tic, g_verify);
     }
 }
 
@@ -215,19 +274,26 @@ inline void Report() {
     const u64 bank_uploads = Take(Counter::BankUploads);
     const u64 bank_bytes = Take(Counter::BankBytes);
     const u64 bank_unchanged = Take(Counter::BankUnchanged);
+    const u64 tic_kept = Take(Counter::TicKept);
+    const u64 tic_resolved = Take(Counter::TicResolved);
+    const u64 tic_full = Take(Counter::TicFull);
+    const u64 memo_kept = Take(Counter::MemoKept);
+    const u64 memo_dropped = Take(Counter::MemoDropped);
     const u64 verified = Take(Counter::Verified);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
              "Track C {:.1f} s: buffer LRU touches {} skipped, {} made; image LRU touches {} "
              "skipped, {} made; pipeline transition searches {} over {} entries, {} whole key "
              "compares, {} found; storage range queries {} skipped, {} made; bank re-uploads {} "
-             "({} KiB), {} unchanged; verify checked {}, mismatches {} ({} since start) | "
-             "touch={} lookup={} ssbo={} bank_stats={} verify={}",
+             "({} KiB), {} unchanged; texture headers after deletions {} kept, {} resolved again, "
+             "{} tables invalidated in full; texture memos {} kept over deletions, {} dropped; "
+             "verify checked {}, mismatches {} ({} since start) | touch={} lookup={} ssbo={} "
+             "bank_stats={} tic={} verify={}",
              seconds, buffer_skipped, buffer_touched, image_skipped, image_touched, searches,
              entries, compares, hits, range_skipped, range_queries, bank_uploads, bank_bytes >> 10,
-             bank_unchanged, verified, mismatches,
-             g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup, g_ssbo,
-             g_bank_stats, g_verify);
+             bank_unchanged, tic_kept, tic_resolved, tic_full, memo_kept, memo_dropped, verified,
+             mismatches, g_mismatches_total.load(std::memory_order_relaxed), g_touch, g_lookup,
+             g_ssbo, g_bank_stats, g_tic, g_verify);
 }
 
 } // namespace VideoCommon::Cfg

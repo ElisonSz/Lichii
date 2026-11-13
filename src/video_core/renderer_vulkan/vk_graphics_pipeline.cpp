@@ -827,7 +827,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (VideoCommon::Nx2FastDraw::g_draw_delta) {
         draw_delta_handles.clear();
     }
-    const bool verify_memo{use_memo && TextureMemoVerify()};
+    // EDEN_NX2_CFG_TIC with EDEN_NX2_CFG_VERIFY: memo hits are also resolved in full and compared
+    // (those the base would not have had, kept over view deletions, count as Track C checks).
+    const bool verify_memo{use_memo && (TextureMemoVerify() ||
+                                        (VideoCommon::Cfg::g_tic && VideoCommon::Cfg::g_verify))};
     boost::container::small_vector<GPUVAddr, 32> handle_addresses;
     boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
     boost::container::small_vector<VideoCommon::ImageViewInOut, 32> memo_views;
@@ -835,6 +838,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     std::vector<VideoCommon::ImageId> memo_prepared;
     std::vector<VideoCommon::ImageId> full_prepared;
     bool memo_hit{};
+    bool memo_kept_over_deletions{};
     if (use_memo) {
         const auto collect_addresses{[&](size_t stage) LAMBDA_FORCEINLINE {
             const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
@@ -869,7 +873,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         memo_hit = texture_cache.ResolveMemoizedTextures(
             texture_memo, std::span(handle_addresses.data(), handle_addresses.size()),
-            std::span(views.data(), views.size()), std::span(samplers.data(), samplers.size()));
+            std::span(views.data(), views.size()), std::span(samplers.data(), samplers.size()),
+            &memo_kept_over_deletions);
         if (verify_memo) {
             texture_cache.LogPrepares(nullptr, false);
         }
@@ -1071,6 +1076,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         } else {
             texture_memo.misses = 0;
             Count(g_memo_hits);
+            if (memo_kept_over_deletions) {
+                VideoCommon::Cfg::Count(VideoCommon::Cfg::Counter::MemoKept);
+            }
         }
         if (memo_hit && verify_memo) {
             // Bindings alone miss what the paths do to the images (#904 prepared the null one).
@@ -1090,6 +1098,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                           "Texture memo: pipeline {:016x} resolved other views, samplers or "
                           "prepared images than its memo",
                           key.Hash());
+            }
+            if (memo_kept_over_deletions) {
+                VideoCommon::Cfg::Count(VideoCommon::Cfg::Counter::Verified);
+                if (!same) {
+                    VideoCommon::Cfg::Mismatch(
+                        "a texture memo kept over view deletions resolved differently in full",
+                        key.Hash(), views.size());
+                }
             }
         }
         ReportTextureMemo();

@@ -1195,14 +1195,19 @@ template <class P>
 bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
                                               std::span<const GPUVAddr> handle_addresses,
                                               std::span<ImageViewInOut> views,
-                                              std::span<SamplerId> samplers) {
+                                              std::span<SamplerId> samplers,
+                                              bool* kept_over_deletions) {
     const auto& image_table = channel_state->graphics_image_table;
     const auto& sampler_table = channel_state->graphics_sampler_table;
     const bool via_header_index =
         maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
+    // EDEN_NX2_CFG_TIC: a view deletion alone (image_table.changes) does not end the memo; a
+    // deletion of one of its views does (below), as do the table's address, limit and full
+    // invalidations (layout_changes).
+    const bool tables_hold = Cfg::g_tic ? memo.image_layout_changes == image_table.layout_changes
+                                        : memo.image_changes == image_table.changes;
     if (!memo.valid || memo.memory != gpu_memory || memo.image_table != &image_table ||
-        memo.image_changes != image_table.changes ||
-        memo.sampler_changes != sampler_table.changes ||
+        !tables_hold || memo.sampler_changes != sampler_table.changes ||
         memo.via_header_index != via_header_index ||
         memo.entries.size() != handle_addresses.size() || views.size() != handle_addresses.size() ||
         samplers.size() != handle_addresses.size() ||
@@ -1218,6 +1223,29 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
             std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
             std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0) {
             return false;
+        }
+    }
+    if (Cfg::g_tic) {
+        if (memo.view_deaths != view_deaths.Clock()) {
+            // The full resolve gives each entry's header the view it gave before while that view
+            // lives (the same bytes, the same page table by host_serial: see ReadImageEntry). A
+            // null view may be a failed creation, which the full resolve tries again.
+            for (const SampledTextureMemo::Entry& entry : memo.entries) {
+                if (entry.view == NULL_IMAGE_VIEW_ID ||
+                    ViewDiedAfter(entry.view, memo.view_deaths)) {
+                    Cfg::Count(Cfg::Counter::MemoDropped);
+                    memo.valid = false;
+                    return false;
+                }
+            }
+            memo.view_deaths = view_deaths.Clock();
+        }
+        if (memo.image_changes != image_table.changes) {
+            // Where the base's memo misses (and is made again with the new count).
+            memo.image_changes = image_table.changes;
+            if (kept_over_deletions != nullptr) {
+                *kept_over_deletions = true;
+            }
         }
     }
     has_deleted_images = false;
@@ -1244,7 +1272,8 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
     memo.entries.clear();
     auto& image_table = channel_state->graphics_image_table;
     auto& sampler_table = channel_state->graphics_sampler_table;
-    if (image_table.invalidated || sampler_table.invalidated || reads.size() != views.size() ||
+    if (image_table.invalidated || (Cfg::g_tic && image_table.deleted_since_read) ||
+        sampler_table.invalidated || reads.size() != views.size() ||
         reads.size() != samplers.size()) {
         return;
     }
@@ -1294,6 +1323,8 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
     memo.host_serial = gpu_memory->HostPointerSerial();
     memo.image_changes = image_table.changes;
     memo.sampler_changes = sampler_table.changes;
+    memo.image_layout_changes = image_table.layout_changes;
+    memo.view_deaths = view_deaths.Clock();
     memo.via_header_index = via_header_index;
     memo.valid = true;
 }
@@ -1311,8 +1342,11 @@ void TextureCache<P>::CaptureDrawDeltaTextures(DrawDeltaSnapshot& snapshot,
             if (index > images.current_limit) {
                 return TICEntry{};
             }
-            if (images.invalidated ||
-                (images.read_descriptors[index / 64] & (1ULL << (index % 64))) == 0) {
+            // EDEN_NX2_CFG_TIC: an entry not read since a view deletion is what a cleared read
+            // bit is in the base.
+            if (Cfg::g_tic ? !images.HoldsReadEntry(index, view_deaths.Clock())
+                           : images.invalidated || (images.read_descriptors[index / 64] &
+                                                    (1ULL << (index % 64))) == 0) {
                 return std::nullopt;
             }
             return images.descriptors[index];
@@ -1734,7 +1768,8 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    auto const [descriptor, is_new] =
+        Cfg::g_tic ? ReadImageTableEntry(table, index) : table.Read(*gpu_memory, index);
     if (is_new) {
         if (mem_trace_enabled) {
             ++trace_tic_changes;
@@ -3331,24 +3366,16 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     RemoveImageViewReferences(image_view_ids);
     RemoveFramebuffers(image_view_ids);
+    if (Cfg::g_tic) {
+        NoteDeletedViews(image_view_ids);
+    }
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
-    for (size_t c : active_channel_ids) {
-        auto& channel_info = channel_storage[c];
-
-#ifndef NDEBUG
-        if constexpr (ENABLE_VALIDATION) {
-            std::ranges::fill(channel_info.graphics_image_table.LiveBoundIds(), CORRUPT_ID);
-            std::ranges::fill(channel_info.compute_image_table.LiveBoundIds(), CORRUPT_ID);
-        }
-#endif
-        channel_info.graphics_image_table.Invalidate();
-        channel_info.compute_image_table.Invalidate();
-    }
+    InvalidateTablesForDeletion();
     has_deleted_images = true;
 }
 
@@ -4899,6 +4926,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
                    num_removed_overlaps);
     }
+    if (Cfg::g_tic) {
+        NoteDeletedViews(image_view_ids);
+    }
     for (const ImageViewId image_view_id : image_view_ids) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
@@ -4932,8 +4962,27 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         image_allocs_table.erase(alloc_it);
         slot_image_allocs.erase(alloc_id);
     }
+    InvalidateTablesForDeletion();
+    has_deleted_images = true;
+}
+
+template <class P>
+void TextureCache<P>::InvalidateTablesForDeletion() {
+    const bool full = std::exchange(tables_invalidated_in_full, false);
     for (size_t c : active_channel_ids) {
         auto& channel_info = channel_storage[c];
+        if (Cfg::g_tic && !full) {
+            // EDEN_NX2_CFG_TIC: the entries bound to the deleted views are resolved again at their
+            // next read (ReadImageEntry), the tables in full once the page table changed.
+            const u64 map_serial = channel_info.gpu_memory.MapSerial();
+            if (channel_info.graphics_image_table.InvalidateViews(map_serial)) {
+                Cfg::Count(Cfg::Counter::TicFull);
+            }
+            if (channel_info.compute_image_table.InvalidateViews(map_serial)) {
+                Cfg::Count(Cfg::Counter::TicFull);
+            }
+            continue;
+        }
 #ifndef NDEBUG
         if constexpr (ENABLE_VALIDATION) {
             std::ranges::fill(channel_info.graphics_image_table.LiveBoundIds(), CORRUPT_ID);
@@ -4943,7 +4992,55 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
     }
-    has_deleted_images = true;
+}
+
+template <class P>
+std::pair<TICEntry, bool> TextureCache<P>::ReadImageTableEntry(
+    DescriptorTable<TICEntry, ImageViewId>& table, u32 index) {
+    using EntryRead = DescriptorTable<TICEntry, ImageViewId>::EntryRead;
+    EntryRead how = EntryRead::Plain;
+    std::pair<TICEntry, bool> read = table.ReadImageEntry(
+        *gpu_memory, index, view_deaths.Clock(),
+        [this](ImageViewId id, u32 stamp) { return ViewDiedAfter(id, stamp); }, how);
+    if (how == EntryRead::Kept) {
+        // The base resolves the entry again here and binds the same view.
+        if (Cfg::g_verify) [[unlikely]] {
+            Cfg::Count(Cfg::Counter::Verified);
+            const ImageViewId kept = table.bound_ids[index];
+            const ImageViewId expected = ResolvedViewOf(read.first);
+            if (expected != kept) {
+                Cfg::Mismatch("a texture header entry kept a view the base resolves differently",
+                              kept.index, expected.index);
+                read.second = true;
+            }
+        }
+        Cfg::Count(read.second ? Cfg::Counter::TicResolved : Cfg::Counter::TicKept);
+    } else if (how == EntryRead::Resolved) {
+        Cfg::Count(Cfg::Counter::TicResolved);
+    }
+    return read;
+}
+
+template <class P>
+void TextureCache<P>::NoteDeletedViews(std::span<const ImageViewId> removed_views) {
+    boost::container::small_vector<u32, 8> slots;
+    for (const ImageViewId id : removed_views) {
+        slots.push_back(id.Value());
+    }
+    if (view_deaths.Note(slots)) [[unlikely]] {
+        // The count started again: no entry or memo may keep one from before, so this deletion
+        // invalidates every table in full (InvalidateTablesForDeletion), as the base's all do.
+        tables_invalidated_in_full = true;
+    }
+}
+
+template <class P>
+ImageViewId TextureCache<P>::ResolvedViewOf(const TICEntry& descriptor) const {
+    if (!IsValidEntry(*gpu_memory, descriptor)) {
+        return NULL_IMAGE_VIEW_ID;
+    }
+    const auto it = channel_state->image_views.find(descriptor);
+    return it != channel_state->image_views.end() ? it->second : ImageViewId{};
 }
 
 template <class P>

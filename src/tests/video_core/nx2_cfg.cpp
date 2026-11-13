@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -17,8 +18,10 @@
 
 #include "common/common_types.h"
 #include "common/lru_cache.h"
+#include "common/slot_vector.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/nx2_cfg.h"
+#include "video_core/texture_cache/descriptor_table.h"
 
 namespace {
 
@@ -401,4 +404,285 @@ TEST_CASE("Cfg: a range query known in one piece repeats without changing the ca
     // Both outcomes occur often.
     REQUIRE(known_total > 50000U);
     REQUIRE(known_total * 4 < queries_total * 3);
+}
+
+namespace {
+
+/// A texture header for the table tests: the address IsValidEntry looks at, and the rest.
+struct MockTic {
+    u64 address{};
+    u64 format{};
+    bool operator==(const MockTic&) const = default;
+};
+
+struct MockTicHash {
+    size_t operator()(const MockTic& tic) const noexcept {
+        return static_cast<size_t>(tic.address * 0x9E3779B97F4A7C15ULL ^ tic.format);
+    }
+};
+
+using TicTable = VideoCommon::DescriptorTable<MockTic, Common::SlotId>;
+constexpr Common::SlotId NULL_VIEW{0};
+constexpr u64 TABLE_BASE = 0x40000;
+constexpr u64 NUM_ADDRESSES = 12;
+constexpr u64 NULL_FORMAT = 5; ///< CreateImageView gives no view for it (and no failure)
+
+/// What the texture cache's VisitImageView reads and changes: guest memory with the table, the
+/// page table, the channel's image_views map and the image view slots.
+struct TicWorld {
+    std::vector<MockTic> words;
+    std::array<bool, NUM_ADDRESSES> mapped{};
+    u64 map_serial = 1;
+    std::vector<bool> alive{true}; ///< slot 0: the null view
+    std::vector<u32> free_slots;   ///< reused last freed first, as Common::SlotVector does
+    std::unordered_map<MockTic, Common::SlotId, MockTicHash> image_views;
+    bool out_of_memory = false;
+
+    [[nodiscard]] const u8* GetPointer(u64 gpu_addr) const {
+        const u64 offset = gpu_addr - TABLE_BASE;
+        if (gpu_addr < TABLE_BASE || offset / sizeof(MockTic) >= words.size()) {
+            return nullptr;
+        }
+        return reinterpret_cast<const u8*>(words.data()) + offset;
+    }
+    void ReadBlockUnsafe(u64 gpu_addr, void* out, size_t size) const {
+        std::memcpy(out, GetPointer(gpu_addr), size);
+    }
+    [[nodiscard]] u64 MapSerial() const {
+        return map_serial;
+    }
+    [[nodiscard]] bool Valid(const MockTic& tic) const {
+        return tic.address != 0 && mapped[tic.address % NUM_ADDRESSES];
+    }
+    Common::SlotId Create() {
+        if (!free_slots.empty()) {
+            const u32 slot = free_slots.back();
+            free_slots.pop_back();
+            alive[slot] = true;
+            return Common::SlotId{slot};
+        }
+        alive.push_back(true);
+        return Common::SlotId{static_cast<u32>(alive.size() - 1)};
+    }
+    /// Deletes a view: RemoveImageViewReferences, then the slot is freed.
+    void Delete(Common::SlotId id) {
+        std::erase_if(image_views, [id](const auto& entry) { return entry.second == id; });
+        alive[id.Value()] = false;
+        free_slots.push_back(id.Value());
+    }
+    [[nodiscard]] std::vector<u32> LiveViews() const {
+        std::vector<u32> live;
+        for (u32 slot = 1; slot < alive.size(); ++slot) {
+            if (alive[slot]) {
+                live.push_back(slot);
+            }
+        }
+        return live;
+    }
+};
+
+/// One channel's image table and its texture cache, with or without EDEN_NX2_CFG_TIC.
+struct TicModel {
+    bool per_entry{};
+    TicWorld world;
+    TicTable table;
+    Cfg::ViewDeaths deaths;
+    u64 kept = 0;
+    u64 resolved_again = 0;
+    u64 full = 0;
+
+    /// The deletion of `slots` (DeleteImage or InvalidateScale): the views die, the tables hear.
+    void DeleteViews(const std::vector<u32>& slots) {
+        for (const u32 slot : slots) {
+            world.Delete(Common::SlotId{slot});
+        }
+        if (!per_entry) {
+            table.Invalidate();
+            return;
+        }
+        if (deaths.Note(slots)) {
+            table.Invalidate();
+            return;
+        }
+        full += table.InvalidateViews(world.MapSerial()) ? 1 : 0;
+    }
+
+    /// VisitImageView. `prepare_deletes` stands for PrepareImageView deleting the view it
+    /// prepares (scaling its image), before the entry is bound to it.
+    Common::SlotId Visit(u32 index, bool prepare_deletes) {
+        using EntryRead = TicTable::EntryRead;
+        EntryRead how = EntryRead::Plain;
+        const std::pair<MockTic, bool> read =
+            per_entry ? table.ReadImageEntry(
+                            world, index, deaths.Clock(),
+                            [this](Common::SlotId id, u32 stamp) {
+                                return deaths.DiedAfter(id.Value(), stamp);
+                            },
+                            how)
+                      : table.Read(world, index);
+        kept += how == EntryRead::Kept ? 1 : 0;
+        resolved_again += how == EntryRead::Resolved ? 1 : 0;
+        if (!read.second) {
+            // Prepared on this path too (PrepareImageView of the bound view).
+            const Common::SlotId bound = table.bound_ids[index];
+            if (prepare_deletes && bound != NULL_VIEW) {
+                DeleteViews({bound.Value()});
+            }
+            return bound;
+        }
+        const MockTic& tic = read.first;
+        if (!world.Valid(tic)) {
+            table.bound_ids[index] = NULL_VIEW;
+            return NULL_VIEW;
+        }
+        const auto [it, inserted] = world.image_views.try_emplace(tic);
+        if (inserted) {
+            if (world.out_of_memory) {
+                world.image_views.erase(it);
+                table.bound_ids[index] = NULL_VIEW;
+                return NULL_VIEW;
+            }
+            it->second = tic.format == NULL_FORMAT ? NULL_VIEW : world.Create();
+        }
+        const Common::SlotId view = it->second;
+        if (prepare_deletes && view != NULL_VIEW) {
+            DeleteViews({view.Value()});
+        }
+        table.bound_ids[index] = view;
+        return view;
+    }
+
+    /// What CaptureDrawDeltaTextures takes as read: the base's cleared read bits and invalidated.
+    [[nodiscard]] bool Holds(u32 index) const {
+        if (per_entry) {
+            return table.HoldsReadEntry(index, deaths.Clock());
+        }
+        return !table.invalidated &&
+               (table.read_descriptors[index / 64] & (u64{1} << (index % 64))) != 0;
+    }
+};
+
+MockTic RandomTic(std::mt19937_64& rng) {
+    return MockTic{.address = rng() % (NUM_ADDRESSES + 2), .format = rng() % 6};
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Cfg: per-entry texture header invalidation binds what full invalidation binds",
+          "[video_core][nx2_cfg]") {
+    std::mt19937_64 rng{31};
+    u64 reads = 0;
+    u64 kept = 0;
+    u64 resolved_again = 0;
+    u64 full = 0;
+    for (int run = 0; run < 300; ++run) {
+        TicModel base;
+        TicModel tic;
+        tic.per_entry = true;
+        if (run % 50 == 7) {
+            // Close to the count's wrap.
+            tic.deaths = Cfg::ViewDeaths{(std::numeric_limits<u32>::max)() - 40};
+        }
+        u32 limit = static_cast<u32>(rng() % 90 + 10);
+        std::vector<MockTic> words(256);
+        for (MockTic& word : words) {
+            word = RandomTic(rng);
+        }
+        std::array<bool, NUM_ADDRESSES> mapped{};
+        for (bool& address : mapped) {
+            address = rng() % 4 != 0;
+        }
+        for (TicModel* model : {&base, &tic}) {
+            model->world.words = words;
+            model->world.mapped = mapped;
+            (void)model->table.Synchronize(TABLE_BASE, limit);
+        }
+        for (int step = 0; step < 3000; ++step) {
+            const u64 kind = rng() % 100;
+            if (kind < 6) {
+                // The game writes a header.
+                const size_t index = static_cast<size_t>(rng() % (limit + 1));
+                const MockTic word = RandomTic(rng);
+                base.world.words[index] = word;
+                tic.world.words[index] = word;
+            } else if (kind < 16) {
+                // Images deleted: one to three live views (the same in both worlds).
+                const std::vector<u32> live = base.world.LiveViews();
+                REQUIRE(live == tic.world.LiveViews());
+                if (live.empty()) {
+                    continue;
+                }
+                std::vector<u32> slots;
+                const u64 count = rng() % 3 + 1;
+                for (u64 i = 0; i < count; ++i) {
+                    const u32 slot = live[static_cast<size_t>(rng() % live.size())];
+                    if (std::ranges::find(slots, slot) == slots.end()) {
+                        slots.push_back(slot);
+                    }
+                }
+                base.DeleteViews(slots);
+                tic.DeleteViews(slots);
+            } else if (kind < 18) {
+                // A map or unmap.
+                const size_t address = static_cast<size_t>(rng() % NUM_ADDRESSES);
+                for (TicModel* model : {&base, &tic}) {
+                    model->world.mapped[address] = !model->world.mapped[address];
+                    ++model->world.map_serial;
+                }
+            } else if (kind < 20) {
+                const bool oom = rng() % 2 == 0;
+                base.world.out_of_memory = oom;
+                tic.world.out_of_memory = oom;
+            } else if (kind == 20 && rng() % 8 == 0) {
+                // The game moves or resizes the table.
+                limit = static_cast<u32>(rng() % 90 + 10);
+                (void)base.table.Synchronize(TABLE_BASE, limit);
+                (void)tic.table.Synchronize(TABLE_BASE, limit);
+            } else if (kind == 21) {
+                // Out of memory at the end of a frame: TickFrame invalidates in full.
+                base.table.Invalidate();
+                tic.table.Invalidate();
+            } else {
+                const u32 index = static_cast<u32>(rng() % (limit + 1));
+                const bool prepare_deletes = rng() % 64 == 0;
+                const Common::SlotId expected = base.Visit(index, prepare_deletes);
+                const Common::SlotId got = tic.Visit(index, prepare_deletes);
+                ++reads;
+                REQUIRE(got == expected);
+            }
+            REQUIRE(base.table.changes == tic.table.changes);
+            for (u32 index = 0; index <= limit; ++index) {
+                REQUIRE(base.Holds(index) == tic.Holds(index));
+            }
+        }
+        REQUIRE(base.world.image_views == tic.world.image_views);
+        kept += tic.kept;
+        resolved_again += tic.resolved_again;
+        full += tic.full;
+    }
+    // Every path ran many times.
+    CAPTURE(kept, resolved_again, full, reads);
+    REQUIRE(kept > 5000U);
+    REQUIRE(resolved_again > 5000U);
+    REQUIRE(full > 1000U);
+    REQUIRE(reads > 500000U);
+}
+
+TEST_CASE("Cfg: view deaths order deletions and reads, also across the count's wrap",
+          "[video_core][nx2_cfg]") {
+    Cfg::ViewDeaths deaths{(std::numeric_limits<u32>::max)() - 2};
+    const u32 read_before = deaths.Clock();
+    REQUIRE_FALSE(deaths.Note(std::vector<u32>{3}));
+    REQUIRE(deaths.DiedAfter(3, read_before));
+    REQUIRE_FALSE(deaths.DiedAfter(3, deaths.Clock()));
+    REQUIRE_FALSE(deaths.DiedAfter(4, read_before));
+    REQUIRE_FALSE(deaths.DiedAfter(1000, read_before));
+    REQUIRE_FALSE(deaths.Note(std::vector<u32>{4}));
+    REQUIRE(deaths.Clock() == (std::numeric_limits<u32>::max)());
+    // The next deletion starts the count again and says so: the caller invalidates in full.
+    REQUIRE(deaths.Note(std::vector<u32>{5}));
+    REQUIRE(deaths.Clock() == 2U);
+    REQUIRE(deaths.DiedAfter(5, 1));
+    REQUIRE_FALSE(deaths.DiedAfter(3, 1));
+    REQUIRE_FALSE(deaths.DiedAfter(4, 1));
 }

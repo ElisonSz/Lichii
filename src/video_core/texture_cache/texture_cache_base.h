@@ -102,6 +102,10 @@ struct SampledTextureMemo {
     u64 host_serial{};         ///< MemoryManager::HostPointerSerial
     u64 image_changes{};       ///< DescriptorTable::changes of both tables
     u64 sampler_changes{};
+    /// EDEN_NX2_CFG_TIC: the image table's layout_changes, and the view deletion count, when the
+    /// memo was made or last found to hold
+    u64 image_layout_changes{};
+    u32 view_deaths{};
     bool via_header_index{}; ///< The sampler binding the handles were split with
     bool valid{};
     u32 misses{}; ///< Draws in a row that did not find the memo good
@@ -357,10 +361,13 @@ public:
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
     /// handle_addresses are where the draw reads its texture handles from, in binding order.
+    /// EDEN_NX2_CFG_TIC: `kept_over_deletions` is set when views were deleted since the memo was
+    /// made, none of its own (the base resolves in full then); it counts if the call returns true.
     [[nodiscard]] bool ResolveMemoizedTextures(SampledTextureMemo& memo,
                                                std::span<const GPUVAddr> handle_addresses,
                                                std::span<ImageViewInOut> views,
-                                               std::span<SamplerId> samplers);
+                                               std::span<SamplerId> samplers,
+                                               bool* kept_over_deletions = nullptr);
 
     /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
     void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
@@ -571,6 +578,25 @@ private:
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
+    /// EDEN_NX2_CFG_TIC: DescriptorTable::ReadImageEntry with the counts and verify.
+    std::pair<TICEntry, bool> ReadImageTableEntry(DescriptorTable<TICEntry, ImageViewId>& table,
+                                                  u32 index);
+
+    /// EDEN_NX2_CFG_TIC: views deleted (DeleteImage, InvalidateScale) get the deletion's count.
+    void NoteDeletedViews(std::span<const ImageViewId> removed_views);
+
+    /// EDEN_NX2_CFG_TIC: the base's Invalidate of every channel's image tables for a deletion.
+    void InvalidateTablesForDeletion();
+
+    /// EDEN_NX2_CFG_TIC: whether view `id` was deleted after the deletion count was `stamp`.
+    [[nodiscard]] bool ViewDiedAfter(ImageViewId id, u32 stamp) const noexcept {
+        return view_deaths.DiedAfter(id.Value(), stamp);
+    }
+
+    /// EDEN_NX2_CFG_TIC verify: the view the base binds a texture header to, without creating
+    /// one (an invalid id if it would create one).
+    [[nodiscard]] ImageViewId ResolvedViewOf(const TICEntry& descriptor) const;
+
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
 
@@ -760,6 +786,10 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// EDEN_NX2_CFG_TIC: image view deletions so far and when each view slot's last one was.
+    Cfg::ViewDeaths view_deaths;
+    /// EDEN_NX2_CFG_TIC: the deletion being made invalidates the tables in full (NoteDeletedViews).
+    bool tables_invalidated_in_full = false;
     std::vector<ImageId>* prepare_log{}; ///< LogPrepares
     bool prepare_log_dry{};
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
