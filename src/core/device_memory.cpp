@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 
 #include "common/logging.h"
@@ -27,6 +28,13 @@ DeviceMemory::DeviceMemory()
     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
              VirtualReserveSize} {
 #ifdef _WIN32
+    // EDEN_NX2_ZERO_TRIM=0 (comparisons): no trim passes, so pages the guest cleared stay in the
+    // working set and a later touch of them takes no page fault.
+    if (const char* const value = std::getenv("EDEN_NX2_ZERO_TRIM");
+        value != nullptr && value[0] == '0') {
+        LOG_INFO(HW_Memory, "EDEN_NX2_ZERO_TRIM=0: zero-page trimming is off");
+        return;
+    }
     zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
 #endif
 }

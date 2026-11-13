@@ -32,6 +32,7 @@
 #include "common/dkb_frame_trace.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/nx2_map_stats.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -4406,12 +4407,18 @@ void RasterizerVulkan::TickFrame() {
                                              snapshot.threads[i].active ? "unavailable" : "inactive");
                     }
                 }
+                // The process's page faults since the last line: soft and demand-zero faults of
+                // guest memory land in the JIT's time on the guest cores.
+                static u64 last_page_faults = Common::Nx2MapStats::PageFaultCount();
+                const u64 page_faults = Common::Nx2MapStats::PageFaultCount();
+                const u64 new_page_faults = page_faults - last_page_faults;
+                last_page_faults = page_faults;
                 LOG_INFO(Render_Vulkan,
-                         "DKB cpu through_frame={} frames={} window_wall_ms={:.3f}{}",
+                         "DKB cpu through_frame={} frames={} window_wall_ms={:.3f} page_faults={}{}",
                          trace_frame, frames,
                          std::chrono::duration<double, std::milli>(
                              snapshot.wall_time - trace_cpu_snapshot->wall_time).count(),
-                         roles);
+                         new_page_faults, roles);
             }
             trace_cpu_snapshot = std::move(snapshot);
             trace_cpu_frame = trace_frame;
