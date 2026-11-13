@@ -581,7 +581,8 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         // vertex input specialization, fixed-function state or an imageless stage's program
         // differs) goes on with the delta.
         if (!same && FastDraw::g_drawx_twin && !serial_changed && current != nullptr &&
-            current->IsBuilt() && (!layout || current->HasDynamicVertexInput()) &&
+            current->IsBuilt() &&
+            current->HasDynamicVertexInput() == draw.pipeline->HasDynamicVertexInput() &&
             current->KeepsImageStateOf(*draw.pipeline)) {
             current->TakeDeltaState(*draw.pipeline);
             twin_source = draw.pipeline;
@@ -653,7 +654,9 @@ bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial, bool matching
     if (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
         return full(FullDraw::RenderPass);
     }
-    if ((taken_delta.vertex_layout || (matching && (taken_delta.match_cases & 2U) != 0)) &&
+    // EDEN_NX2_DRAWX_TWIN: a twin may repack vertex buffers the previous pipeline did not.
+    if ((taken_delta.vertex_layout || (matching && (taken_delta.match_cases & 2U) != 0) ||
+         twin_source != nullptr) &&
         buffer_cache_runtime.AnyVertexRepacked()) {
         taken_break_classes |=
             VideoCommon::Nx2FastDraw::ClassBit(VideoCommon::Nx2FastDraw::BreakClass::VertexLayout);
@@ -1312,6 +1315,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_stats = {};
         drawx_stats = {};
         drawx_keep_serial = 0;
+        twin_source = nullptr;
     }
     fast_draw_verify = fast_draw_on && (FastDraw::VerifyEnabled() || FastDraw::g_draw_delta_verify ||
                                         FastDraw::g_drawx_verify);
