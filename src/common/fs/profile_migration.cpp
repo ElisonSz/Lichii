@@ -119,6 +119,28 @@ void CheckTree(const fs::path& root) {
     }
 }
 
+// A source root may itself be a link to a directory, for example a junction that keeps the old
+// profile on another drive. Import from the directory it points to, so every overlap check and
+// the recovery journal use the real path. Links inside the tree are still refused by CheckTree.
+// Move is refused for a linked root: it would rename the real directory behind the link, which
+// other links or programs may still use.
+fs::path ResolveSourceRoot(const fs::path& root, Strategy strategy) {
+    if (!Common::FS::IsSymlink(root)) {
+        return root;
+    }
+    if (strategy == Strategy::Move) {
+        throw std::runtime_error("Move cannot import a linked profile folder, use Copy or Link: " +
+                                 root.string());
+    }
+    std::error_code error;
+    const auto target = fs::canonical(root, error);
+    if (error || Common::FS::IsSymlink(target) || !fs::is_directory(target)) {
+        throw std::runtime_error("Migration source link does not lead to a real directory: " +
+                                 root.string());
+    }
+    return target;
+}
+
 std::vector<Root> Validate(const Plan& plan) {
     if (plan.roots.empty() || plan.state_dir.empty()) {
         throw std::runtime_error("Migration requires roots and an external state directory");
@@ -130,9 +152,10 @@ std::vector<Root> Validate(const Plan& plan) {
         if (root.source.empty() || root.destination.empty()) {
             throw std::runtime_error("Migration paths cannot be empty");
         }
-        CheckTree(root.source);
+        const auto source = ResolveSourceRoot(root.source, plan.strategy);
+        CheckTree(source);
         const auto destination = Absolute(root.destination);
-        Root normalized{fs::weakly_canonical(Absolute(root.source)),
+        Root normalized{fs::weakly_canonical(Absolute(source)),
                         fs::weakly_canonical(destination.parent_path()) / destination.filename()};
         if (Overlaps(normalized.source, fs::weakly_canonical(destination))) {
             throw std::runtime_error("Migration source and destination must not overlap");

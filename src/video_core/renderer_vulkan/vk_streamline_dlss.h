@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
@@ -46,6 +47,18 @@ public:
         bool reset;
         bool depth_inverted = true;
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
+        /// The depth image's size when it is larger than the render size (the scene lies in its
+        /// top left corner); zero for the render size.
+        VkExtent2D depth_size{};
+        /// The scene camera, for DLSS Frame Generation. Row-major matrices that take a column
+        /// vector, unjittered, with OpenGL clip depth (-1 to 1) and clip y up: the
+        /// view-projection and the motion vectors' clip-to-previous-clip. Without it the frame
+        /// gets no frame generation.
+        struct Camera {
+            std::array<f32, 16> view_projection;
+            std::array<f32, 16> clip_to_previous_clip;
+        };
+        std::optional<Camera> camera;
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.

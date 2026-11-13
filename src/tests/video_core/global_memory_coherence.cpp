@@ -483,6 +483,25 @@ TEST_CASE("Global atomic add preserves native candidate selection and atomic old
     }
 }
 
+TEST_CASE("Native global routing helpers stay inlinable and route with a branch per buffer",
+          "[shader][spirv][global_atomic][oot]") {
+    // Marked DontInline and routed through one OpSwitch, these helpers made Ocarina of Time's
+    // foliage compute programs draw the far forest unculled and at wrong heights on NVIDIA.
+    for (const bool atomic : {false, true}) {
+        CAPTURE(atomic);
+        GlobalAtomicProgram fixture{true, 4, atomic};
+        REQUIRE(fixture.program.info.native_global_bounds);
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        CHECK(Instructions(code, 251).empty());
+        const auto functions = Instructions(code, 54);
+        REQUIRE(functions.size() > 1);
+        for (const auto& function : functions) {
+            REQUIRE(function.size() == 4);
+            CHECK(function[2] == 0);
+        }
+    }
+}
+
 TEST_CASE("Global loads do not emit unused atomic helpers", "[shader][spirv][global_atomic]") {
     GlobalAtomicProgram fixture{true, 4, false};
     const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);

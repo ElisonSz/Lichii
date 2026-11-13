@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -259,6 +258,8 @@ public:
     [[nodiscard]] bool IsFree(u64 tick) const noexcept;
 
     u64 GetDeviceMemoryBudget() const;
+
+    u64 GetDeviceHeapMemoryBudget() const;
 
     u64 GetDeviceMemorySlack() const;
 

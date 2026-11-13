@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,8 @@ enum class Reason : u8 {
     IndirectReset,
     Frame,
     TextureHeaders,
+    /// A write list lost a range (only with EDEN_NX2_DRAWX_COALESCE: by default a full list widens
+    /// its closest range, AppendRange).
     DeltaOverflow,
     Map,
     Count,
@@ -67,6 +70,11 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
 };
 
 inline std::atomic<bool> g_enabled{true};
+
+/// Whether pipelines take their vertex input as dynamic state (VK_EXT_vertex_input_dynamic_state):
+/// then the vertex attribute formats are draw parameters, as only each attribute's type class is
+/// in the pipeline key. Set by the pipeline cache before the GPU threads run, read on the back.
+inline std::atomic<bool> g_dynamic_vertex_input{};
 
 /// Initialized at GPU creation, before command processing starts. Hot switches are plain flags.
 inline bool g_draw_delta{};
@@ -86,7 +94,8 @@ inline void ReadDrawDeltaSwitch() {
 inline bool g_draw_reuse{};
 inline bool g_draw_reuse_verify{};
 /// EDEN_NX2_DRAW_VERTEX_INPUT=1: dynamic vertex input states are kept by the registers they are
-/// built from (VideoCommon::VertexInputCache) and recorded by reference.
+/// built from (VideoCommon::VertexInputCache) and recorded by reference. nx2 does that always
+/// (RasterizerVulkan::UpdateVertexInput); the switch still logs the cache's hits and misses.
 inline bool g_draw_vertex_input{};
 /// EDEN_NX2_DRAW_HANDLE_EVAL=1: handle programs run without zeroing their stack and slots
 /// (Shader::g_lean_handle_programs).
@@ -104,6 +113,9 @@ inline bool g_drawx_neutral{};
 inline bool g_drawx_pipestate{};
 /// EDEN_NX2_DRAWX_UNIFORMS=1: uniform keeps (BufferCache::UniformRangeKept) also on full draws
 /// when nothing but register writes ended the delta chain since the previous draw (g_keep_serial).
+/// nx2 keeps uniforms on every draw until a synchronisation point (SyncSerial), so full draws keep
+/// them without the switch; with it the DrawX window counts the full draws that keep them and
+/// those outside a keep chain (which only nx2's rule keeps).
 inline bool g_drawx_uniforms{};
 /// EDEN_NX2_DRAWX_TWIN=1: when the pipeline looked up again for a vertex layout, fixed-function or
 /// shader program change is another object that keeps the same image state (the same configure
@@ -124,10 +136,13 @@ inline bool g_drawx_keep_audit{};
 /// by default): every small uniform buffer is compared with the bytes its slot streamed last.
 inline bool g_drawx_no_keeps{};
 /// EDEN_NX2_DRAWX_COALESCE=1: a full constant data write list (Delta::MaxWrites GPU and device
-/// ranges) takes a further range by widening the entry it grows least (CoalesceRange) instead of
-/// ending the chain (Reason::DeltaOverflow). Every reader of the lists treats a range as maybe
-/// written, so a covering range only makes them more careful. EDEN_NX2_DRAWX_COALESCE_VERIFY=1
-/// also keeps every range exactly and checks the lists cover them when a draw takes them.
+/// ranges) takes a further range by widening the entry it grows least (CoalesceRange), by at most
+/// CoalesceGrowthLimit bytes nobody wrote; a range no merge takes within that ends the chain
+/// (Reason::DeltaOverflow). Without the switch a full list widens its closest range however far
+/// (AppendRange) and the draw keeps no uniforms (Delta::no_uniform_keeps). Every reader of the
+/// lists treats a range as maybe written, so a covering range only makes them more careful, and
+/// bounded merges keep uniform keeps. EDEN_NX2_DRAWX_COALESCE_VERIFY=1 also keeps every range
+/// exactly and checks the lists cover them when a draw takes them.
 inline bool g_drawx_coalesce{};
 inline bool g_drawx_coalesce_verify{};
 /// EDEN_NX2_DRAWX_DYNSTATE=1: depth bias values (read only by UpdateDepthBias, dynamic state on
@@ -167,18 +182,19 @@ void ReadDrawXSwitches();
 enum class KeepSource : u8 {
     Delta, ///< A delta draw with the previous draw's pipeline
     Twin,  ///< A delta draw with a twin of it (EDEN_NX2_DRAWX_TWIN)
-    Full,  ///< A full draw (EDEN_NX2_DRAWX_UNIFORMS)
+    Full,  ///< A full draw
     Count,
 };
 inline constexpr std::array<const char*, static_cast<size_t>(KeepSource::Count)>
     keep_source_names{"delta", "twin", "full"};
 
-/// EDEN_NX2_DRAWX_UNIFORMS: links full draws into keep chains. g_keep_serial must not have changed
-/// since the previous draw began binding its uniforms, and that draw must be the one that took
-/// g_delta last: TakeReusableDraw empties g_delta for each draw, so after a draw that returned
-/// before binding its uniforms (no pipeline yet, a skipped mesh draw) the next draw's g_delta
-/// lacks the binds and constant data written before it. Take() when the draw takes g_delta,
-/// Keeps() when it begins binding its uniforms.
+/// EDEN_NX2_DRAWX_UNIFORMS: links full draws into keep chains (the test line's full-draw keep rule,
+/// counted in the DrawX window since nx2 keeps uniforms on every draw). g_keep_serial must not
+/// have changed since the previous draw began binding its uniforms, and that draw must be the one
+/// that took g_delta last: TakeReusableDraw empties g_delta for each draw, so after a draw that
+/// returned before binding its uniforms (no pipeline yet, a skipped mesh draw) the next draw's
+/// g_delta lacks the binds and constant data written before it. Take() when the draw takes
+/// g_delta, Keeps() when it begins binding its uniforms.
 class KeepChain {
 public:
     /// The serial the previous draw left for this one: 0 (none) unless it reached Keeps().
@@ -460,48 +476,89 @@ inline void ResetCostEvents() {
     }
 }
 
-inline std::atomic<u64> g_serial{1};
+/// On its own cache line, away from what every thread reads (g_enabled).
+alignas(64) inline std::atomic<u64> g_serial{1};
 /// Diagnostic serial ignoring only the three experiment-eligible register/method breaks. It
 /// never authorizes reuse: off-window candidates still execute full preparation.
 inline std::atomic<u64> g_match_serial{1};
-/// The last break's reason and, for Register and Method, its 3D method (diagnostics).
+/// The last break's reason and, for Register and Method, its 3D method (diagnostics). Stored by
+/// every break, also those that skip the add below, so a register block's one break names what
+/// its writes one by one would.
 inline std::atomic<u32> g_last_break{};
+
+/// The thread that draws reads the serial before each draw (Serial). Once one of its breaks
+/// bumped the serial since that read, more change nothing it compares, so they skip the locked
+/// add (every changed 3D register breaks). Threads that never read it (the front's puller, guest
+/// CPU write traps, unmaps) always bump. From lucastaonline's 865afaa4f3 (#1161).
+inline thread_local bool t_reads_serial{};
+inline thread_local bool t_serial_bumped{};
+
+/// Bumped where the guest CPU may have synchronised with the GPU: fences, semaphores, syncpoints,
+/// reports, frames, other engines and requests from other threads. After one the guest may have
+/// written memory the caches were not told about (pages that aren't write-protected), so uniform
+/// keeps read their buffers again.
+inline std::atomic<u64> g_sync_serial{1};
+
+inline void NoteSync() {
+    g_sync_serial.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline u64 SyncSerial() {
+    return g_sync_serial.load(std::memory_order_acquire);
+}
 
 [[nodiscard]] bool IsExperimentBreak(Reason reason, u32 method);
 
 inline void Break(Reason reason, u32 method = 0) {
-    if (Enabled()) {
+    // 3D methods that let the CPU synchronise (reports, syncpoints) note it where they reach the
+    // rasterizer. Invalidations end image and shader lifetimes, not guest memory writes, and an
+    // overflowing write list ends its draw's uniform keeps itself (Delta::no_uniform_keeps).
+    if (reason != Reason::Register && reason != Reason::Method && reason != Reason::ConstantData &&
+        reason != Reason::TextureHeaders && reason != Reason::DeltaOverflow &&
+        reason != Reason::Invalidation) {
+        NoteSync();
+    }
+    if (!Enabled()) {
+        return;
+    }
+    g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+    if (!(t_reads_serial && t_serial_bumped)) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
-        if (Nx2CallSites::g_enabled && reason != Reason::Call) [[unlikely]] {
-            Nx2CallSites::g_other_break.store(true, std::memory_order_relaxed);
+        t_serial_bumped = t_reads_serial;
+    }
+    // Every break, also those that skip the add above.
+    if (Nx2CallSites::g_enabled && reason != Reason::Call) [[unlikely]] {
+        Nx2CallSites::g_other_break.store(true, std::memory_order_relaxed);
+    }
+    if (g_drawx_uniforms && reason != Reason::Register) {
+        g_keep_serial.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (DrawCostStatsEnabled()) {
+        // Sample only the optional bookkeeping, including its extra serial. The clock pair
+        // and sample-result atomics are outside this interval. Sampling avoids two clock
+        // reads on every break; report sample count so extrapolation is explicit.
+        static thread_local u32 sample_sequence{};
+        const bool sample = (++sample_sequence & 1023U) == 0;
+        const u64 start = sample ? CostNow() : 0;
+        if (!IsExperimentBreak(reason, method)) {
+            g_match_serial.fetch_add(1, std::memory_order_relaxed);
         }
-        if (g_drawx_uniforms && reason != Reason::Register) {
-            g_keep_serial.fetch_add(1, std::memory_order_relaxed);
+        g_break_classes.fetch_or(ClassifyBreak(reason, method), std::memory_order_relaxed);
+        if (reason == Reason::Method && method < g_method_breaks.size()) {
+            g_method_breaks[method].fetch_add(1, std::memory_order_relaxed);
         }
-        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
-        if (DrawCostStatsEnabled()) {
-            // Sample only the optional bookkeeping, including its extra serial. The clock pair
-            // and sample-result atomics are outside this interval. Sampling avoids two clock
-            // reads on every break; report sample count so extrapolation is explicit.
-            static thread_local u32 sample_sequence{};
-            const bool sample = (++sample_sequence & 1023U) == 0;
-            const u64 start = sample ? CostNow() : 0;
-            if (!IsExperimentBreak(reason, method)) {
-                g_match_serial.fetch_add(1, std::memory_order_relaxed);
-            }
-            g_break_classes.fetch_or(ClassifyBreak(reason, method), std::memory_order_relaxed);
-            if (reason == Reason::Method && method < g_method_breaks.size()) {
-                g_method_breaks[method].fetch_add(1, std::memory_order_relaxed);
-            }
-            if (sample) {
-                g_bookkeeping_ns.fetch_add(CostNow() - start, std::memory_order_relaxed);
-                g_bookkeeping_samples.fetch_add(1, std::memory_order_relaxed);
-            }
+        if (sample) {
+            g_bookkeeping_ns.fetch_add(CostNow() - start, std::memory_order_relaxed);
+            g_bookkeeping_samples.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
 
+/// The thread that draws: what it compares fast draws with (and from then on its next break
+/// bumps the serial again).
 inline u64 Serial() {
+    t_reads_serial = true;
+    t_serial_bumped = false;
     return g_serial.load(std::memory_order_relaxed);
 }
 
@@ -516,11 +573,26 @@ public:
     /// Whether [begin, end) of device memory overlaps the range's.
     [[nodiscard]] bool Intersects(DAddr begin, DAddr end) const;
 
+    /// The GPU address the range starts at.
+    [[nodiscard]] GPUVAddr Address() const noexcept {
+        return address;
+    }
+
+    /// Whether the range maps to one run of device memory in GPU order, starting at LinearBase.
+    [[nodiscard]] bool IsLinear() const noexcept {
+        return linear;
+    }
+    [[nodiscard]] DAddr LinearBase() const noexcept {
+        return linear_base;
+    }
+
 private:
     const Tegra::MemoryManager* memory{};
     GPUVAddr address{};
     u64 size{};
     u64 map_serial{};
+    bool linear{};
+    DAddr linear_base{};
     std::vector<std::pair<DAddr, DAddr>> spans; ///< Sorted, disjoint [begin, end) pairs
 };
 
@@ -538,6 +610,10 @@ struct Delta {
     std::array<DAddr, MaxWrites> device_begin{};
     std::array<DAddr, MaxWrites> device_end{};
     u32 num_device_writes{};
+    /// Set when the ranges were widened (AppendRange), lost a range (EDEN_NX2_DRAWX_COALESCE) or
+    /// reached a buffer of texture handles between its handles: the draw keeps no uniforms, as
+    /// when such writes ended draw reuse.
+    bool no_uniform_keeps{};
     bool vertex_layout{}; ///< Requires a fresh pipeline lookup, then dynamic vertex input.
     /// EDEN_NX2_DRAWX_PIPESTATE: a fixed-function register changed; requires a fresh pipeline
     /// lookup that selects the same pipeline object (or a twin, EDEN_NX2_DRAWX_TWIN).
@@ -571,14 +647,116 @@ struct Delta {
         }
         return false;
     }
+
+    /// Reaches for only the bytes [base + first, base + second) of each of words, all inside the
+    /// range spans was updated with. Device writes are compared word by word when that range maps
+    /// linearly, else with the whole range.
+    [[nodiscard]] bool ReachesWords(GPUVAddr base, std::span<const std::pair<u32, u32>> words,
+                                    const DeviceSpans& spans) const {
+        for (u32 write = 0; write < num_writes; ++write) {
+            for (const auto& [first, second] : words) {
+                if (write_begin[write] < base + second && base + first < write_end[write]) {
+                    return true;
+                }
+            }
+        }
+        for (u32 write = 0; write < num_device_writes; ++write) {
+            if (!spans.Intersects(device_begin[write], device_end[write])) {
+                continue;
+            }
+            if (!spans.IsLinear()) {
+                return true;
+            }
+            for (const auto& [first, second] : words) {
+                const DAddr begin = spans.LinearBase() + (base + first - spans.Address());
+                const DAddr end = begin + (second - first);
+                if (device_begin[write] < end && begin < device_end[write]) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 };
 
 inline Delta g_delta;
 
-/// Appends [begin, end) to a delta's range list, or extends its last range when that ends at
-/// begin. False when the list is full.
+/// Moves g_delta into `out` and clears it, copying only the ranges in use (Delta is ~0.5 KiB and
+/// taken for every draw). Every other member is copied and cleared too.
+inline void TakeDelta(Delta& out) {
+    Delta& delta = g_delta;
+    out.binds = delta.binds;
+    out.num_writes = delta.num_writes;
+    std::copy_n(delta.write_begin.begin(), delta.num_writes, out.write_begin.begin());
+    std::copy_n(delta.write_end.begin(), delta.num_writes, out.write_end.begin());
+    out.num_device_writes = delta.num_device_writes;
+    std::copy_n(delta.device_begin.begin(), delta.num_device_writes, out.device_begin.begin());
+    std::copy_n(delta.device_end.begin(), delta.num_device_writes, out.device_end.begin());
+    out.no_uniform_keeps = delta.no_uniform_keeps;
+    out.vertex_layout = delta.vertex_layout;
+    out.pipeline_state = delta.pipeline_state;
+    out.shader_state = delta.shader_state;
+    out.drawx_skipped = delta.drawx_skipped;
+    out.queries = delta.queries;
+    out.vertex_id = delta.vertex_id;
+    out.match_cases = delta.match_cases;
+    out.overflowed = delta.overflowed;
+    delta.binds = {};
+    delta.num_writes = 0;
+    delta.num_device_writes = 0;
+    delta.no_uniform_keeps = false;
+    delta.vertex_layout = false;
+    delta.pipeline_state = false;
+    delta.shader_state = false;
+    delta.drawx_skipped = false;
+    delta.queries = false;
+    delta.vertex_id = false;
+    delta.match_cases = 0;
+    delta.overflowed = false;
+}
+
+/// Adds [begin, end) to a delta's range list: extends a range it touches or overlaps, else
+/// appends it. A full list widens the range that grows least instead (true then), which only
+/// makes Reaches more conservative.
 inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
                         std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
+    if (count != 0 && ends[count - 1] == begin) {
+        ends[count - 1] = end;
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (begin <= ends[i] && begins[i] <= end) {
+            begins[i] = (std::min)(begins[i], begin);
+            ends[i] = (std::max)(ends[i], end);
+            return false;
+        }
+    }
+    if (count < Delta::MaxWrites) {
+        begins[count] = begin;
+        ends[count] = end;
+        ++count;
+        return false;
+    }
+    u32 best = 0;
+    u64 best_growth = ~u64{0};
+    for (u32 i = 0; i < count; ++i) {
+        const u64 growth = ((std::max)(ends[i], end) - (std::min)(begins[i], begin)) -
+                           (ends[i] - begins[i]);
+        if (growth < best_growth) {
+            best = i;
+            best_growth = growth;
+        }
+    }
+    begins[best] = (std::min)(begins[best], begin);
+    ends[best] = (std::max)(ends[best], end);
+    return true;
+}
+
+/// EDEN_NX2_DRAWX_COALESCE's first step: appends [begin, end) to a delta's range list, or extends
+/// its last range when that ends at begin. False when the list is full.
+inline bool AppendOrExtendLast(std::array<u64, Delta::MaxWrites>& begins,
+                               std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin,
+                               u64 end) {
     if (count != 0 && ends[count - 1] == begin) {
         ends[count - 1] = end;
         return true;
@@ -596,13 +774,13 @@ inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
 /// whose every entry is further away than this from the new range overflows as before.
 inline constexpr u64 CoalesceGrowthLimit = 0x10000;
 
-/// AppendRange; when the list is full, [begin, end) widens the entry it grows by the fewest
-/// bytes nobody wrote (none for a range inside or touching an entry), and `merged` is set. False
-/// when every merge would add more than CoalesceGrowthLimit such bytes.
+/// AppendOrExtendLast; when the list is full, [begin, end) widens the entry it grows by the
+/// fewest bytes nobody wrote (none for a range inside or touching an entry), and `merged` is set.
+/// False when every merge would add more than CoalesceGrowthLimit such bytes.
 inline bool CoalesceRange(std::array<u64, Delta::MaxWrites>& begins,
                           std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end,
                           bool& merged) {
-    if (AppendRange(begins, ends, count, begin, end)) {
+    if (AppendOrExtendLast(begins, ends, count, begin, end)) {
         return true;
     }
     u32 best = Delta::MaxWrites;
@@ -652,11 +830,13 @@ inline CoalesceVerify g_coalesce_verify;
 /// the ranges.
 void CheckCoalesced(const Delta& taken);
 
-/// Appends to one of the delta's range lists as the switches say. False when the range is lost.
+/// Appends to one of the delta's range lists as the switches say. False when the range is lost
+/// (only with EDEN_NX2_DRAWX_COALESCE: AppendRange widens a full list however far).
 inline bool NoteRange(Delta& delta, std::array<u64, Delta::MaxWrites>& begins,
                       std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
     if (!g_drawx_coalesce) {
-        return AppendRange(begins, ends, count, begin, end);
+        delta.no_uniform_keeps |= AppendRange(begins, ends, count, begin, end);
+        return true;
     }
     bool merged = false;
     if (!CoalesceRange(begins, ends, count, begin, end, merged)) {
@@ -687,7 +867,9 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
         g_coalesce_verify.gpu.emplace_back(begin, end);
     }
     if (!NoteRange(delta, delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
+        // The lists miss the range: the chain ends, and the next draw keeps no uniforms.
         delta.overflowed = true;
+        delta.no_uniform_keeps = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
             g_gpu_overflows.fetch_add(1, std::memory_order_relaxed);
@@ -706,7 +888,9 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
     }
     if (!NoteRange(delta, delta.device_begin, delta.device_end, delta.num_device_writes, begin,
                    end)) {
+        // As NoteConstantData's.
         delta.overflowed = true;
+        delta.no_uniform_keeps = true;
         Break(Reason::DeltaOverflow);
         if (DrawCostStatsEnabled()) {
             g_device_overflows.fetch_add(1, std::memory_order_relaxed);

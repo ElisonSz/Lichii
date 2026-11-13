@@ -405,6 +405,46 @@ TEST_CASE("Migration rejects overlapping paths and symlink trees", "[profile_mig
     CHECK_FALSE(fs::exists(f.state / "complete"));
 }
 
+TEST_CASE("A source root that is a link to a directory imports from its target",
+          "[profile_migration]") {
+    Fixture f;
+    const auto real = f.base / "data" / "eden";
+    Write(real / "save", "legacy");
+    fs::remove(f.source);
+    // A directory symlink, or a junction on Windows when symlinks need privileges.
+    if (!Common::FS::CreateSymlink(real, f.source) || !Common::FS::IsSymlink(f.source)) {
+        SKIP("This host cannot create a directory link");
+    }
+    SECTION("copy") {
+        RunImport(f.MakePlan(Strategy::Copy));
+        CHECK_FALSE(Common::FS::IsSymlink(f.destination));
+        CHECK(Read(f.destination / "save") == "legacy");
+        CHECK(GetState(f.state) == State::Complete);
+    }
+    SECTION("link") {
+        RunImport(f.MakePlan(Strategy::Link));
+        CHECK(Common::FS::IsSymlink(f.destination));
+        CHECK(fs::equivalent(f.destination, real));
+        CHECK(Read(f.destination / "save") == "legacy");
+        CHECK(GetState(f.state) == State::Complete);
+    }
+    SECTION("move is refused before anything changes") {
+        REQUIRE_THROWS(RunImport(f.MakePlan(Strategy::Move)));
+        CHECK_FALSE(fs::exists(f.destination));
+        CHECK(Backups(real).empty());
+        CHECK(GetState(f.state) == State::Unresolved);
+    }
+    SECTION("a link inside the linked root is still refused") {
+        fs::create_directories(f.base / "outside");
+        REQUIRE(Common::FS::CreateSymlink(f.base / "outside", real / "link"));
+        REQUIRE_THROWS(RunImport(f.MakePlan(Strategy::Copy)));
+        CHECK_FALSE(fs::exists(f.destination));
+        CHECK_FALSE(fs::exists(f.state / "complete"));
+    }
+    CHECK(Common::FS::IsSymlink(f.source));
+    CHECK(Read(real / "save") == "legacy");
+}
+
 #ifndef _WIN32
 TEST_CASE("A real copy permission failure keeps both profiles and can retry",
           "[profile_migration]") {

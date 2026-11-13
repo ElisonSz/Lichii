@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/frontend/ir/program.h"
@@ -31,6 +30,7 @@ void ConditionalBarrierPass(IR::Program& program) {
                     inst.GetOpcode() == IR::Opcode::Barrier) {
                     LOG_WARNING(Shader, "Barrier within conditional control flow");
                     inst.ReplaceOpcode(IR::Opcode::Identity);
+                    program.info.removed_conditional_barrier = true;
                 }
             }
             break;

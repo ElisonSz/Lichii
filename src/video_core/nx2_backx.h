@@ -20,6 +20,9 @@
 /// base takes where an exact check without the lock shows they would change nothing. Guest CPU
 /// write traps hold the buffer cache's lock across page protection system calls, so every
 /// acquisition the back makes can meet one and spin (3 % of the back's time on Castle Town).
+/// nx2 ported the gather, inline write, usage reset and apply parts (7a5e5357cb and f5edeabdbb)
+/// as unconditional behaviour and fixed crossing writes as COLLECT_SPLIT does;
+/// EDEN_NX2_BACKX_VERIFY checks its skips too (the Mismatch without a Check, SkippedGather).
 namespace VideoCommon::BackX {
 
 /// EDEN_NX2_BACKX_INLINE=1: an inline-to-memory write takes the buffer cache's lock only when one
@@ -30,21 +33,25 @@ inline bool g_inline{};
 /// its page may be one the guest read GPU-written data from (read-back pages).
 inline bool g_report{};
 /// EDEN_NX2_BACKX_GATHER=1: InvalidateGPUCache gathers collected CPU writes (two locks per core's
-/// manager) only when a manager may hold one.
+/// manager) only when a manager may hold one. nx2 does that always now; with _VERIFY the switch
+/// picks its own verify (CollectEpoch) over nx2's (Collects, SkippedGather).
 inline bool g_gather{};
 /// _GATHER with _VERIFY: GPUDirtyMemoryManager::Collect counts its calls (CollectEpoch), so a
 /// verify gather that finds writes tells a Collect racing with the check from a check that missed
 /// a write.
 inline bool g_gather_epochs{};
 /// EDEN_NX2_BACKX_COLLECT_SPLIT=1: a CPU write into GPU-written memory that crosses one of the
-/// GPUDirtyMemoryManager's 2 KiB granules is collected granule by granule. The base builds one
+/// GPUDirtyMemoryManager's 2 KiB granules is collected granule by granule. The base built one
 /// transform from the write's first granule with a mask shift out of range past it: such a write
-/// loses its bytes (often all), so they never reach the GPU's copy, and a later download can write
-/// the GPU's older bytes over them in guest memory. A fix of the base, so off by default: the
-/// stats line counts crossing writes ("crossing writes") with or without it.
+/// lost its bytes (often all), so they never reached the GPU's copy, and a later download could
+/// write the GPU's older bytes over them in guest memory. nx2 fixed the base the same way, so
+/// Collect always splits now and the switch changes nothing; the stats line counts crossing
+/// writes ("crossing writes").
 inline bool g_collect_split{};
 /// EDEN_NX2_BACKX_TICK=1: a buffer's usage tracker clears only the words it set since its last
-/// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame).
+/// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame). nx2
+/// made that unconditional, so the switch changes nothing now; the stats line still counts the
+/// resets and their words.
 inline bool g_tick{};
 /// EDEN_NX2_BACKX_APPLY=1: collected CPU writes are applied with each cache's lock taken once for
 /// all of them (OnCacheInvalidations took the buffer cache's twice, the texture cache's once, per
@@ -64,8 +71,10 @@ inline bool g_ops{};
 /// (EDEN_NX2_PROTECT_INLINE) asks the tracker first, so the attempts it declines skip the page
 /// table lookup and the GPU-written range search.
 inline bool g_flush{};
-/// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
-/// then does what the base does.
+/// EDEN_NX2_BACKX_VERIFY=1: every skip above, and every one nx2 takes unconditionally, also runs
+/// the base's own check, logs "BackX verify mismatch" where that check would have done something,
+/// and then does what the base does. The GPU dirty memory managers count their collects
+/// (Core::GPUDirtyMemoryManager::count_collects).
 inline bool g_verify{};
 /// EDEN_NX2_BACKX_STATS=1: one "BackX" line every 10 s with the counters below.
 inline bool g_stats{};
@@ -81,7 +90,7 @@ enum class Counter : std::size_t {
     GatherRun,        ///< calls that gathered
     GatherEmpty,      ///< gathers that found nothing (a write collected and gathered meanwhile)
     GatherRaces,      ///< verify: skipped gathers' writes collected after the check (as the base)
-    CrossingWrites,   ///< collected CPU writes crossing a 2 KiB granule (split or lost)
+    CrossingWrites,   ///< collected CPU writes crossing a 2 KiB granule (split)
     TickResets,       ///< usage tracker resets
     TickWordsCleared, ///< words cleared by them
     TickWordsSkipped, ///< words the base would have cleared too (already zero)
@@ -113,11 +122,12 @@ enum class Check : std::size_t {
     Report,        ///< REPORT: a report on a read-back page
     Gather,        ///< GATHER: collected CPU writes no manager showed (no Collect raced)
     Tick,          ///< TICK: a usage word set outside the tracked extent
+    Other,         ///< a skip named by its message alone (nx2's Mismatch without a Check)
     Count,
 };
 
-/// Verify mismatches of each check since the start (each kind logged 16 times at most, so one
-/// kind cannot hide the others).
+/// Verify mismatches of each check since the start (each kind logged 16 times at most, Other 64
+/// times as nx2 logs them, so one kind cannot hide the others).
 inline std::array<std::atomic<u64>, static_cast<std::size_t>(Check::Count)> g_mismatches{};
 
 /// Verify: a skip the base's own check contradicts.
@@ -126,9 +136,46 @@ inline void Mismatch(Check check, const char* what, u64 address, u64 size) {
                                                                         std::memory_order_relaxed);
     const u64 seen =
         g_mismatches[static_cast<std::size_t>(check)].fetch_add(1, std::memory_order_relaxed);
-    if (seen < 16) {
+    if (seen < (check == Check::Other ? 64U : 16U)) {
         LOG_ERROR(HW_GPU, "BackX verify mismatch: {} at {:#x}+{:#x}", what, address, size);
     }
+}
+
+/// Verify: the same, for a caller that names the skip by `what` alone (nx2's form): Check::Other.
+inline void Mismatch(const char* what, u64 address, u64 size) {
+    Mismatch(Check::Other, what, address, size);
+}
+
+/// Verify of a gather that nx2's InvalidateGPUCache skipped: `found` when the gather found writes,
+/// `collected` when a manager collected one after the skip's check (a race the next call covers
+/// either way). Writes found with nothing collected since are a miss (Check::Gather). Logs the
+/// counts every 10 s; the stats line counts the races too (GatherRaces, as GATHER's own verify).
+inline void SkippedGather(bool found, bool collected, std::pair<u64, u64> first_write) {
+    static std::mutex mutex;
+    static u64 skips{};
+    static u64 races{};
+    static u64 misses{};
+    static auto last_log = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    ++skips;
+    if (found && collected) {
+        ++races;
+        Count(Counter::GatherRaces);
+    } else if (found) {
+        ++misses;
+        Mismatch(Check::Gather, "collected CPU write while no manager showed one",
+                 first_write.first, first_write.second);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log < std::chrono::seconds{10}) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "BackX gather checks in 10 s: {} skipped gathers, {} found writes collected after "
+             "the check, {} found writes no manager showed (must stay 0)",
+             skips, races, misses);
+    skips = races = misses = 0;
+    last_log = now;
 }
 
 /// EDEN_NX2_BACKX_REPORT: whether a device page may be in a small set of pages that changes under
@@ -274,6 +321,11 @@ inline void ReadSwitches() {
     }
 }
 
+/// nx2's name for ReadSwitches (its version read EDEN_NX2_BACKX_VERIFY alone).
+inline void ReadSwitch() {
+    ReadSwitches();
+}
+
 [[nodiscard]] inline u64 Mismatches(Check check) {
     return g_mismatches[static_cast<std::size_t>(check)].load(std::memory_order_relaxed);
 }
@@ -314,16 +366,16 @@ inline void Report() {
              "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
              "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
              "gathers {} skipped, {} run ({} found nothing, {} skipped with writes collected after "
-             "the check); crossing writes {} ({}); usage resets {} clearing {} words, {} words "
+             "the check); crossing writes {} (split); usage resets {} clearing {} words, {} words "
              "left alone; collected writes {} in {} passes; deferred fence flushes submitted "
              "early {}; verify mismatches {} (since start: inline {}, query {}, report {}, gather "
-             "{}, tick {})",
+             "{}, tick {}, other {})",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
              report_locked, gather_skipped, gather_run, gather_empty, gather_races, crossing_writes,
-             g_collect_split ? "split" : "lost", tick_resets, tick_cleared, tick_skipped,
-             apply_ranges, apply_passes, early_submits, mismatches,
-             Mismatches(Check::InlineGpuData), Mismatches(Check::InlineQuery),
-             Mismatches(Check::Report), Mismatches(Check::Gather), Mismatches(Check::Tick));
+             tick_resets, tick_cleared, tick_skipped, apply_ranges, apply_passes, early_submits,
+             mismatches, Mismatches(Check::InlineGpuData), Mismatches(Check::InlineQuery),
+             Mismatches(Check::Report), Mismatches(Check::Gather), Mismatches(Check::Tick),
+             Mismatches(Check::Other));
     // OPS and FLUSH count only while switched on.
     const u64 ops_reused = Take(Counter::OpsReused);
     const u64 ops_allocated = Take(Counter::OpsAllocated);

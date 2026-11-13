@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -37,11 +36,7 @@ public:
             return;
         }
         tracked = false;
-        if (BackX::g_tick) [[unlikely]] {
-            ResetSetWords();
-        } else {
-            std::ranges::fill(pages, 0ULL);
-        }
+        ResetSetWords();
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -63,12 +58,9 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
-        if (BackX::g_tick) [[unlikely]] {
-            // EDEN_NX2_BACKX_TICK: TrackPage and FillPages below set words only in
-            // [page, page_end].
-            set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
-            set_end = (std::max)(set_end, page_end + 1);
-        }
+        // TrackPage and FillPages below set words only in [page, page_end].
+        set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
+        set_end = (std::max)(set_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;
@@ -103,9 +95,10 @@ public:
     }
 
 private:
-    /// EDEN_NX2_BACKX_TICK: clears the words set since the last reset, [set_begin, set_end); every
-    /// other word is zero already (only Track sets words). A buffer of hundreds of MiB bound in
-    /// part cleared all its words (8 bytes a 4 KiB page) every frame.
+    /// Clears the words set since the last reset, [set_begin, set_end); every other word is zero
+    /// already (only Track sets words). A buffer of hundreds of MiB bound in part cleared all its
+    /// words (8 bytes a 4 KiB page) every frame. Always on (EDEN_NX2_BACKX_TICK's bounded reset,
+    /// made unconditional upstream); EDEN_NX2_BACKX_STATS counts the words cleared and skipped.
     void ResetSetWords() noexcept {
         if (set_end != 0) {
             std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
@@ -198,8 +191,7 @@ private:
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
-    /// EDEN_NX2_BACKX_TICK: the words set since the last reset lie in [set_begin, set_end) (none
-    /// when set_end is 0).
+    /// The words set since the last reset lie in [set_begin, set_end) (none when set_end is 0).
     size_t set_begin{};
     size_t set_end{};
     bool tracked{};

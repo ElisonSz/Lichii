@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <bit>
 #include <optional>
 
 #include <sirit/sirit.h>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "shader_recompiler/backend/bindings.h"
@@ -188,7 +189,7 @@ public:
     }
 
     Id Const(u32 value) {
-        return Constant(U32[1], value);
+        return CachedConstant(u32_constants, U32[1], value);
     }
 
     Id Const(u32 element_1, u32 element_2) {
@@ -222,7 +223,7 @@ public:
     }
 
     Id Const(f32 value) {
-        return Constant(F32[1], value);
+        return CachedConstant(f32_constants, F32[1], value);
     }
 
     const Profile& profile;
@@ -390,6 +391,9 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
@@ -429,6 +433,8 @@ public:
     Id mesh_task_offsets_buffer{};
     Id mesh_task_args_buffer{};
     Id mesh_group_index{};
+    /// NumWorkgroups of a native mesh program (Profile::has_broken_mesh_user_sgprs only).
+    Id mesh_num_workgroups{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -446,6 +452,21 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    /// Sirit deduplicates constants, but by hashing a freshly allocated copy of their words on
+    /// every call; immediates are emitted over and over, so remember the ids of scalar constants.
+    /// Keys are bit patterns, like Sirit's (0.0f and -0.0f, and NaN payloads, stay distinct).
+    template <typename T>
+    Id CachedConstant(::Common::unordered_map<u32, Id>& cache, Id type, T value) {
+        const auto [it, is_new]{cache.try_emplace(std::bit_cast<u32>(value))};
+        if (is_new) {
+            it->second = Constant(type, value);
+        }
+        return it->second;
+    }
+
+    ::Common::unordered_map<u32, Id> u32_constants;
+    ::Common::unordered_map<u32, Id> f32_constants;
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);

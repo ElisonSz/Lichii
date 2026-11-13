@@ -30,7 +30,8 @@ struct GraphicsStageProperties {
           uses_subgroup_invocation_id{info.uses_subgroup_invocation_id},
           uses_subgroup_shuffles{info.uses_subgroup_shuffles},
           uses_subgroup_mask{info.uses_subgroup_mask}, uses_quad_shuffles{info.uses_quad_shuffles},
-          uses_fswzadd{info.uses_fswzadd} {}
+          uses_fswzadd{info.uses_fswzadd},
+          removed_conditional_barrier{info.removed_conditional_barrier} {}
 
     bool operator==(const GraphicsStageProperties&) const = default;
 
@@ -50,6 +51,7 @@ struct GraphicsStageProperties {
     bool uses_subgroup_mask{};
     bool uses_quad_shuffles{};
     bool uses_fswzadd{};
+    bool removed_conditional_barrier{};
 };
 
 /// Descriptors and handle bytecode occupy one allocation per distinct shader record. Immutable

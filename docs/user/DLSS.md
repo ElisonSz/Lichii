@@ -46,15 +46,31 @@ preset, so the emulator log reports the request, not proof of the model executed
   scales that image to the guest destination if needed. It does not increase the
   game's render resolution to the display resolution. Ocarina's 1440p mode stays
   at 2560×1440 instead of reconstructing to 4K.
-- **Quality, Balanced, Performance and Ultra Performance** request that NGX mode
-  without changing guest rendering. The request is used only when both render
-  dimensions fit NVIDIA's queried dynamic-resolution range. Otherwise Automatic
-  chooses a compatible mode and the log records the request, actual mode and
-  allowed size range. If no mode accepts the sizes, the existing FSR fallback runs.
+- **Quality, Balanced, Performance and Ultra Performance** request that NGX mode.
+  The request is used only when both render dimensions fit NVIDIA's queried
+  dynamic-resolution range. Otherwise Automatic chooses a compatible mode and the
+  log records the request, actual mode and allowed size range. If no mode accepts
+  the sizes, the existing FSR fallback runs.
+
+DLSS replaces a game's own upscaler, so it takes whatever resolution the game
+renders. In most games these modes therefore don't lower the rendering
+resolution, and a Performance request is not a promise of higher frame rates.
+
+The Legend of Zelda: Ocarina of Time is the exception. Docked with the Max
+Resolution add-on, it renders at 2560×1440 and DLSS reconstructs 4K, which is
+NVIDIA's Quality ratio. Balanced, Performance and Ultra Performance patch the
+game's fixed render scale so it renders at 2276×1280, 1920×1080 and 1280×720
+(ProfessorTee's [#903](https://github.com/zortos293/Lichii/pull/903), with
+QuincyForbes' follow-up for the Balanced and Performance upscale passes). Automatic and Quality keep 2560×1440. The render scale is
+patched into the game when it starts, so a change takes effect at the next
+start; until then DLSS applies the new mode to the old render size. Handheld,
+DLSS off and a disabled Max Resolution add-on leave the game's scale alone. If
+DLSS turns out to be unavailable when the game starts (no NVIDIA runtime, another
+GPU), FSR 3.1 reconstructs the smaller scene instead of the game's own upscale;
+at Balanced, whose padded scene only DLSS takes, the game's own upscale runs.
 
 Ultra Quality is not offered merely because an SDK enum exists; this integration
-does not establish runtime support for it. A Performance request is not a promise
-of higher frame rates, because it cannot lower the game's own rendering resolution.
+does not establish runtime support for it.
 
 Old profiles without these settings load Automatic and M. The Automatic/Native
 values remain compatible with the quality settings in

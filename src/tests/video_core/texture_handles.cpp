@@ -1638,3 +1638,63 @@ TEST_CASE("Review19 masked writable handles preserve descriptor mode",
         CHECK((desc.handle_program != ~0U) == (Shader::StrictHandles && !byte_address));
     }
 }
+
+TEST_CASE("A handle word the translation saw dereferenced is not a handle without a storage buffer",
+          "[video_core][texture_handles]") {
+    const Shader::Info info;
+    Shader::TextureDescriptor desc{};
+    desc.cbuf_index = 0;
+    desc.cbuf_offset = 0x520;
+    desc.count = 1;
+    desc.size_shift = 3;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.handle_is_pointer_word = true;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.has_secondary = true; // an address built from two words
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.handle_program = 0;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+}
+
+TEST_CASE("An unresolved handle read through an unmapped pointer word marks its record",
+          "[video_core][texture_handles]") {
+    for (const bool mapped : {false, true}) {
+        CAPTURE(mapped);
+        HandleProgram shader;
+        shader.handle_table_arrays = false; // no table array: the handle binds a null texture
+        // The handle is read through the table's address, a constant buffer word
+        const Value list_offset{shader.Emit(Opcode::GetRegister, {Value{IR::Reg::R0}})};
+        const Value light{shader.Emit(Opcode::LoadStorage32, {Value{0U}, list_offset})};
+        const Value entry{shader.Emit(Opcode::IMul32, {light, Value{96U}})};
+        const Value table{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x520U}})};
+        const Value handle{
+            shader.Emit(Opcode::LoadStorage32, {Value{1U}, shader.Add(entry, table)})};
+        auto& sample{shader.Sample(handle)};
+        if (mapped) {
+            // A capture that saw the pointer mapped binds it as a storage buffer
+            shader.program.info.storage_buffers_descriptors.push_back(
+                {.cbuf_index = 0, .cbuf_offset = 0x520, .count = 1, .is_written = false});
+        }
+        shader.Run();
+
+        const auto& descriptor{shader.Descriptor(sample)};
+        CHECK(descriptor.bind_null);
+        CHECK(descriptor.handle_is_pointer_word);
+        CHECK(descriptor.cbuf_offset == 0x520);
+        CHECK(VideoCommon::HandleMustBeNull(shader.program.info, descriptor, 0));
+        CHECK(shader.program.info.binds_unmapped_pointer_word == !mapped);
+    }
+    // A word that reaches the handle other than through a load's address is no pointer
+    HandleProgram shader;
+    const Value word{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0x540U}})};
+    const Value sum{
+        shader.Emit(Opcode::FPAdd32, {shader.Emit(Opcode::BitCastF32U32, {word}), Value{1.0f}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::BitCastU32F32, {sum}))};
+    shader.Run();
+
+    const auto& descriptor{shader.Descriptor(sample)};
+    CHECK(descriptor.bind_null);
+    CHECK_FALSE(descriptor.handle_is_pointer_word);
+    CHECK(descriptor.cbuf_offset == 0);
+    CHECK_FALSE(shader.program.info.binds_unmapped_pointer_word);
+}

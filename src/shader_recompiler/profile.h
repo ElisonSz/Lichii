@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -28,6 +27,15 @@ struct Profile {
     bool support_separate_denorm_behavior{};
     bool support_separate_rounding_mode{};
     bool support_fp16_denorm_preserve{};
+    /// The device converts to fp16 with round-to-nearest-even when asked (RoundingModeRTE 16).
+    bool support_fp16_rounding_rte{};
+    /// fp16 and fp64 float controls must be set identically (independence 32_BIT_ONLY), and the
+    /// device supports the fp64 counterparts of the fp16 modes above.
+    bool fp16_float_controls_shared_with_fp64{};
+    /// fp16 float controls can differ from fp32 ones (neither independence is NONE).
+    bool fp16_float_controls_independent_of_fp32{};
+    bool support_fp64_rounding_rte{};
+    bool support_fp64_denorm_preserve{};
     bool support_fp32_denorm_preserve{};
     bool support_fp16_denorm_flush{};
     bool support_fp32_denorm_flush{};
@@ -117,6 +125,10 @@ struct Profile {
 
     /// Maxwell and earlier nVidia architectures have broken robust support
     bool has_broken_robust{};
+    /// RADV before Mesa 26.2.5 keeps stale vertex user SGPR state when a mesh shader without the
+    /// grid size or draw index is bound, and the next mesh draw hangs the GPU (Mesa MR 45092).
+    /// Native mesh shaders read the grid size there so that RADV gives them that SGPR.
+    bool has_broken_mesh_user_sgprs{};
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};

@@ -407,7 +407,7 @@ struct LogcatBackend : public Backend {
             }
         }();
         auto const df = GetDirectFormatArgs(entry);
-        __android_log_print(android_log_priority, "YuzuNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
+        __android_log_print(android_log_priority, "LichiiNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
     }
     void Flush() noexcept override {}
 };
@@ -491,6 +491,29 @@ void Start() {
 void Stop() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {
+#ifndef __OPENORBIS__
+    if (!logging_instance || !logging_instance->file_backend)
+        return;
+    char buffer[2048];
+    const auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);
+    const std::size_t length = (std::min)(result.size, sizeof(buffer) - 1);
+    buffer[length] = '\0';
+    const Entry e{
+        .message = buffer,
+        .message_len = length,
+        .timestamp = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - logging_instance->time_origin),
+        .log_class = Class::Common,
+        .log_level = Level::Critical,
+        .filename = TrimSourcePath(filename),
+        .function = function,
+        .line_num = line_num,
+    };
+    logging_instance->file_backend->Write(e);
+    logging_instance->file_backend->Flush();
+#endif
 }
 
 void SetGlobalFilter(const Filter& filter) {

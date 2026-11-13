@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -9,8 +8,6 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
-#elif defined(_WIN32)
-#include "common/windows/timer_resolution.h"
 #endif
 
 #include "common/assert.h"
@@ -27,7 +24,9 @@
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_acquire_stats.h"
+#include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_fast_wake.h"
@@ -74,7 +73,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             VideoCommon::WaitStats::Thread::Front};
         VideoCommon::GpuSplit::MarkGpuThread();
 #ifdef __linux__
-        // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
+        // The pending-channel waits below sleep 500 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
 #endif
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
@@ -86,10 +85,24 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
-        // When a pending channel last moved or a command arrived (see the polling below).
+        // When a pending channel last moved or a command arrived (see the waits below).
         auto last_progress = std::chrono::steady_clock::now();
+        // For this long after that the thread waits in hardware, then it blocks in the OS. In
+        // hardware it looks at the words the channels wait on every WordCheckPeriod and polls the
+        // channels in full every PendingPollPeriod.
+        constexpr std::chrono::nanoseconds PendingPoll = std::chrono::microseconds{500};
+        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{20};
+        constexpr std::chrono::nanoseconds WordCheckPeriod = std::chrono::microseconds{2};
+        // How the last wait ended, counted when a channel moves after it.
+        enum class WaitEnd { None, Woken, PollTimedOut, SleepTimedOut };
+        WaitEnd last_wait = WaitEnd::None;
+        auto& wake = Tegra::Nx2PendingWake::Get();
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+        auto& acquire_stats = VideoCommon::g_acquire_stats;
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        namespace BackIdleTrace = VideoCommon::BackIdleTrace;
+        using FrontState = BackIdleTrace::FrontState;
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
@@ -103,25 +116,44 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             VideoCommon::Nx2AcquireStats::MaybeReport();
             VideoCommon::Nx2AcquireDetails::Report();
             if (scheduler.HasPendingChannels()) {
-                // Take this before polling: a latch between the poll and sleep must not be lost.
+                // EDEN_NX2_FAST_WAKE: take this before polling: a latch between the poll and sleep
+                // must not be lost.
                 const u64 pending_generation =
                     VideoCommon::FastWake::enabled ? VideoCommon::FastWake::pending.Snapshot() : 0;
-                // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                // Suspended channels wait on semaphores and list copies: a new command, a GPU
+                // release or a finished copy wakes the wait below at once (Nx2PendingWake), so
+                // arm it before looking.
+                wake.Arm();
                 bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     resumed = scheduler.ResumePending(system.GPU());
                 }
-                if (resumed) {
-                    last_progress = std::chrono::steady_clock::now();
-                }
                 if (split.Active()) {
                     VideoCommon::FrontQmdView::Get().MaybeTakeOver(
                         split, VideoCommon::Nx2AcquireStats::QmdTakeOver::BetweenCommands);
                 }
-                if (!state.queue.TryPop(next)) {
+                const bool popped = state.queue.TryPop(next);
+                if (popped) {
+                    BackIdleTrace::SetFrontState(FrontState::Parse);
+                }
+                if (resumed || popped) {
+                    if (last_wait == WaitEnd::PollTimedOut) {
+                        VideoCommon::Count(acquire_stats.front_found_polling);
+                    } else if (last_wait == WaitEnd::SleepTimedOut) {
+                        VideoCommon::Count(acquire_stats.front_found_late);
+                    }
+                    last_wait = WaitEnd::None;
+                    last_progress = std::chrono::steady_clock::now();
+                }
+                if (!popped) {
                     if (!scheduler.HasPendingChannels()) {
                         continue;
+                    }
+                    if (BackIdleTrace::Enabled()) {
+                        BackIdleTrace::SetFrontState(scheduler.WaitsForListCopy()
+                                                         ? FrontState::PendingCopy
+                                                         : FrontState::PendingSemaphore);
                     }
                     if (VideoCommon::SyncSuspend::enabled && split.Active()) [[unlikely]] {
                         // A channel suspended before the back ran the release it waits for
@@ -145,15 +177,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                                 const size_t bucket = suspended <= 1 ? 0 : suspended == 2 ? 1 : 2;
                                 ++VideoCommon::RunAhead::counters.idle_channels[bucket];
                             }
+                            // A channel that moves next was waited for here, not found by a
+                            // timed-out wait below.
+                            last_wait = WaitEnd::None;
                             last_progress = std::chrono::steady_clock::now();
                             continue;
                         }
                     }
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
-                    // second and its present waits for the work behind them: with 1 ms sleeps the
-                    // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
-                    // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
+                    // Mario Kart World's channels wait for semaphores its CPU releases, stores
+                    // that send no wake, and the CPU usually releases soon after: for half a
+                    // millisecond wait in hardware, watching the semaphore words, then block in
+                    // the OS for 500 us at a time. A full poll every 20 us catches what sends no
+                    // wake and changes no word, such as a release a shader wrote to the caches.
+                    // Ocarina of Time waits here ~330 times a second and its present waits for the
+                    // work behind them: with 1 ms sleeps the present waited ~17 ms a frame in
+                    // Kokiri village, with 50 us ~1 ms.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     // Words sent since the last publish (a poll's flush or fence work, a resumed
                     // channel's) would wait out the sleep below while the back runs out of work:
@@ -162,44 +200,66 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.Publish();
                     }
                     split.SettleIdleBack();
-                    const auto waited = std::chrono::steady_clock::now() - last_progress;
-                    if (waited < std::chrono::microseconds{500}) {
-                        std::this_thread::yield();
+                    const auto now = std::chrono::steady_clock::now();
+                    bool woken = false;
+                    if (now - last_progress < PendingPoll) {
+                        VideoCommon::Count(acquire_stats.front_polls);
+                        last_wait = WaitEnd::PollTimedOut;
+                        const auto poll_end =
+                            std::min(now + PendingPollPeriod, last_progress + PendingPoll);
+                        auto until = now;
+                        do {
+                            until = std::min(std::chrono::steady_clock::now() + WordCheckPeriod,
+                                             poll_end);
+                            if (wake.Poll(until)) {
+                                woken = true;
+                                break;
+                            }
+                            if (waiters.WordStored()) {
+                                VideoCommon::Count(acquire_stats.front_stored);
+                                last_wait = WaitEnd::Woken;
+                                break;
+                            }
+                        } while (until < poll_end);
                     } else if (VideoCommon::FastWake::enabled) {
+                        // EDEN_NX2_FAST_WAKE: block on the event latches and new commands signal
+                        // (FastWake::pending) instead of the 500 us sleep below. Keep Windows
+                        // fallback polling near the old timer tick; real latches and queued
+                        // commands interrupt it rather than waiting for the timer.
+                        VideoCommon::Count(acquire_stats.front_sleeps);
                         auto& wake_counts = VideoCommon::FastWake::counters;
                         wake_counts.pending_waits.fetch_add(1, std::memory_order_relaxed);
-                        // Keep Windows fallback polling near the old timer tick; real latches
-                        // and queued commands interrupt it rather than waiting for the timer.
 #ifdef _WIN32
                         constexpr auto poll_timeout = std::chrono::microseconds{500};
 #else
                         constexpr auto poll_timeout = std::chrono::microseconds{50};
 #endif
-                        const auto timeout = waited < std::chrono::seconds{2}
+                        const auto timeout = now - last_progress < std::chrono::seconds{2}
                                                  ? poll_timeout
                                                  : std::chrono::microseconds{1000};
                         const auto result =
                             VideoCommon::FastWake::pending.Wait(pending_generation, timeout);
-                        auto& counter = result == VideoCommon::FastWake::Signal::Result::Notified
-                                            ? wake_counts.pending_notified
-                                            : wake_counts.pending_timeouts;
+                        woken = result == VideoCommon::FastWake::Signal::Result::Notified;
+                        last_wait = woken ? WaitEnd::Woken : WaitEnd::SleepTimedOut;
+                        auto& counter =
+                            woken ? wake_counts.pending_notified : wake_counts.pending_timeouts;
                         counter.fetch_add(1, std::memory_order_relaxed);
-                    } else if (waited < std::chrono::seconds{2}) {
-#ifdef _WIN32
-                        // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
-                        // SleepForOneTick uses NtDelayExecution(-1) for one high-res timer tick.
-                        Common::Windows::SleepForOneTick();
-#else
-                        std::this_thread::sleep_for(std::chrono::microseconds{50});
-#endif
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        VideoCommon::Count(acquire_stats.front_sleeps);
+                        last_wait = WaitEnd::SleepTimedOut;
+                        woken = wake.Sleep(std::chrono::microseconds{500});
+                    }
+                    if (woken) {
+                        VideoCommon::Count(acquire_stats.front_woken);
+                        last_wait = WaitEnd::Woken;
                     }
                     continue;
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                BackIdleTrace::SetFrontState(FrontState::QueueEmpty);
                 state.queue.PopWait(next, stop_token);
+                BackIdleTrace::SetFrontState(FrontState::Parse);
             }
             if (stop_token.stop_requested()) {
                 break;
@@ -214,7 +274,17 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    // Maps and flushes may change what the snapshot copier reads.
+                    Tegra::DmaPusher::WaitForSnapshotCopies();
+                }
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    // The guest may have written pages the caches don't watch since the lists
+                    // before it: uniform keeps end here, in order on the back. It writes no guest
+                    // memory.
+                    split.Defer([] { VideoCommon::Nx2FastDraw::NoteSync(); },
+                                VideoCommon::GpuSplit::FastDrawNeutral,
+                                VideoCommon::GpuSplit::Writes::Noted);
                     Profile::Scope scope{Profile::Zone::Push};
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
@@ -256,7 +326,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 last_progress = std::chrono::steady_clock::now();
                 continue;
             }
+            if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                Tegra::DmaPusher::WaitForSnapshotCopies();
+            }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                VideoCommon::Nx2FastDraw::NoteSync();
                 Profile::Scope scope{Profile::Zone::Push};
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
@@ -330,6 +404,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
         VideoCommon::SyncSuspend::queued_commands.fetch_add(1, std::memory_order_relaxed);
     }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    Tegra::Nx2PendingWake::Get().Notify();
     if (VideoCommon::FastWake::enabled && VideoCommon::FastWake::pending.Notify()) {
         VideoCommon::FastWake::counters.command_signals.fetch_add(1, std::memory_order_relaxed);
     }
@@ -351,6 +426,8 @@ void ThreadManager::NotifyShutdown() {
         }
         thread.join();
     }
+    // Queued snapshot copies read the channels' memory managers, which services free next.
+    Tegra::DmaPusher::WaitForSnapshotCopies();
     VideoCommon::GpuSplit::Get().Stop();
 }
 

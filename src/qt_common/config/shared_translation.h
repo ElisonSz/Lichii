@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -80,6 +79,8 @@ static const std::map<Settings::NvidiaDlssPreset, QString> nvidia_dlss_preset_te
 static const std::map<Settings::FrameGenType, QString> frame_gen_type_texts_map = {
     {Settings::FrameGenType::Lsfg, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "LSFG"))},
     {Settings::FrameGenType::Fsr3, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Optical Flow"))},
+    {Settings::FrameGenType::NvidiaDlssG,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "NVIDIA DLSS Frame Generation"))},
 };
 
 static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map = {

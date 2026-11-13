@@ -73,15 +73,23 @@ const Themes themes{{
     {"Dark Colorful", "colorful_dark"},
     {"Midnight Blue", "qdarkstyle_midnight_blue"},
     {"Midnight Blue Colorful", "colorful_midnight_blue"},
+    {"Lichii Dark", "lichii"},
 }};
 
 bool IsDarkTheme() {
     const auto& theme = UISettings::values.theme;
     return theme == std::string("qdarkstyle") || theme == std::string("qdarkstyle_midnight_blue") ||
-           theme == std::string("colorful_dark") || theme == std::string("colorful_midnight_blue");
+           theme == std::string("colorful_dark") ||
+           theme == std::string("colorful_midnight_blue") || theme == std::string("lichii");
 }
 
 Values values = {};
+
+Setting<u32, true>& CurrentGameIconSize() {
+    return values.game_list_mode.GetValue() == Settings::GameListMode::TreeView
+               ? values.game_icon_size
+               : values.game_cover_size;
+}
 
 u32 CalculateWidth(u32 height, Settings::AspectRatio ratio) {
     switch (ratio) {

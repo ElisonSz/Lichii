@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <random>
+#include <sstream>
+#include <type_traits>
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
 #include "common/recommended_settings.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
+#include "frontend_common/recommended_settings.h"
 
 namespace {
 
@@ -128,6 +133,8 @@ void CheckUnchangedProfile() {
     CHECK_FALSE(values.use_video_framerate.GetValue());
     CHECK_FALSE(values.mkw_30fps.GetValue());
     CHECK_FALSE(values.mkw_dynamic_fps.GetValue());
+    CHECK_FALSE(values.hyrule_dynamic_fps.GetValue());
+    CHECK_FALSE(values.hyrule_30fps.GetValue());
     CHECK(values.use_reactive_flushing.GetValue());
     CHECK(values.barrier_feedback_loops.GetValue());
     CHECK_FALSE(values.enable_buffer_history.GetValue());
@@ -382,6 +389,86 @@ TEST_CASE("The recommended settings backup persists in the config", "[config]") 
     FileConfig config{std::string{"qt-config"}};
     CHECK(Settings::values.recommended_settings_backup.GetValue().empty());
     CHECK(Settings::values.speed_limit.GetValue() == 150);
+}
+
+namespace {
+
+// Gives the game its own value, other than the recommended one, for every recommended setting
+// and for the resolution, which is not one.
+void WriteGameOverrides(const std::string& game) {
+    FileConfig config{game, Config::ConfigType::PerGameConfig};
+    Settings::ForEachRecommendedSetting(Settings::values, [](auto& setting, const auto& value) {
+        using Type = std::remove_cvref_t<decltype(value)>;
+        setting.SetGlobal(false);
+        setting.SetValue(value == Type{} ? static_cast<Type>(1) : Type{});
+    });
+    Settings::values.resolution_setup.SetGlobal(false);
+    Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
+    config.SaveValues();
+    Settings::RestoreGlobalState(false);
+}
+
+// Boots the game's config and returns the value it uses for every per-game setting, "global"
+// where it uses the global value.
+std::map<std::string, std::string> GameValues(const std::string& game) {
+    std::map<std::string, std::string> values;
+    {
+        FileConfig config{game, Config::ConfigType::PerGameConfig};
+        for (const auto& [key, setting] : Settings::values.linkage.by_key) {
+            if (setting->Switchable()) {
+                values.emplace(key, setting->UsingGlobal() ? "global" : setting->ToString());
+            }
+        }
+    }
+    Settings::RestoreGlobalState(false);
+    return values;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+    std::ifstream file{path};
+    std::stringstream contents;
+    contents << file.rdbuf();
+    return contents.str();
+}
+
+} // namespace
+
+TEST_CASE("Recommended settings reset the per-game values of recommended settings", "[config]") {
+    ConfigDirectory directory;
+    const std::string game = "0100152000022000";
+    // The global values already match, so only the game changes.
+    Settings::ApplyRecommendedSettings(Settings::values);
+    Settings::values.recommended_settings_backup = std::string{};
+    WriteGameOverrides(game);
+    directory.Write("custom/0400C3F00006E000.ini",
+                    "[Renderer]\nresolution_setup\\use_global=true\n");
+    const auto before = GameValues(game);
+    const std::string other_game = ReadFile(directory.path / "custom" / "0400C3F00006E000.ini");
+
+    const auto changes = FrontendCommon::ApplyRecommendedSettings(Settings::values);
+    REQUIRE_FALSE(changes.empty());
+    CHECK(std::ranges::all_of(changes, [&](const auto& change) { return change.game == game; }));
+    // Help > Restore My Previous Settings shows while the backup holds something.
+    CHECK_FALSE(Settings::values.recommended_settings_backup.GetValue().empty());
+    auto after = GameValues(game);
+    Settings::ForEachRecommendedSetting(Settings::values, [&](auto& setting, const auto&) {
+        INFO(setting.GetLabel());
+        CHECK(after.at(setting.GetLabel()) == "global");
+        after[setting.GetLabel()] = before.at(setting.GetLabel());
+    });
+    CHECK(after == before);
+    CHECK(before.at("resolution_setup") != "global");
+    CHECK(ReadFile(directory.path / "custom" / "0400C3F00006E000.ini") == other_game);
+
+    const std::string applied = ReadFile(directory.path / "custom" / (game + ".ini"));
+    CHECK(FrontendCommon::ApplyRecommendedSettings(Settings::values).empty());
+    CHECK(ReadFile(directory.path / "custom" / (game + ".ini")) == applied);
+
+    CHECK(FrontendCommon::RestorePreviousSettings(Settings::values).size() == changes.size());
+    CHECK(GameValues(game) == before);
+    CHECK(Settings::values.recommended_settings_backup.GetValue().empty());
+    CHECK(FrontendCommon::RestorePreviousSettings(Settings::values).empty());
+    CHECK(GameValues(game) == before);
 }
 
 TEST_CASE("A config path beneath a non-directory is not seeded", "[config]") {

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -242,6 +241,12 @@ public:
         for (const auto& [cpu_addr, size] : sequences) {
             InvalidateRegion(cpu_addr, size, which);
         }
+    }
+
+    /// InnerInvalidation of constant buffer data (MemoryManager::WriteConstantBufferData).
+    virtual void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) {
+        InnerInvalidation(sequences);
     }
 
     /// Notify rasterizer that any caches of the specified region are desync with guest

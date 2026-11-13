@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -264,7 +263,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
         // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+        // A shader that lost a conditional barrier relies on a whole warp running in step: at a
+        // smaller subgroup size it reads stale shared memory, which shows as banding over the image
+        // in Mario Kart World on Intel's Windows driver.
+        const bool uses_warp_ops = info.removed_conditional_barrier ||
+                                   info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd ||
                                    info.uses_cooperative_matrix;
@@ -426,9 +429,9 @@ void ComputePipeline::RunBuild() {
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
     const bool known_shader =
-        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == 0xef542df87cacfe9eULL ||
-        shader_hash == Ocarina1440pShader ||
-        shader_hash == OcarinaFullSizeShader;
+        shader_hash == OcarinaThreeQuarterShader || shader_hash == 0xef542df87cacfe9eULL ||
+        shader_hash == Ocarina1440pShader || shader_hash == Ocarina1440pScaledShader ||
+        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader;
     return known_shader && !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&

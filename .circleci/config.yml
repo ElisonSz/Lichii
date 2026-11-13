@@ -1,0 +1,20 @@
+version: 2.1
+
+# Placeholder until the build jobs land: a cheap job so the CircleCI check passes on every
+# pipeline. The real build-check mirror replaces it.
+
+jobs:
+  config-check:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Check the CircleCI config is in place
+          command: test -s .circleci/config.yml
+
+workflows:
+  build-check:
+    jobs:
+      - config-check

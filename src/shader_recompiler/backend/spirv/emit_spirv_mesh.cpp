@@ -239,8 +239,16 @@ void MeshEpilogue(EmitContext& ctx) {
         return;
     }
     Barrier(ctx);
-    const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
-                              ctx.Const(mesh.max_primitives))};
+    Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                        ctx.Const(mesh.max_primitives))};
+    if (Sirit::ValidId(ctx.mesh_num_workgroups)) {
+        // The grid size is never zero while a workgroup runs, so the count doesn't change; the
+        // read only has to survive the driver's optimisations (see DefineMesh).
+        const Id groups{ctx.OpCompositeExtract(
+            ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.mesh_num_workgroups), 0U)};
+        count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, groups, ctx.u32_zero_value),
+                             ctx.u32_zero_value, count);
+    }
     const Id max_vertices{ctx.Const(mesh.max_vertices)};
     // Marker for OpSetMeshOutputsEXT max_vertices, count (PatchMeshInstructions).
     ctx.OpStore(max_vertices, count);
@@ -348,6 +356,11 @@ void EmitMeshPrologue(EmitContext& ctx) {
     const bool as_compute{ctx.runtime_info.mesh_as_compute};
     if (ctx.stage == Stage::Task) {
         if (!as_compute) {
+            // A task that culls all its threads never writes the mesh workgroup count, and the
+            // payload starts undefined: launching that many mesh workgroups hangs the GPU.
+            // Every invocation stores the zero (upstream 8e87cf5a66).
+            ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
+            Barrier(ctx);
             return;
         }
     } else if (ctx.stage != Stage::Mesh) {

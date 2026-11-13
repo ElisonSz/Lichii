@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
+#include <thread>
+#include <vector>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/host1x/syncpoint_manager.h"
@@ -114,4 +118,44 @@ TEST_CASE("Syncpoint action IDs stay distinct across counters and host guest ban
     manager.IncrementHost(1);
     REQUIRE(guest_calls == 1);
     REQUIRE(host_calls == 1);
+}
+
+TEST_CASE("The guest mirror sees each increment before it is published and its actions run",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::vector<u32> mirrored;
+    bool published_early{};
+    manager.SetGuestMirror([&](u32 id, u32 value) {
+        REQUIRE(id == 3);
+        published_early |= manager.IsReadyGuest(id, value);
+        mirrored.push_back(value);
+    });
+    u32 mirrored_at_action{};
+    manager.RegisterGuestAction(3, 2, [&] { mirrored_at_action = mirrored.back(); });
+    manager.IncrementGuest(3);
+    manager.IncrementGuest(3);
+    manager.IncrementHost(3);
+    REQUIRE(mirrored == std::vector<u32>{1, 2});
+    REQUIRE_FALSE(published_early);
+    REQUIRE(mirrored_at_action == 2);
+
+    manager.SetGuestMirror({});
+    manager.IncrementGuest(3);
+    REQUIRE(mirrored.size() == 2);
+    REQUIRE(manager.GetGuestSyncpointValue(3) == 3);
+}
+
+TEST_CASE("Guest increments wait for a stable copy of the guest values",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::thread increment;
+    u32 value_while_stable{};
+    manager.WithGuestValuesStable([&] {
+        increment = std::thread([&] { manager.IncrementGuest(0); });
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        value_while_stable = manager.GetGuestSyncpointValue(0);
+    });
+    increment.join();
+    REQUIRE(value_while_stable == 0);
+    REQUIRE(manager.GetGuestSyncpointValue(0) == 1);
 }

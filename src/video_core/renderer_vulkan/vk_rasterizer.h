@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -9,6 +8,7 @@
 #include <array>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -136,6 +136,8 @@ public:
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
@@ -270,7 +272,9 @@ private:
     /// registers VideoCommon::VertexInputKey holds).
     void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
                           u32 max_bindings, VertexInputState& state);
-    /// EDEN_NX2_DRAW_VERTEX_INPUT: states built before, by their registers.
+    /// Dynamic vertex input states built before, by the registers they were built from
+    /// (EDEN_NX2_DRAW_VERTEX_INPUT's cache, always on). VideoCommon::VertexInputCache comes from
+    /// draw_delta.h.
     VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
 
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
@@ -297,6 +301,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
+    s32 bound_channel_id = -1;
     Scheduler& scheduler;
 
     VideoCommon::TeardownClock teardown_clock;
@@ -341,6 +346,8 @@ private:
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// The game started at the DLSS Performance render scale (1920x1080).
+    bool oot_performance_scale{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};
@@ -348,8 +355,17 @@ private:
         GPUVAddr depth_address{};
         u32 depth_tic{};
         VkExtent2D extent{};
+        /// The scene render targets' size: larger than the extent where the game pads them.
+        VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+
+        /// Whether an image holds the whole scene: the game samples padded targets through
+        /// descriptors of the scene's own size.
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent.width || width == image_extent.width) &&
+                   (height == extent.height || height == image_extent.height);
+        }
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
@@ -425,6 +441,12 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+    /// Mesh emulation: the draw's staging buffers, held until its commands are recorded.
+    /// Configure can submit (an ASTC decode, a full descriptor buffer ring), so the tick when
+    /// they were requested may be older than the submission that writes them.
+    boost::container::static_vector<StagingBufferRef, 4> mesh_draw_buffers;
+    bool mesh_arena_used{};
+    void ReleaseMeshEmulationBuffers();
 
     /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
     struct ReusableDraw {
@@ -450,6 +472,8 @@ private:
         SampledImages,
         TextureHandles,
         TextureDescriptors,
+        ComputedHandles,
+        VertexInput,
         Count,
     };
     /// Why a recorded draw can't be followed by a delta draw.
@@ -493,6 +517,8 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        /// Draws whose recorded dynamic vertex input isn't what the registers give.
+        u64 vertex_input_mismatches{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -509,6 +535,8 @@ private:
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
     /// the remembered draw either way: only a recorded draw remembers one again.
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    void InvalidateCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences,
+                                bool constant_buffer_data);
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial, bool matching = false);
@@ -524,6 +552,27 @@ private:
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial, u64 match_serial);
     void ReportFastDraws();
+
+    /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
+    /// frames, leaving out uniform buffers) was in the previous frame, only earlier in this one,
+    /// or in neither.
+    enum class DrawReuse : u8 { Hit, Repeat, Miss, Count };
+    struct DrawReuseProbe {
+        std::unordered_set<u64> previous_frame;
+        std::unordered_set<u64> frame;
+        std::array<std::array<u64, static_cast<size_t>(DrawPath::Count)>,
+                   static_cast<size_t>(DrawReuse::Count)>
+            draws{}, prepare_ns{};
+        u64 gate_ns{}; ///< Full-path hits: their PrepareDraw time over 1.1 us
+        u64 probe_ns{}; ///< NoteDrawReuse's own time, left out of prepare_ns
+        u64 frames{};
+        u64 window_start{};
+    };
+    /// Classifies the draw just configured with `pipeline` and adds its key to the frame's.
+    DrawReuse NoteDrawReuse(const GraphicsPipeline& pipeline, bool is_indexed);
+    void TickDrawReuse();
+    DrawReuseProbe draw_reuse;
+
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// EDEN_NX2_DRAW_REUSE: the pipeline TakeReusableDraw looked up for a vertex layout change,
@@ -535,6 +584,10 @@ private:
         handle_spans;
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
+    /// taken_delta hasn't reached BeginGraphicsUniforms yet (the draw may still stop before).
+    bool taken_delta_unconsumed{};
+    /// Constant buffer data since the last BeginGraphicsUniforms that no delta it got holds.
+    bool uniform_writes_lost{};
     FastDrawStats fast_draw_stats;
     /// Track D (EDEN_NX2_DRAWX_*), logged with the fast draw windows.
     struct DrawXStats {
@@ -542,7 +595,10 @@ private:
         u64 pipeline_state_same{};  ///< Fixed-function/shader re-lookups: same pipeline or twin
         u64 pipeline_state_other{}; ///< ... another pipeline (full resolve)
         u64 uniform_full_draws{};   ///< Full draws taking uniform keeps
-        u64 uniform_full_blocked{}; ///< Full draws without: a non-register break came first
+        /// ... outside a keep chain (a non-register break came first): only nx2's keep rule
+        /// (until a synchronisation point) keeps uniforms there.
+        u64 uniform_full_unchained{};
+        u64 uniform_full_blocked{}; ///< Full draws without (writes lost, keeps off)
         u64 uniform_full_kept{};    ///< Uniform buffers kept on those full draws
         u64 uniform_full_streamed{};
         u64 twins{};      ///< Delta candidates that went on with a twin pipeline
@@ -557,7 +613,7 @@ private:
     /// its delta state to a twin (taken_draw.pipeline), else null.
     GraphicsPipeline* twin_source{};
     /// EDEN_NX2_DRAWX_UNIFORMS: Nx2FastDraw::g_keep_serial when the previous draw began binding
-    /// uniforms, if it is the draw that took g_delta last.
+    /// uniforms, if it is the draw that took g_delta last (statistics: DrawXStats).
     VideoCommon::Nx2FastDraw::KeepChain drawx_keep_chain;
     u32 taken_break_classes{};
     bool matched_candidate{};
@@ -566,6 +622,11 @@ private:
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};
+    /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds, so UpdateVertexInput compares
+    /// the vertex input recorded last with what the registers give now.
+    bool verify_vertex_input{};
+    VertexInputState recorded_vertex_input;
+    bool vertex_input_recorded{};
 
     struct IndirectTrace {
         vk::Buffer readback;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -419,6 +418,18 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
         } else {
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
+    }
+    if (ctx.native_half_rounding) {
+        // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        if (!profile.support_separate_denorm_behavior || !profile.support_separate_rounding_mode) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 64U);
+        }
+        return;
     }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
@@ -14,6 +13,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_sync_suspend.h"
 #include "video_core/nx2_sync_trace.h"
@@ -89,6 +89,8 @@ bool Scheduler::ResumePending(GPU& gpu) {
             if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                 split.PublishSoon();
             }
+            VideoCommon::BackIdleTrace::SetFrontState(
+                VideoCommon::BackIdleTrace::FrontState::Parse);
             const VideoCommon::SyncTrace::FrontScope sync_scope{
                 VideoCommon::SyncTrace::enabled ? &dma_pusher.puller : nullptr};
             BindChannel(gpu, state->bind_id);
@@ -124,6 +126,12 @@ std::optional<u64> Scheduler::EarlyWaitPosition() const {
         }
     }
     return earliest;
+}
+
+bool Scheduler::WaitsForListCopy() const {
+    return std::ranges::any_of(pending_channels, [](const auto& state) {
+        return state->payload->dma_pusher.WaitsForListCopy();
+    });
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

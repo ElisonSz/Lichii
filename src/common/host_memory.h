@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -74,6 +73,9 @@ public:
     /// A guest streaming memory in or out maps and unmaps many times a second.
     [[nodiscard]] static u64 NanosecondsSinceMapChange() noexcept;
 
+    /// Bytes Map, Unmap and Protect have covered since start.
+    static u64 MappedBytes() noexcept;
+
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 
@@ -88,6 +90,10 @@ public:
     }
     [[nodiscard]] const u8* BackingBasePointer() const noexcept {
         return backing_base;
+    }
+
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
     }
 
     [[nodiscard]] u8* VirtualBasePointer() noexcept {

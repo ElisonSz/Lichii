@@ -201,6 +201,25 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
     return scratch_offset / 4U;
 }
 
+namespace {
+// Whether the entry point can request fp16 round-to-nearest-even and denorm preserve, so that an
+// fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
+// every non-NaN fp32 input; a NaN stays a NaN.
+bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
+    if (!profile.support_float_controls || profile.has_broken_fp16_float_controls ||
+        !profile.support_fp16_rounding_rte || !profile.support_fp16_denorm_preserve ||
+        !profile.fp16_float_controls_independent_of_fp32 || info.uses_fp16_denorms_flush) {
+        return false;
+    }
+    if (profile.support_separate_denorm_behavior && profile.support_separate_rounding_mode) {
+        return true;
+    }
+    // fp64 has to take the same modes, which match how the guest treats fp64 by default.
+    return profile.fp16_float_controls_shared_with_fp64 && profile.support_fp64_rounding_rte &&
+           profile.support_fp64_denorm_preserve;
+}
+} // Anonymous namespace
+
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program) {
     if (ctx.tensor_scratch_word) {
         ctx.cooperative_hmma =
@@ -237,11 +256,24 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             ctx.profile.has_broken_spirv_subgroup_shuffle)
             throw NotImplementedException("Software HMMA requires subgroup shuffle support");
         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
+        ctx.native_half_rounding = CanRoundHalfNatively(ctx.profile, program.info);
+        const Id f16ty = ctx.native_half_rounding ? ctx.TypeFloat(16) : Id{};
+        if (ctx.native_half_rounding) {
+            ctx.AddCapability(spv::Capability::Float16);
+        }
         const auto imm = [&](u32 v) { return ctx.Const(v); };
         const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
         const auto and_ = [&](Id a, u32 b) { return ctx.OpBitwiseAnd(u32ty, a, imm(b)); };
         const auto unpack = [&](Id v) { return ctx.OpUnpackHalf2x16(ctx.F32[2], v); };
         const auto round_half = [&](Id value) {
+            if (ctx.native_half_rounding) {
+                // Without NoContraction, RADV folds the conversion pair away and nothing rounds.
+                const Id half = ctx.OpFConvert(f16ty, value);
+                ctx.Decorate(half, spv::Decoration::NoContraction);
+                const Id widened = ctx.OpFConvert(f32ty, half);
+                ctx.Decorate(widened, spv::Decoration::NoContraction);
+                return widened;
+            }
             // Do not express the intermediate rounding as unpack(pack(value)): drivers may
             // eliminate that round trip. Round normal significands explicitly, ties to even;
             // half subnormals lie on the exactly representable 2^-24 grid.

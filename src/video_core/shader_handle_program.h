@@ -219,11 +219,18 @@ private:
 /// unrelated texture, a different one whenever the game moves the buffer: every frame for a
 /// double-buffered one, so the surface flickers. Bind no texture for it instead.
 template <typename Info, typename Descriptor>
-[[nodiscard]] bool HandleMustBeNull(const Info& info, const Descriptor& desc, u32 index) {
-    if (desc.bind_null) {
-        return true;
+[[nodiscard]] bool HandleIsStoragePointer(const Info& info, const Descriptor& desc, u32 index) {
+    if (desc.handle_program != ~0U) {
+        return false;
     }
-    if (desc.handle_program != ~0U || desc.has_secondary) {
+    if constexpr (requires { desc.handle_is_pointer_word; }) {
+        // The translation saw the word dereferenced, also when no storage buffer binds it (a
+        // capture that saw the pointer null)
+        if (desc.handle_is_pointer_word) {
+            return true;
+        }
+    }
+    if (desc.has_secondary) {
         return false;
     }
     const u32 offset = desc.cbuf_offset + (index << desc.size_shift);
@@ -231,6 +238,14 @@ template <typename Info, typename Descriptor>
         return storage.cbuf_index == desc.cbuf_index && offset >= storage.cbuf_offset &&
                offset - storage.cbuf_offset < sizeof(u64);
     });
+}
+
+/// Whether texture descriptor `desc` binds the null texture for element `index`: a handle the
+/// translation could not compute (bind_null), or a word that is a storage pointer
+/// (HandleIsStoragePointer).
+template <typename Info, typename Descriptor>
+[[nodiscard]] bool HandleMustBeNull(const Info& info, const Descriptor& desc, u32 index) {
+    return desc.bind_null || HandleIsStoragePointer(info, desc, index);
 }
 
 } // namespace VideoCommon

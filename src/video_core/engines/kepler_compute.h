@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -31,6 +30,10 @@ class System;
 
 namespace VideoCommon {
 class GpuSplit;
+}
+
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
 }
 
 namespace Tegra {
@@ -63,6 +66,8 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
     (offsetof(Tegra::Engines::KeplerCompute::LaunchParams, field_name) / sizeof(u32))
 
 class KeplerCompute final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
@@ -273,6 +278,8 @@ public:
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
+    /// Whether FrontCallMethod takes `method`'s next word as a parameter of a macro it runs.
+    bool FrontRunsMacroWord(u32 method) const;
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

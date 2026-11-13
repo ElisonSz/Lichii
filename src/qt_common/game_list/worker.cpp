@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -234,7 +233,7 @@ QString FormatPatchNameVersions(const FileSys::PatchManager& patch_manager,
     FileSys::VirtualFile update_raw;
     loader.ReadUpdateRaw(update_raw);
     for (const auto& patch : patch_manager.GetPatches(update_raw)) {
-        const bool is_update = patch.name == "Update";
+        const bool is_update = patch.type == FileSys::PatchType::Update;
         if (!updatable && is_update) {
             continue;
         }
@@ -439,6 +438,40 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
              file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
             !Loader::IsBootableGameContainer(file, file_type)) {
+            // Update- and DLC-only containers stay hidden. One whose programs cannot be
+            // decrypted is listed so the player sees that keys are missing.
+            const auto status = Loader::GetContainerProgramStatus(file, file_type);
+            const auto reason = Loader::GetResultStatusString(status);
+            if (!Loader::IsMissingKeyStatus(status)) {
+                if (status != Loader::ResultStatus::Success &&
+                    status != Loader::ResultStatus::ErrorNSPMissingProgramNCA &&
+                    status != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
+                    LOG_WARNING(Frontend, "Not listing {}: {}", physical_name, reason);
+                }
+                return;
+            }
+            LOG_WARNING(Frontend, "Listing {} without its content: {}", physical_name, reason);
+
+            const auto file_type_string =
+                QString::fromStdString(Loader::GetFileTypeString(file_type));
+            auto* const path_item = new GameListItemPath(
+                FormatGameName(physical_name), {},
+                QFileInfo(QString::fromStdString(physical_name)).completeBaseName(),
+                file_type_string, 0, 0, {});
+            path_item->setData(tr("%1\nDump current keys from your own console and install them "
+                                  "with Tools > Install Decryption Keys.")
+                                   .arg(QString::fromStdString(reason)),
+                               Qt::ToolTipRole);
+            auto pending = std::make_shared<PendingRow>(QList<QStandardItem*>{
+                path_item,
+                new GameListItem(file_type_string),
+                new GameListItemSize(Common::FS::GetSize(physical_name)),
+                new GameListItemPlayTime(0),
+                new GameListItem(tr("Decryption keys missing")),
+            });
+            RecordEvent([=](GameListModel* model) {
+                model->AddEntry(pending->Release(), parent_dir);
+            });
             return;
         }
 

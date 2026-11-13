@@ -10,11 +10,14 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fssystem/fssystem_bucket_tree.h"
 #include "core/file_sys/fssystem/fssystem_compression_configuration.h"
@@ -64,6 +67,26 @@ std::vector<u8> MakePfs0(const std::vector<std::string>& names) {
         Put(out, 0x10 + i * 0x18 + 0x10, name_offsets[i]);
     }
     out.insert(out.end(), strtab.begin(), strtab.end());
+    return out;
+}
+
+// PFS0 holding the given files, like an NSP.
+std::vector<u8> MakePfs0WithFiles(const std::vector<std::pair<std::string, std::vector<u8>>>& files) {
+    std::vector<std::string> names;
+    for (const auto& file : files) {
+        names.push_back(file.first);
+    }
+    auto out = MakePfs0(names);
+    u64 offset = 0;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const u64 size = files[i].second.size();
+        Put(out, 0x10 + i * 0x18, offset);
+        Put(out, 0x10 + i * 0x18 + 8, size);
+        offset += size;
+    }
+    for (const auto& file : files) {
+        out.insert(out.end(), file.second.begin(), file.second.end());
+    }
     return out;
 }
 
@@ -297,6 +320,32 @@ TEST_CASE("NCA with an AES-XTS section opens a storage", "[core][file_sys]") {
     auto nca = MakeSha256Nca();
     nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesXts;
     REQUIRE(nca.Open() == ResultSuccess);
+}
+
+TEST_CASE("NCA without a header key reports the missing key", "[core][file_sys]") {
+    if (Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
+        SKIP("A header key is installed");
+    }
+    const NCA nca{MakeFile(std::vector<u8>(0xC00, 0xA5))};
+    CHECK(nca.GetStatus() == Loader::ResultStatus::ErrorMissingHeaderKey);
+}
+
+TEST_CASE("NSP that cannot be decrypted reports the missing key", "[core][file_sys]") {
+    if (Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
+        SKIP("A header key is installed");
+    }
+    const auto nsp = MakeFile(MakePfs0WithFiles(
+        {{"0123456789abcdef0123456789abcdef.cnmt.nca", std::vector<u8>(0xC00, 0xA5)}}));
+    CHECK_FALSE(Loader::IsBootableGameContainer(nsp, Loader::FileType::NSP));
+    CHECK(Loader::GetContainerProgramStatus(nsp, Loader::FileType::NSP) ==
+          Loader::ResultStatus::ErrorMissingHeaderKey);
+}
+
+TEST_CASE("NSP without programs reports no missing key", "[core][file_sys]") {
+    const auto nsp = MakeFile(MakePfs0WithFiles({{"readme.txt", std::vector<u8>(0x10)}}));
+    CHECK_FALSE(Loader::IsBootableGameContainer(nsp, Loader::FileType::NSP));
+    CHECK(Loader::GetContainerProgramStatus(nsp, Loader::FileType::NSP) ==
+          Loader::ResultStatus::ErrorNSPMissingProgramNCA);
 }
 
 TEST_CASE("NCA rejects a file shorter than its header", "[core][file_sys]") {

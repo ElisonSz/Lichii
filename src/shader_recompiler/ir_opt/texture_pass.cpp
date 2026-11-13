@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -37,6 +36,8 @@ struct TextureInst {
     ConstBufferAddr cbuf;
     IR::Inst* inst;
     IR::Block* block;
+    /// The handle word reaches the handle only as the address of a load (see ReachesOutsideLoads)
+    bool pointer_word{};
 };
 
 using TextureInstVector = boost::container::small_vector<TextureInst, 24>;
@@ -560,6 +561,39 @@ bool IsFloatValue(const IR::Inst& inst) {
 }
 
 thread_local bool g_legacy_handle_search{};
+
+// Whether target is reachable from value without passing through a memory load. A word reached
+// only through loads is part of an address the program dereferences, never the handle itself.
+bool ReachesOutsideLoads(const IR::Value& value, const IR::Inst* target, const IR::Block* block) {
+    const IR::Value start{ResolveConditionalPhi(value, block)};
+    if (target == nullptr || start.IsImmediate()) {
+        return true;
+    }
+    std::unordered_set<const IR::Inst*> visited{start.InstRecursive()};
+    std::queue<const IR::Inst*> queue;
+    queue.push(start.InstRecursive());
+    while (!queue.empty()) {
+        const IR::Inst* const inst{queue.front()};
+        queue.pop();
+        if (inst == target) {
+            return true;
+        }
+        if (IsMemoryLoad(inst->GetOpcode())) {
+            continue;
+        }
+        for (size_t arg = inst->NumArgs(); arg--;) {
+            const IR::Value arg_value{ResolveConditionalPhi(inst->Arg(arg), block)};
+            if (arg_value.IsImmediate()) {
+                continue;
+            }
+            const IR::Inst* const arg_inst{arg_value.InstRecursive()};
+            if (visited.insert(arg_inst).second) {
+                queue.push(arg_inst);
+            }
+        }
+    }
+    return false;
+}
 
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
     if (StrictHandles && !g_legacy_handle_search) {
@@ -1109,13 +1143,15 @@ void TrimTrailingTees(std::vector<u32>& code) {
 
 // Elements of the descriptor array of a handle read from a table at an index word (see
 // g_handle_index_allowed): the table entries a draw binds, larger indices taking the last one.
-// LICHII_BINDLESS_TABLE overrides it (1 to 1024), 0 turning such arrays off (the shader then
-// gets whatever constant buffer word the earlier search finds, as before them).
+constexpr u32 HANDLE_TABLE_SIZE = 64;
+
+// HANDLE_TABLE_SIZE, which LICHII_BINDLESS_TABLE overrides (1 to 1024), 0 turning such arrays off
+// (such a handle then binds a null texture, as any sampled handle no program computes).
 u32 HandleTableSize() {
     static const u32 size = [] {
         const char* const value = std::getenv("LICHII_BINDLESS_TABLE");
         if (value == nullptr || value[0] == '\0') {
-            return 64U;
+            return HANDLE_TABLE_SIZE;
         }
         const long parsed = std::strtol(value, nullptr, 10);
         return static_cast<u32>(std::clamp(parsed, 0L, 1024L));
@@ -1420,6 +1456,7 @@ std::optional<ConstBufferAddr> UniqueLegacyImageHandle(IR::Value value, Environm
 
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
     ConstBufferAddr addr;
+    bool pointer_word{};
     if (IsBindless(inst)) {
         std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
         if (StrictHandles && track_addr && !track_addr->has_secondary &&
@@ -1463,18 +1500,20 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
             }
             if (!built) {
                 // A dependency of an unresolved handle is not itself a texture handle.
-                // Preserve the legacy search only for buffers and storage images.
-                const std::optional<ConstBufferAddr> legacy{
-                    StrictHandles
-                        ? std::nullopt
-                        : IR::BreadthFirstSearch(
-                              inst.Arg(0),
-                              [&env, &host_info, block](const IR::Inst* candidate) {
-                                  return TryGetConstBuffer(candidate, env, host_info, block);
-                              },
-                              [&](IR::Value operand) {
-                                  return ResolveConditionalPhi(operand, block);
-                              })};
+                // Preserve the legacy search only for buffers and storage images; for a texture
+                // it only tells whether the word it finds is a pointer (below).
+                const IR::Inst* found_inst{};
+                const std::optional<ConstBufferAddr> found{IR::BreadthFirstSearch(
+                    inst.Arg(0),
+                    [&env, &host_info, block, &found_inst](const IR::Inst* candidate) {
+                        std::optional result{TryGetConstBuffer(candidate, env, host_info, block)};
+                        if (result) {
+                            found_inst = candidate;
+                        }
+                        return result;
+                    },
+                    [&](IR::Value operand) { return ResolveConditionalPhi(operand, block); })};
+                const std::optional<ConstBufferAddr> legacy{StrictHandles ? std::nullopt : found};
                 if (!sampled) {
                     auto usable = StrictHandles
                                       ? UniqueLegacyImageHandle(inst.Arg(0), env, host_info, block)
@@ -1501,13 +1540,6 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 if (StrictHandles) {
                     env.WarnStrictHandles("sampled handle unresolved; binding a null texture");
                 }
-                static std::atomic<int> warnings{};
-                if (!StrictHandles && warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
-                    LOG_WARNING(Shader,
-                                "Bindless {} handle not computable per draw (stopped at {}): "
-                                "binding a null texture",
-                                inst.GetOpcode(), g_handle_failure);
-                }
                 addr = ConstBufferAddr{
                     .index = 0,
                     .offset = 0,
@@ -1520,6 +1552,29 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                     .has_secondary = false,
                     .bind_null = true,
                 };
+                // The word the search finds may be the pointer a load reads the handle through
+                // (a light table's address). The null texture then names that word, so that a
+                // capture which saw the pointer unmapped is captured again (see
+                // Info::binds_unmapped_pointer_word).
+                pointer_word = found && !ReachesOutsideLoads(inst.Arg(0), found_inst, block);
+                if (pointer_word) {
+                    addr.index = found->index;
+                    addr.offset = found->offset;
+                }
+                static std::atomic<int> warnings{};
+                if (!StrictHandles && warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    if (pointer_word) {
+                        LOG_WARNING(Shader,
+                                    "Bindless {} handle not computable per draw (stopped at {}): "
+                                    "binding a null texture, cbuf{}+{:#x} being a pointer",
+                                    inst.GetOpcode(), g_handle_failure, addr.index, addr.offset);
+                    } else {
+                        LOG_WARNING(Shader,
+                                    "Bindless {} handle not computable per draw (stopped at {}): "
+                                    "binding a null texture",
+                                    inst.GetOpcode(), g_handle_failure);
+                    }
+                }
             } else {
                 TrimTrailingTees(code);
                 auto& programs{*g_handle_programs};
@@ -1584,6 +1639,7 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
         .cbuf = addr,
         .inst = &inst,
         .block = block,
+        .pointer_word = pointer_word,
     };
 }
 
@@ -1657,7 +1713,8 @@ public:
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
                    desc.bind_null == existing.bind_null &&
-                   desc.handle_program == existing.handle_program;
+                   desc.handle_program == existing.handle_program &&
+                   desc.handle_is_pointer_word == existing.handle_is_pointer_word;
         })};
         // TODO: Read this from TIC
         texture_descriptors[index].is_multisample |= desc.is_multisample;
@@ -2053,7 +2110,17 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .handle_program = cbuf.handle_program,
                     .bind_null = cbuf.bind_null,
                     .is_descriptor_array = cbuf.count > 1,
+                    .handle_is_pointer_word = texture_inst.pointer_word,
                 });
+                if (texture_inst.pointer_word &&
+                    std::ranges::none_of(program.info.storage_buffers_descriptors,
+                                         [&cbuf](const auto& storage) {
+                                             return storage.cbuf_index == cbuf.index &&
+                                                    cbuf.offset >= storage.cbuf_offset &&
+                                                    cbuf.offset - storage.cbuf_offset < sizeof(u64);
+                                         })) {
+                    program.info.binds_unmapped_pointer_word = true;
+                }
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }
             break;
@@ -2167,6 +2234,7 @@ void LimitSharedStageSampledTextureArrays(std::span<IR::Program* const> programs
 
 JoinedDescriptors JoinTextureInfo(Info& base, Info& source, std::span<const u32> storage_bindings) {
     base.requires_coherent_image_memory |= source.requires_coherent_image_memory;
+    base.binds_unmapped_pointer_word |= source.binds_unmapped_pointer_word;
     // The handle programs of source join those of base (once each, as the pass keeps them),
     // reading its storage buffers at their bindings in base.
     std::vector<u32> program_index(source.handle_programs.size());

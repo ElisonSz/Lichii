@@ -70,6 +70,7 @@ public:
         const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) override;
 
     bool IsVibrationEnabled(const PadIdentifier& identifier) override;
+    bool IsVibrationStreamed(const PadIdentifier& identifier) override;
 
 private:
     void InitJoystick(SDL_JoystickID joystick_id);

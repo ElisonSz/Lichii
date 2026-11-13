@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -25,30 +24,34 @@ public:
 
     ~GPUDirtyMemoryManager() = default;
 
+    /// Off unless EDEN_NX2_BACKX_VERIFY counts the writes that add bits (Collects).
+    static inline bool count_collects{};
+
     void Collect(PAddr address, size_t size) {
         // EDEN_NX2_BACKX_GATHER with _VERIFY: odd while a Collect runs (CollectEpoch).
         const EpochScope epoch_scope{VideoCommon::BackX::g_gather_epochs ? &collect_epoch
                                                                          : nullptr};
-        if (VideoCommon::BackX::g_collect_split || VideoCommon::BackX::g_stats ||
-            VideoCommon::BackX::g_verify) [[unlikely]] {
+        if (VideoCommon::BackX::g_stats || VideoCommon::BackX::g_verify) [[unlikely]] {
             if ((address & page_mask) + size > page_size) {
-                // BuildTransform covers one 2 KiB granule; past its end the mask's shift is out of
-                // range, and the write's bytes are lost (often all of them).
+                // The BackX line's "crossing writes" (EDEN_NX2_BACKX_COLLECT_SPLIT's split below
+                // is always on now).
                 VideoCommon::BackX::Count(VideoCommon::BackX::Counter::CrossingWrites);
-                if (VideoCommon::BackX::g_collect_split) {
-                    // EDEN_NX2_BACKX_COLLECT_SPLIT: one transform per granule the write touches.
-                    while (size != 0) {
-                        const size_t chunk = (std::min)(
-                            size, static_cast<size_t>(page_size - (address & page_mask)));
-                        CollectInGranule(address, chunk);
-                        address += chunk;
-                        size -= chunk;
-                    }
-                    return;
-                }
             }
         }
-        CollectInGranule(address, size);
+        // A transform covers one page: a write past its page goes in a page at a time. Its mask
+        // was otherwise built with shifts of 32 or more, which could leave it empty and lose the
+        // write (with an older one left in back_buffer and `current` showing nothing).
+        while (size != 0) {
+            const size_t in_page = (std::min<size_t>)(size, page_size - (address & page_mask));
+            CollectInPage(address, in_page);
+            address += in_page;
+            size -= in_page;
+        }
+    }
+
+    /// Writes collected that added bits, ever (only while count_collects is set).
+    [[nodiscard]] u64 Collects() const {
+        return collects.load(std::memory_order_acquire);
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -78,8 +81,6 @@ public:
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
-            // The last gather emptied front_buffer, which is back_buffer now.
-            back_buffer_used.store(false, std::memory_order_relaxed);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
@@ -90,18 +91,14 @@ public:
         front_buffer.clear();
     }
 
-    /// False when Gather would find nothing: `current` has no mask bits (an empty transform;
-    /// IsValid holds for every 32-bit page index) and nothing was pushed to back_buffer since the
-    /// last gather. back_buffer counts on its own: a write crossing a 2 KiB granule gets an empty
-    /// mask (BuildTransform), and its push leaves the transform before it in back_buffer behind an
-    /// empty `current`. `current` is read first: a push sets back_buffer_used before it releases
-    /// the new `current`, so a `current` from after the push comes with the flag. Without the
-    /// locks: a Collect it misses is one the caller may order after itself.
+    /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
+    /// in `current` (by compare-exchange, or by exchange after pushing the one before to
+    /// back_buffer under `guard`), and only Gather, which takes back_buffer too, empties `current`
+    /// again. An empty transform has no mask bits; Collect builds none, as a write crossing a page
+    /// goes in a page at a time. Without the locks: a Collect it misses is one the caller may
+    /// order after itself.
     [[nodiscard]] bool MayHavePending() const {
-        if (current.load(std::memory_order_acquire).mask != 0) {
-            return true;
-        }
-        return back_buffer_used.load(std::memory_order_acquire);
+        return current.load(std::memory_order_acquire).mask != 0;
     }
 
     /// EDEN_NX2_BACKX_GATHER with _VERIFY: counts Collect calls twice, on entry and on return
@@ -139,8 +136,13 @@ public:
     }
 
 private:
-    /// One write within one 2 KiB granule (Collect).
-    void CollectInGranule(PAddr address, size_t size) {
+    struct alignas(8) TransformAddress {
+        u32 address;
+        u32 mask;
+    };
+
+    /// [address, address + size) lies in one page and size is not 0, so the mask has bits.
+    void CollectInPage(PAddr address, size_t size) {
         TransformAddress t = BuildTransform(address, size);
         TransformAddress tmp, original;
         do {
@@ -150,10 +152,8 @@ private:
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
-                    back_buffer_used.store(true, std::memory_order_relaxed);
-                    // Release: whoever sees `t` sees back_buffer_used too (MayHavePending). The
-                    // same instruction as relaxed on x86.
-                    current.exchange(t, std::memory_order_release);
+                    current.exchange(t, std::memory_order_relaxed);
+                    CountCollect();
                     return;
                 }
                 tmp.address = t.address;
@@ -165,12 +165,15 @@ private:
             tmp.mask |= t.mask;
         } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
                                                 std::memory_order_relaxed));
+        CountCollect();
     }
 
-    struct alignas(8) TransformAddress {
-        u32 address;
-        u32 mask;
-    };
+    /// After the write is in `current`: a reader that sees the count sees the write.
+    void CountCollect() {
+        if (count_collects) {
+            collects.fetch_add(1, std::memory_order_release);
+        }
+    }
 
     template <typename Func>
     static void ForEachRun(const TransformAddress& transform, Func&& callback) {
@@ -222,13 +225,11 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    std::atomic<u64> collects{};
     std::mutex guard;
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
-    /// back_buffer holds transforms pushed since the last gather (written under guard, read by
-    /// MayHavePending without it).
-    std::atomic<bool> back_buffer_used{false};
     std::atomic<u64> collect_epoch{};
 
     /// EDEN_NX2_BACKX_GATHER with _VERIFY: collect_epoch around one Collect.

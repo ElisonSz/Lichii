@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/logging.h"
@@ -62,7 +61,13 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
         LOG_ERROR(HW_GPU, "Ignoring increment of invalid syncpoint {:#x}", syncpoint_id);
         return;
     }
-    Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id]);
+    Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id],
+              syncpoint_id);
+}
+
+void SyncpointManager::SetGuestMirror(GuestMirror mirror) {
+    std::scoped_lock lk(guard);
+    guest_mirror = std::move(mirror);
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
@@ -81,10 +86,15 @@ void SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value) {
 }
 
 void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
-                                 std::list<RegisteredAction>& action_storage) {
-    auto new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
-
+                                 std::list<RegisteredAction>& action_storage,
+                                 std::optional<u32> mirrored_id) {
     std::scoped_lock lk(guard);
+    if (mirrored_id && guest_mirror) {
+        // Before the value is published: the lock-free ready checks in RegisterAction and Wait
+        // must not see it ahead of the page.
+        guest_mirror(*mirrored_id, syncpoint.load(std::memory_order_relaxed) + 1);
+    }
+    const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     auto it = action_storage.begin();
     while (it != action_storage.end()) {
         if (it->expected_value > new_value) {

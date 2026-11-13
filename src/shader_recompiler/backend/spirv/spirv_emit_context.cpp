@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -1932,6 +1931,14 @@ void EmitContext::DefineMesh(const IR::Program& program) {
 
     if (as_compute) {
         return; // the output buffer: DefineMeshEmulationOutput, after the storage buffers
+    }
+    if (profile.has_broken_mesh_user_sgprs) {
+        // On GFX11+, RADV gives a mesh shader user SGPRs only for the grid size and the draw
+        // index. Without them, binding the shader keeps the last vertex shader's draw index
+        // state, and the next mesh draw writes a SET_SH_REG packet that declares more registers
+        // than it holds: the command processor then hangs. MeshEpilogue reads this variable.
+        mesh_num_workgroups = DefineVariable(*this, U32[3], spv::BuiltIn::NumWorkgroups,
+                                             spv::StorageClass::Input);
     }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};

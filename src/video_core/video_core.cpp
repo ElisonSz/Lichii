@@ -11,6 +11,7 @@
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/front_qmd.h"
 #include "video_core/gpu_split.h"
@@ -28,6 +29,7 @@
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_macro.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -93,6 +95,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
+    VideoCommon::ListMacroTrace::ReadSwitch();
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
     VideoCommon::MemTrack::ReadSwitch();
@@ -116,7 +119,10 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::StaleTargets::ReadSwitch();
     VideoCommon::ImageJoin::ReadSwitches();
     VideoCommon::Nx2Protect::ReadSwitch();
+    // Every EDEN_NX2_BACKX_* switch, EDEN_NX2_BACKX_VERIFY included (nx2's ReadSwitch read that
+    // one alone): read once, so the BackX line is logged once.
     VideoCommon::BackX::ReadSwitches();
+    Core::GPUDirtyMemoryManager::count_collects = VideoCommon::BackX::g_verify;
     VideoCommon::Nx2Macro::ReadSwitches();
     VideoCommon::Cfg::ReadSwitches();
 

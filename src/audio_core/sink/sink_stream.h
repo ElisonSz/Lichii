@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -90,7 +89,8 @@ public:
 
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
 
-    u32 SysmixQueueLimit() const;
+    /// Bound queued sysmix blocks; discard sinks use one to preserve the timer cadence.
+    virtual u32 SysmixQueueLimit() const;
 
     /**
      * Check if the stream is paused.
@@ -291,6 +291,10 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    u64 level_rendered_frames{};
+    u64 level_callbacks{};
+    u64 level_underrun_callbacks{};
+    u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// Largest number of frames the host device has asked for in one callback (sysmix streams)

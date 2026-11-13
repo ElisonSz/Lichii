@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -138,6 +139,10 @@ struct PerfStatsResults;
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path);
 
+/// The id of the Switch 2 program in a game file, or nothing for any other program.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index);
+
 /// Enumeration representing the return values of the System Initialize and Load process.
 enum class SystemResultStatus : u32 {
     Success,             ///< Succeeded
@@ -222,6 +227,12 @@ public:
     [[nodiscard]] SystemResultStatus Load(Frontend::EmuWindow& emu_window,
                                           const std::string& filepath,
                                           Service::AM::FrontendAppletParameters& params);
+
+    /// Brings up the kernel, Host1x and the GPU without an application process, audio or
+    /// services, for a GPU trace replay (video_core/gpu_trace/replay.h). ShutdownMainProcess
+    /// tears it down.
+    [[nodiscard]] SystemResultStatus InitializeForGpuReplay(Frontend::EmuWindow& emu_window,
+                                                            u64 program_id);
 
     /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an

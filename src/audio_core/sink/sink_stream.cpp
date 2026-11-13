@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -32,10 +31,10 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
 
-    auto yuzu_volume = Settings::Volume();
-    if (yuzu_volume > 1.0f)
-        yuzu_volume = 0.6f + 20.0f * std::log10(yuzu_volume);
-    auto const volume = system_volume * device_volume * yuzu_volume;
+    auto lichii_volume = Settings::Volume();
+    if (lichii_volume > 1.0f)
+        lichii_volume = 0.6f + 20.0f * std::log10(lichii_volume);
+    auto const volume = system_volume * device_volume * lichii_volume;
     std::size_t pushed{};
     const auto device_samples = samples.size() / system_channels * device_channels;
 
@@ -205,6 +204,7 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
     }
 }
 
+/// Render queued PCM with the stream's underrun policy and optional two-second diagnostics.
 void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::size_t num_frames) {
     if (num_frames == 0) {
         return;
@@ -276,8 +276,27 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             level_peak = std::max<s32>(level_peak, std::abs(static_cast<s32>(output_buffer[i])));
         }
         level_frames += num_frames;
+        if (meter) {
+            const u64 missing = num_frames - actual_frames_written;
+            level_rendered_frames += actual_frames_written;
+            ++level_callbacks;
+            level_underrun_callbacks += missing != 0;
+            level_max_missing_frames = std::max(level_max_missing_frames, missing);
+        }
         if (level_frames >= TargetSampleRate * 2) {
             LOG_INFO(Audio, "Audio output peak over {} frames: {} of 32767", level_frames, level_peak);
+            if (meter) {
+                LOG_INFO(Audio,
+                         "Audio sink {}: callbacks={} requested_frames={} rendered_frames={} "
+                         "missing_frames={} underrun_callbacks={} max_missing_frames={}",
+                         name, level_callbacks, level_frames, level_rendered_frames,
+                         level_frames - level_rendered_frames, level_underrun_callbacks,
+                         level_max_missing_frames);
+                level_rendered_frames = 0;
+                level_callbacks = 0;
+                level_underrun_callbacks = 0;
+                level_max_missing_frames = 0;
+            }
             level_frames = 0;
             level_peak = 0;
         }

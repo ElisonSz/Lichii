@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -156,12 +155,14 @@ public:
                 uncommitted_operations.emplace_back(std::move(func));
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            if (!BackX::g_ops) [[likely]] {
-                uncommitted_operations.reserve(64);
-            } else if (recycled_operations.Take(uncommitted_operations)) {
+            // A list the fencing thread ran, with the capacity it grew to (EDEN_NX2_BACKX_OPS's
+            // reuse, which nx2 does always), else a new one.
+            if (!spare_operations.empty()) {
+                uncommitted_operations = std::move(spare_operations.back());
+                spare_operations.pop_back();
                 BackX::Count(BackX::Counter::OpsReused);
             } else {
+                uncommitted_operations = OperationList{}; // moved-from: make it empty explicitly
                 uncommitted_operations.reserve(64);
                 BackX::Count(BackX::Counter::OpsAllocated);
             }
@@ -176,8 +177,13 @@ public:
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
+            // The fencing thread waits for the host GPU while it has fences: it needs waking (a
+            // system call) only when it waits for fences to be made.
+            const bool wake = fence_thread_waiting;
             guard.unlock();
-            cv.notify_all();
+            if (wake) {
+                cv.notify_all();
+            }
         }
         if (delay_fence) {
             SubmitDeferredWork();
@@ -325,7 +331,11 @@ private:
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                cv.wait(lock, [&] {
+                    fence_thread_waiting = !stop_token.stop_requested() && fences.empty();
+                    return !fence_thread_waiting;
+                });
+                fence_thread_waiting = false;
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -377,22 +387,28 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                released.operations.clear();
             }
             if (!batch.empty()) {
                 VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+            }
+            {
+                // The emptied lists go back to SignalFence, unless one grew past what is worth
+                // keeping (a burst of operations).
+                std::scoped_lock lock{uncommitted_guard};
+                for (Released& released : batch) {
+                    const size_t capacity = released.operations.capacity();
+                    if (spare_operations.size() < MaxSpareOperationLists && capacity != 0 &&
+                        capacity <= MaxSpareOperations) {
+                        spare_operations.push_back(std::move(released.operations));
+                    }
+                }
             }
             {
                 std::unique_lock lock(ring_guard);
                 for (Released& released : batch) {
                     delayed_destruction_ring.Push(std::move(released.fence));
                 }
-            }
-            if (BackX::g_ops) [[unlikely]] {
-                // Where batch.clear() destroys them: the operations in order, then the emptied
-                // lists go back to SignalFence.
-                recycled_operations.Give(batch, [](Released& released) -> OperationList& {
-                    return released.operations;
-                });
             }
             batch.clear();
         }
@@ -406,6 +422,9 @@ private:
 
     static constexpr u8 TextureFlushes = 1;
     static constexpr u8 BufferFlushes = 2;
+    static constexpr size_t MaxSpareOperationLists = 32;
+    /// Capacity of a list worth keeping (EDEN_NX2_BACKX_OPS's recycler kept up to 4096).
+    static constexpr size_t MaxSpareOperations = 4096;
 
     /// committed: what CommitAsyncFlushes returned for this fence.
     void PopAsyncFlushes(u8 committed) {
@@ -520,17 +539,17 @@ private:
     using OperationList = std::vector<std::function<void()>>;
     OperationList uncommitted_operations;
     std::deque<OperationList> pending_operations;
+    /// Lists the fencing thread ran, kept with their capacity for the next fences (a list grew
+    /// from 64 operations at most fences: ~30 a fence at Ocarina of Time's water, in bursts).
+    std::vector<OperationList> spare_operations; ///< Guarded by uncommitted_guard
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 
     std::mutex guard;
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
-    /// EDEN_NX2_BACKX_OPS: operation lists the fencing thread emptied, which SignalFence takes
-    /// (inside uncommitted_guard) instead of a new list; they keep the capacity they grew to, up to
-    /// 4096 operations.
-    BackX::ListRecycler<OperationList, 16, 4096> recycled_operations;
     std::condition_variable cv;
+    bool fence_thread_waiting{}; ///< The fencing thread waits on cv for fences (guarded by guard)
 
     std::jthread fence_thread;
 

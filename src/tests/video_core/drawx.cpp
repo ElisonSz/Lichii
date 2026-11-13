@@ -346,13 +346,15 @@ TEST_CASE("DrawX: with COALESCE a full write list no longer ends the chain",
                                      0x9000000 + u64{index} * 0x40 + 0x10);
         }
     };
-    // Off: the 17th range overflows and breaks, as before.
+    // Off: a full list widens its ranges (AppendRange) instead of breaking, and the draw keeps no
+    // uniforms.
     ReadSwitches(false, false, false);
     FastDraw::g_delta = {};
     u64 serial = FastDraw::Serial();
     write_many(40);
-    CHECK(FastDraw::Serial() > serial);
-    CHECK(FastDraw::g_delta.overflowed);
+    CHECK(FastDraw::Serial() == serial);
+    CHECK(!FastDraw::g_delta.overflowed);
+    CHECK(FastDraw::g_delta.no_uniform_keeps);
     CHECK(!FastDraw::g_delta.drawx_skipped);
     // On: no break, the lists cover every range, and the delta is marked for verify attribution.
     ReadSwitches(false, false, false, false, false, true);

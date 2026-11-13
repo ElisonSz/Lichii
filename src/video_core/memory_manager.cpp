@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -403,6 +402,14 @@ T MemoryManager::Read(GPUVAddr addr) const {
         return value;
     }
 
+    // A Switch 2 sparse block waiting for memory reads what was written to it.
+    if (const auto address = GpuToCpuAddress(addr); address) {
+        T value;
+        if (memory.ReadKept(*address, &value, sizeof(T))) {
+            return value;
+        }
+    }
+
     static std::atomic<u32> reported{};
     if (reported.fetch_add(1) < 16) {
         LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
@@ -436,10 +443,15 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
-    // A Switch 2 sparse block nobody wrote yet gets its memory now.
+    // A Switch 2 sparse block nobody wrote yet gets its memory now, or keeps the write until it
+    // has some.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
+        return;
+    }
+    if (const auto address = GpuToCpuAddress(addr);
+        address && memory.WriteKept(*address, &data, sizeof(T))) {
         return;
     }
 
@@ -561,10 +573,11 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
-        // A device page without memory (a sparse block nobody wrote yet) reads zero.
+        // A device page without memory (a sparse block nobody wrote yet) reads zero, or what was
+        // written to it while it waits for memory.
         if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(dest_buffer, physical, copy_amount);
-        } else {
+        } else if (!memory.ReadKept(dev_addr_base, dest_buffer, copy_amount)) {
             std::memset(dest_buffer, 0, copy_amount);
         }
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
@@ -625,30 +638,30 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
     ReadBlockUnsafe(gpu_src_addr, dest, size, caller);
 }
 
+void MemoryManager::FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const {
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) == 0 || rasterizer == nullptr ||
+        !VideoCore::ReadDownloadsMayCover(dev_addr, size)) {
+        return;
+    }
+    if (VideoCore::ReadCheckWrites::Enabled()) {
+        VideoCore::ReadCheckWrites::Note(dev_addr, size,
+                                         unsafe ? "MemoryManager::WriteBlockUnsafe/Cached (inline-to-memory or "
+                                                  "constant buffer data)"
+                                                : "MemoryManager::WriteBlock");
+    }
+    rasterizer->FinishRead(dev_addr, size);
+}
+
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
-    // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
+    // Give Switch 2 sparse pages the write lands on their memory first, or have them keep it until
+    // they get some (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
-    // A download for a guest read not yet in guest memory would land over this write later.
-    const auto finish_reads = [this, unsafe](DAddr dev_addr, std::size_t amount) {
-        if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
-            if (rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(dev_addr, amount)) {
-                if (VideoCore::ReadCheckWrites::Enabled()) {
-                    VideoCore::ReadCheckWrites::Note(
-                        dev_addr, amount,
-                        unsafe ? "MemoryManager::WriteBlockUnsafe/Cached (inline-to-memory or "
-                                 "constant buffer data)"
-                               : "MemoryManager::WriteBlock");
-                }
-                rasterizer->FinishRead(dev_addr, amount);
-            }
-        }
-    };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        finish_reads(dev_addr_base, copy_amount);
+        FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -656,6 +669,8 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             VideoCommon::SemRecorder::TrackedBytes("gpu-block-store", dev_addr_base, src_buffer,
                                                    copy_amount);
             std::memcpy(physical, src_buffer, copy_amount);
+        } else {
+            memory.WriteKept(dev_addr_base, src_buffer, copy_amount);
         }
         // After the copy: the buffer cache may upload the written bytes from guest memory.
         if (!unsafe) {
@@ -665,7 +680,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        finish_reads(dev_addr_base, copy_amount);
+        FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -720,6 +735,32 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
     }
+}
+
+void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size) {
+    FinishReadsBefore(device_addr, size, true);
+    const auto* src = static_cast<const u8*>(data);
+    for (DAddr address = device_addr; address < device_addr + size;) {
+        const std::size_t amount = (std::min<std::size_t>)(
+            device_addr + size - address, Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
+        if (u8* const physical = memory.GetPointer<u8>(address)) {
+            std::memcpy(physical, src, amount);
+        } else {
+            memory.WriteKept(address, src, amount);
+        }
+        address += amount;
+        src += amount;
+    }
+    if (!constant_buffer_writes.empty()) {
+        auto& [last, last_size] = constant_buffer_writes.back();
+        if (device_addr <= last + last_size && last <= device_addr + size) {
+            const DAddr end = (std::max)(last + last_size, device_addr + size);
+            last = (std::min)(last, device_addr);
+            last_size = end - last;
+            return;
+        }
+    }
+    constant_buffer_writes.emplace_back(device_addr, size);
 }
 
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
@@ -1197,6 +1238,10 @@ void MemoryManager::FlushCaching() {
     })) {
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
+    }
+    if (!constant_buffer_writes.empty()) {
+        rasterizer->InvalidateConstantBufferData(constant_buffer_writes);
+        constant_buffer_writes.clear();
     }
 }
 

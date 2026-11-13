@@ -9,11 +9,15 @@
 #include <array>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QImage>
 #include <QObject>
+#include <QPainter>
+#include <QPainterPath>
 #include <QRegularExpression>
 #include <QStandardItem>
 #include <QString>
@@ -42,13 +46,65 @@ Q_DECLARE_METATYPE(GameListItemType);
  * @param size The desired width and height of the default icon.
  * @return QPixmap default icon
  */
+static bool IsLichiiTheme() {
+    return UISettings::values.theme == "lichii";
+}
+
 static QPixmap GetDefaultIcon(u32 size) {
-    QPixmap icon(size, size);
+    if (size == 0 || !IsLichiiTheme()) {
+        QPixmap icon(size, size);
+        icon.fill(Qt::transparent);
+        return icon;
+    }
+    // Lichii Dark draws a game without art as a tile with a controller glyph.
+    const int side = static_cast<int>(size);
+    QImage icon(side, side, QImage::Format_ARGB32_Premultiplied);
     icon.fill(Qt::transparent);
-    return icon;
+    QPainter painter(&icon);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0x23, 0x24, 0x2a));
+    painter.drawRoundedRect(QRectF(0, 0, side, side), side * 0.18, side * 0.18);
+    const int glyph = side * 3 / 8;
+    painter.drawImage(QRect((side - glyph) / 2, (side - glyph) / 2, glyph, glyph),
+                      QImage(QStringLiteral(":/lichii/icons/menu_gamepad@2x.png")));
+    painter.end();
+    return QPixmap::fromImage(icon);
+}
+
+static QPixmap RoundedIcon(const QPixmap& picture) {
+    if (!IsLichiiTheme() || picture.isNull()) {
+        return picture;
+    }
+    QImage icon(picture.size(), QImage::Format_ARGB32_Premultiplied);
+    icon.fill(Qt::transparent);
+    QPainter painter(&icon);
+    painter.setRenderHint(QPainter::Antialiasing);
+    QPainterPath path;
+    const qreal radius = picture.width() * 0.18;
+    path.addRoundedRect(QRectF(icon.rect()), radius, radius);
+    painter.setClipPath(path);
+    painter.drawPixmap(0, 0, picture);
+    painter.end();
+    return QPixmap::fromImage(icon);
 }
 
 static QPixmap ThemeIcon(const char* name) {
+    if (IsLichiiTheme()) {
+        // Lichii Dark keeps folder rows compact with the 16 px line icons from its set.
+        const std::string_view icon{name};
+        const char* lichii_name = icon == "sd_card"    ? "sd"
+                                  : icon == "chip"     ? "cpu"
+                                  : icon == "list-add" ? "plus"
+                                  : icon == "star"     ? "star"
+                                                       : "folder";
+        QPixmap pixmap(
+            QStringLiteral(":/lichii/icons/menu_%1@2x.png").arg(QLatin1String(lichii_name)));
+        pixmap.setDevicePixelRatio(2.0);
+        return pixmap;
+    }
+
     const int size = UISettings::values.folder_icon_size.GetValue();
 
     return QIcon::fromTheme(QLatin1String(name))
@@ -112,7 +168,7 @@ public:
 
         setData(tooltip, Qt::ToolTipRole);
 
-        const u32 size = UISettings::values.game_icon_size.GetValue();
+        const u32 size = UISettings::CurrentGameIconSize().GetValue();
 
         QPixmap picture;
         if (!picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
@@ -120,7 +176,7 @@ public:
         }
         picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
-        setData(picture, Qt::DecorationRole);
+        setData(RoundedIcon(picture), Qt::DecorationRole);
     }
 
     int type() const override {
@@ -136,7 +192,7 @@ public:
             const std::array<QString, 4> row_data{{
                 QString::fromStdString(filename),
                 data(FileTypeRole).toString(),
-                QString::fromStdString(fmt::format("{:#016x}", data(ProgramIdRole).toULongLong())),
+                QString::fromStdString(fmt::format("{:016X}", data(ProgramIdRole).toULongLong())),
                 data(TitleRole).toString(),
             }};
 

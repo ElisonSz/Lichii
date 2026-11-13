@@ -12,9 +12,12 @@ import tempfile
 import threading
 import unittest
 
-import debug_mcp
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+# -I leaves the script's directory off sys.path.
+sys.path.insert(0, HERE)
+
+import debug_mcp  # noqa: E402
+
 PNG_BYTES = b"\x89PNG fake"
 PNG = base64.b64encode(PNG_BYTES).decode()
 

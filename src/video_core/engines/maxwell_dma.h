@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -19,6 +18,10 @@
 
 namespace Core {
 class System;
+}
+
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
 }
 
 namespace Tegra {
@@ -100,6 +103,8 @@ public:
  */
 
 class MaxwellDMA final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     struct PackedGPUVAddr {
         u32 upper;

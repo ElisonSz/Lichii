@@ -52,6 +52,33 @@ Any changed user-mod bytes in either patch record or the timer state take
 precedence over the entire built-in patch. An incompatible build, original
 instruction, layout, or truncated module leaves both patch records untouched.
 
+## Water ripple passes
+
+The ripple simulation (compute shaders `fb4203a7d928ed42` then `e2ce39e630ce65f3`,
+256x256 ping-pong textures) sets its pass count at `main+0x475F8` as
+`iterations * (int)step`, with `iterations` 6. Truncation is harmless at the
+original step of exactly 1.0, but any step below 1.0 runs no passes: at 120 fps
+the ripples stop, and the grid origin that follows the player keeps moving with
+no pass to apply the shift. Measured before this patch at the save in Zora's
+Domain, frames that ran the simulation out of 10: no patch 10, FPS Unlock capped
+at 60 fps 4 (step 0.998 to 1.003), FPS Unlock at about 99 fps 0.
+
+Both built-ins replace that `fcvtzs` with `bl 0x3C46300` and drop the `mul` that
+followed it. The routine adds `iterations * step` to a remainder kept per water
+object, runs the rounded whole number of passes and keeps the rest, with at least
+one pass whenever the step is positive so the origin shift is always applied. A
+paused game (step 0) still runs none. The final pass `6a7f45ab293a93b1` was never
+affected.
+
+The remainders live in 8 slots of 16 bytes from `0x4E9FE10` (the water object
+from `x21` at the patch site, then the remainder as a float), with the next slot
+to reuse at `0x4E9FE90`. An object without a slot takes the next one in turn, so
+two water objects drawn in the same frame don't pull from one shared fraction.
+The timer state is 0x98 bytes from `0x4E9FE00`. The routine is 148 bytes at
+`0x3C46300-0x3C46393`, clear of the Dynamic FPS routine at `0x3C46200` and of the
+ultrawide caves at `0x3C46400` and up. It uses w8, x9-x12 and s0-s2, none read
+by the game again before it writes them.
+
 ## Timing limits
 
 The routine reads `CNTPCT_EL0` and `CNTFRQ_EL0`. After its first call, it caps

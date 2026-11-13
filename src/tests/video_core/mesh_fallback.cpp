@@ -5,9 +5,13 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #define SPV_ENABLE_UTILITY_CODE
@@ -132,7 +136,8 @@ Profile MakeProfile() {
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
-                             Profile profile = MakeProfile(), bool lane_id = false) {
+                             Profile profile = MakeProfile(), bool lane_id = false,
+                             bool culled = false) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -155,7 +160,7 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
         ir.IsbeWriteAttribute(ir.Imm32(0), index);
         ir.IsbeWriteMapU8(ir.Imm32(4), ir.Imm32(0));
         ir.IsbeWriteMapU32(ir.Imm32(3), ir.Imm32(1));
-    } else {
+    } else if (!culled) {
         ir.IsbeWriteAttribute(ir.Imm32(4), ir.Imm32(1)); // one mesh workgroup
     }
     ir.Epilogue();
@@ -194,6 +199,67 @@ TEST_CASE("Mesh fallback leaves native task and mesh programs as mesh shaders",
     Dump(task, "native-task");
     REQUIRE(Model(task) == spv::ExecutionModel::TaskEXT);
     REQUIRE(UsesStorageClass(task, spv::StorageClass::TaskPayloadWorkgroupEXT));
+}
+
+TEST_CASE("Native task programs zero the mesh workgroup count before the guest runs",
+          "[video_core][spirv][mesh_fallback]") {
+    // A task that culls every thread never writes payload word 1, which OpEmitMeshTasksEXT reads.
+    const std::vector<u32> task{EmitProgram(Stage::Task, false, false, MakeProfile(), false, true)};
+    Dump(task, "native-task-culled");
+    std::unordered_map<u32, u32> constants;
+    std::unordered_set<u32> payload_variables;
+    std::unordered_map<u32, std::pair<u32, u32>> umins;
+    std::unordered_map<u32, u32> payload_indices;
+    const auto value_of = [&](u32 id) -> std::optional<u32> {
+        if (const auto it{constants.find(id)}; it != constants.end()) {
+            return it->second;
+        }
+        if (const auto it{umins.find(id)}; it != umins.end()) {
+            const auto a{constants.find(it->second.first)};
+            const auto b{constants.find(it->second.second)};
+            if (a != constants.end() && b != constants.end()) {
+                return (std::min)(a->second, b->second);
+            }
+        }
+        return std::nullopt;
+    };
+    bool zeroed{};
+    for (const Instruction& inst : Instructions(task)) {
+        if (inst.op == spv::Op::OpControlBarrier) {
+            break;
+        }
+        switch (inst.op) {
+        case spv::Op::OpConstant:
+            constants[inst.operands[1]] = inst.operands[2];
+            break;
+        case spv::Op::OpVariable:
+            if (inst.operands[2] == static_cast<u32>(spv::StorageClass::TaskPayloadWorkgroupEXT)) {
+                payload_variables.insert(inst.operands[1]);
+            }
+            break;
+        case spv::Op::OpExtInst:
+            if (inst.operands[3] == 38) { // GLSL.std.450 UMin
+                umins[inst.operands[1]] = {inst.operands[4], inst.operands[5]};
+            }
+            break;
+        case spv::Op::OpAccessChain:
+            if (inst.operands.size() == 4 && payload_variables.contains(inst.operands[2])) {
+                payload_indices[inst.operands[1]] = inst.operands[3];
+            }
+            break;
+        case spv::Op::OpStore:
+            if (const auto index{payload_indices.find(inst.operands[0])};
+                index != payload_indices.end() &&
+                value_of(index->second) == std::optional<u32>{1} &&
+                value_of(inst.operands[1]) == std::optional<u32>{0}) {
+                zeroed = true;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    REQUIRE(zeroed);
 }
 
 TEST_CASE("Mesh fallback emits mesh programs as compute shaders writing storage buffers",

@@ -549,7 +549,28 @@ Shader::RuntimeInfo Runtime(std::span<const u8> key, Stage stage, Json& assumpti
     return info;
 }
 
+// --device-profile: the HostTranslateInfo ("host") and Profile ("profile") fields that
+// PipelineCache's constructor takes from a device, in place of the offline defaults.
+Json device_profile = Json::object();
+
+template <typename Struct>
+void ApplyDeviceFields(std::string_view section, Struct& target, auto&& fields) {
+    const auto overrides = device_profile.find(section);
+    if (overrides == device_profile.end())
+        return;
+    size_t applied{};
+    fields([&](std::string_view name, auto Struct::*field) {
+        if (const auto value = overrides->find(name); value != overrides->end()) {
+            value->get_to(target.*field);
+            ++applied;
+        }
+    });
+    if (applied != overrides->size())
+        throw std::runtime_error(fmt::format("Unknown {} field in the device profile", section));
+}
+
 Shader::HostTranslateInfo OfflineHost() {
+    using H = Shader::HostTranslateInfo;
     Shader::HostTranslateInfo host{};
     host.support_float64 = true;
     host.support_float16 = true;
@@ -558,11 +579,43 @@ Shader::HostTranslateInfo OfflineHost() {
     host.support_viewport_index_layer = true;
     host.support_geometry_shader_passthrough = true;
     host.support_handle_table_arrays = true;
+    ApplyDeviceFields("host", host, [](auto field) {
+        field("min_ssbo_alignment", &H::min_ssbo_alignment);
+        field("max_per_stage_descriptor_sampled_images",
+              &H::max_per_stage_descriptor_sampled_images);
+        field("max_per_stage_resources", &H::max_per_stage_resources);
+        field("max_per_stage_descriptor_storage_buffers",
+              &H::max_per_stage_descriptor_storage_buffers);
+        field("max_per_stage_descriptor_samplers", &H::max_per_stage_descriptor_samplers);
+        field("max_descriptor_set_samplers", &H::max_descriptor_set_samplers);
+        field("max_descriptor_set_uniform_buffers", &H::max_descriptor_set_uniform_buffers);
+        field("max_descriptor_set_uniform_buffers_dynamic",
+              &H::max_descriptor_set_uniform_buffers_dynamic);
+        field("max_descriptor_set_storage_buffers", &H::max_descriptor_set_storage_buffers);
+        field("max_descriptor_set_storage_buffers_dynamic",
+              &H::max_descriptor_set_storage_buffers_dynamic);
+        field("max_descriptor_set_sampled_images", &H::max_descriptor_set_sampled_images);
+        field("max_descriptor_set_storage_images", &H::max_descriptor_set_storage_images);
+        field("max_descriptor_set_input_attachements", &H::max_descriptor_set_input_attachements);
+        field("support_float64", &H::support_float64);
+        field("support_float16", &H::support_float16);
+        field("support_int64", &H::support_int64);
+        field("needs_demote_reorder", &H::needs_demote_reorder);
+        field("support_snorm_render_buffer", &H::support_snorm_render_buffer);
+        field("support_viewport_index_layer", &H::support_viewport_index_layer);
+        field("support_viewport_mask", &H::support_viewport_mask);
+        field("support_geometry_shader_passthrough", &H::support_geometry_shader_passthrough);
+        field("support_conditional_barrier", &H::support_conditional_barrier);
+        field("single_lane_geometry_subgroups", &H::single_lane_geometry_subgroups);
+        field("support_byte_addressed_r16", &H::support_byte_addressed_r16);
+        field("support_handle_table_arrays", &H::support_handle_table_arrays);
+    });
     host.ApplyDescriptorLimitPolicy();
     return host;
 }
 
 Shader::Profile OfflineProfile(const Shader::HostTranslateInfo& host) {
+    using P = Shader::Profile;
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010400;
     profile.unified_descriptor_binding = true;
@@ -581,6 +634,65 @@ Shader::Profile OfflineProfile(const Shader::HostTranslateInfo& host) {
     profile.support_typeless_image_loads = true;
     // Handle table arrays are indexed per invocation, as with Vulkan.
     profile.support_sampled_image_array_nonuniform_indexing = true;
+    ApplyDeviceFields("profile", profile, [](auto field) {
+        field("supported_spirv", &P::supported_spirv);
+        field("support_descriptor_aliasing", &P::support_descriptor_aliasing);
+        field("support_int8", &P::support_int8);
+        field("support_uniform_and_storage_buffer_8bit",
+              &P::support_uniform_and_storage_buffer_8bit);
+        field("support_storage_buffer_8bit", &P::support_storage_buffer_8bit);
+        field("support_int16", &P::support_int16);
+        field("support_uniform_and_storage_buffer_16bit",
+              &P::support_uniform_and_storage_buffer_16bit);
+        field("support_storage_buffer_16bit", &P::support_storage_buffer_16bit);
+        field("support_int64", &P::support_int64);
+        field("support_float_controls", &P::support_float_controls);
+        field("support_separate_denorm_behavior", &P::support_separate_denorm_behavior);
+        field("support_separate_rounding_mode", &P::support_separate_rounding_mode);
+        field("support_fp16_denorm_preserve", &P::support_fp16_denorm_preserve);
+        field("support_fp32_denorm_preserve", &P::support_fp32_denorm_preserve);
+        field("support_fp16_denorm_flush", &P::support_fp16_denorm_flush);
+        field("support_fp32_denorm_flush", &P::support_fp32_denorm_flush);
+        field("support_fp16_signed_zero_nan_preserve", &P::support_fp16_signed_zero_nan_preserve);
+        field("support_fp32_signed_zero_nan_preserve", &P::support_fp32_signed_zero_nan_preserve);
+        field("support_fp64_signed_zero_nan_preserve", &P::support_fp64_signed_zero_nan_preserve);
+        field("support_explicit_workgroup_layout", &P::support_explicit_workgroup_layout);
+        field("support_workgroup_layout_8bit_access", &P::support_workgroup_layout_8bit_access);
+        field("support_workgroup_layout_16bit_access", &P::support_workgroup_layout_16bit_access);
+        field("support_shader_quad_control", &P::support_shader_quad_control);
+        field("support_quad_shuffles", &P::support_quad_shuffles);
+        field("support_vote", &P::support_vote);
+        field("support_shuffle_relative", &P::support_shuffle_relative);
+        field("supported_subgroup_stages", &P::supported_subgroup_stages);
+        field("support_viewport_index_layer_non_geometry",
+              &P::support_viewport_index_layer_non_geometry);
+        field("support_viewport_mask", &P::support_viewport_mask);
+        field("support_typeless_image_loads", &P::support_typeless_image_loads);
+        field("support_demote_to_helper_invocation", &P::support_demote_to_helper_invocation);
+        field("support_int64_atomics", &P::support_int64_atomics);
+        field("support_shared_int64_atomics", &P::support_shared_int64_atomics);
+        field("support_derivative_control", &P::support_derivative_control);
+        field("support_geometry_shader_passthrough", &P::support_geometry_shader_passthrough);
+        field("support_native_ndc", &P::support_native_ndc);
+        field("support_scaled_attributes", &P::support_scaled_attributes);
+        field("support_multi_viewport", &P::support_multi_viewport);
+        field("support_geometry_streams", &P::support_geometry_streams);
+        field("support_sampled_image_array_nonuniform_indexing",
+              &P::support_sampled_image_array_nonuniform_indexing);
+        field("support_storage_image_array_nonuniform_indexing",
+              &P::support_storage_image_array_nonuniform_indexing);
+        field("support_uniform_texel_buffer_array_nonuniform_indexing",
+              &P::support_uniform_texel_buffer_array_nonuniform_indexing);
+        field("support_storage_texel_buffer_array_nonuniform_indexing",
+              &P::support_storage_texel_buffer_array_nonuniform_indexing);
+        field("warp_size_potentially_larger_than_guest",
+              &P::warp_size_potentially_larger_than_guest);
+        field("need_gather_subpixel_offset", &P::need_gather_subpixel_offset);
+        field("has_broken_spirv_fragment_shuffle", &P::has_broken_spirv_fragment_shuffle);
+        field("max_compute_shared_memory_size", &P::max_compute_shared_memory_size);
+        field("max_subgroup_size", &P::max_subgroup_size);
+        field("max_user_clip_distances", &P::max_user_clip_distances);
+    });
     return profile;
 }
 
@@ -1179,6 +1291,7 @@ int main(int argc, char** argv) {
                              "(--output SPV | --lower-only WORDS | --packed-code WORDS)\n"
                              "shader-sweep --pipeline RECORD --cache-version 46..54 "
                              "--output-dir DIR [--path legacy|v2]\n"
+                             "  [--device-profile JSON] (any mode but --list)\n"
                              "shader-sweep --list CACHE --output-dir DIR [--path legacy|v2] "
                              "[--programs-log V2LOG]\n";
                 return 0;
@@ -1212,6 +1325,13 @@ int main(int argc, char** argv) {
                 list = value;
             else if (arg == "--programs-log")
                 programs_log = value;
+            else if (arg == "--device-profile") {
+                std::ifstream file{value};
+                if (!file)
+                    throw std::runtime_error("Cannot open " + value);
+                device_profile = Json::parse(file);
+                OfflineProfile(OfflineHost());
+            }
             else if (arg == "--path") {
 #ifdef SHADER_SWEEP_V2
                 if (value == "v2") {
@@ -1412,8 +1532,11 @@ int main(int argc, char** argv) {
         const auto key = pipeline_key.empty() ? std::vector<u8>{} : ReadFile(pipeline_key);
         auto runtime = Runtime(key, env.ShaderStage(), diagnostic["assumptions"]);
         diagnostic["assumptions"].push_back(
-            "Offline SPIR-V 1.4 profile; no device feature probing, default shader settings, no "
-            "resolution scaling");
+            device_profile.empty()
+                ? "Offline SPIR-V 1.4 profile; no device feature probing, default shader settings, "
+                  "no resolution scaling"
+                : "Device profile from --device-profile; default shader settings, no resolution "
+                  "scaling");
         diagnostic["phase"] = "translate";
         Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
         Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{env.EntryPoint()}};

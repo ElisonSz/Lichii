@@ -5,11 +5,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <random>
-#include <deque>
-#include <map>
 #include <set>
 #include <thread>
 #include <utility>
@@ -20,6 +20,8 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/nx2_backx.h"
+
+// Ported from jpkto/Lichii 7a5e5357cb (src/tests/video_core/nx2_backx.cpp).
 
 namespace {
 
@@ -142,6 +144,7 @@ TEST_CASE("BackX tick: bounded usage resets answer as the base's full resets",
           "[video_core][nx2_backx]") {
     // The same operations on two trackers, one with EDEN_NX2_BACKX_TICK (and its verify): every
     // IsUsed answer and every word match, and verify finds no word outside the tracked extent.
+    // Bounded resets are always on now (nx2): the base's full reset is a fresh tracker.
     const SwitchScope verify{BackX::g_verify, true};
     const u64 mismatches = Counted(BackX::Counter::Mismatches);
     for (u64 seed = 1; seed <= 40; ++seed) {
@@ -172,10 +175,7 @@ TEST_CASE("BackX tick: bounded usage resets answer as the base's full resets",
                     bounded.Track(offset, size);
                 }
             } else if (op < 9) {
-                {
-                    const SwitchScope tick{BackX::g_tick, false};
-                    base.Reset();
-                }
+                base = VideoCommon::UsageTracker{buffer_size};
                 {
                     const SwitchScope tick{BackX::g_tick, true};
                     bounded.Reset();
@@ -349,9 +349,10 @@ TEST_CASE("BackX gather: a manager shows a collected write until it is gathered"
 
 TEST_CASE("BackX gather: a write crossing a 2 KiB granule leaves the write before it pending",
           "[core][nx2_backx]") {
-    // BuildTransform gives a write crossing the manager's 2 KiB granule an empty mask (an
-    // out-of-range shift). Its push moves the transform before it to back_buffer and leaves an
+    // BuildTransform gave a write crossing the manager's 2 KiB granule an empty mask (an
+    // out-of-range shift). Its push moved the transform before it to back_buffer and left an
     // empty `current`: a check of `current` alone missed that write (round 1's verify mismatches).
+    // Collect now takes such a write a granule at a time, so `current` keeps bits.
     struct Write {
         PAddr address;
         size_t size;
@@ -369,6 +370,35 @@ TEST_CASE("BackX gather: a write crossing a 2 KiB granule leaves the write befor
         };
         manager.Gather(callback);
         REQUIRE(gathered.contains(0x20000 >> 6));
+        REQUIRE_FALSE(manager.MayHavePending());
+    }
+}
+
+TEST_CASE("BackX gather: a write crossing a 2 KiB page is collected whole and shows",
+          "[core][nx2_backx]") {
+    // A transform covers 2 KiB in 64-byte bits. A write past its page's 32 bits must still show
+    // (MayHavePending) and be gathered to its last byte.
+    Core::GPUDirtyMemoryManager manager;
+    std::vector<std::pair<PAddr, size_t>> gathered;
+    std::function<void(PAddr, size_t)> callback = [&](PAddr address, size_t size) {
+        gathered.emplace_back(address, size);
+    };
+    for (const auto& [offset, size] :
+         {std::pair<u64, u64>{600, 1960}, {0, 4096}, {1000, 3000}, {2047, 2}, {64, 2048}}) {
+        CAPTURE(offset, size);
+        manager.Collect(0x7000, 0x40); // Something already collected on another page
+        manager.Collect(0x10000 + offset, size);
+        REQUIRE(manager.MayHavePending());
+        gathered.clear();
+        manager.Gather(callback);
+        std::set<u64> blocks;
+        for (const auto& [address, length] : gathered) {
+            AddBlocks(blocks, address, length);
+        }
+        for (u64 block = (0x10000 + offset) >> 6; block <= (0x10000 + offset + size - 1) >> 6;
+             ++block) {
+            REQUIRE(blocks.contains(block));
+        }
         REQUIRE_FALSE(manager.MayHavePending());
     }
 }
@@ -392,16 +422,36 @@ TEST_CASE("BackX gather: collect epochs count each Collect twice with verify on"
     REQUIRE(manager.CollectEpoch() == 8);
 }
 
+TEST_CASE("BackX gather: Collects counts the collects that add bits", "[core][nx2_backx]") {
+    // The verify tells a race from a miss by this count, so it must move for every collect a
+    // gather can find (a page split counting each page) and only when counting is on.
+    Core::GPUDirtyMemoryManager manager;
+    manager.Collect(0x10000, 0x40);
+    REQUIRE(manager.Collects() == 0);
+    Core::GPUDirtyMemoryManager::count_collects = true;
+    manager.Collect(0x10000, 0x40);
+    REQUIRE(manager.Collects() == 0);
+    manager.Collect(0x10040, 0x40);
+    REQUIRE(manager.Collects() == 1);
+    manager.Collect(0x7000, 0x40);
+    REQUIRE(manager.Collects() == 2);
+    manager.Collect(0x107c0, 0x80);
+    REQUIRE(manager.Collects() == 4);
+    Core::GPUDirtyMemoryManager::count_collects = false;
+}
+
 TEST_CASE("BackX gather: gathering only when a manager shows a write loses none",
           "[core][nx2_backx]") {
     // One collecting thread per manager, as each guest core has its own; the GPU thread gathers
     // only when MayHavePending says so, at the same time. Some writes cross a 2 KiB granule. What
     // the base would gather of each write is what a second manager, gathered after every write,
-    // returns for it (crossing writes lose bytes there too: BuildTransform).
+    // returns for it; now that Collect takes a crossing write a granule at a time (nx2), that is
+    // every byte of every write (`collected`).
     for (u64 seed = 1; seed <= 8; ++seed) {
         Core::GPUDirtyMemoryManager manager;
         Core::GPUDirtyMemoryManager shadow;
         std::set<u64> expected;
+        std::set<u64> collected;
         std::set<u64> gathered;
         std::atomic<bool> done{false};
         u64 checks = 0;
@@ -420,6 +470,7 @@ TEST_CASE("BackX gather: gathering only when a manager shows a write loses none"
                 const u64 address = 0x100000 + page * 2048 + offset;
                 crossing += offset + size > 2048 ? 1 : 0;
                 manager.Collect(address, size);
+                AddBlocks(collected, address, size);
                 shadow.Collect(address, size);
                 shadow.Gather(shadow_callback);
             }
@@ -446,6 +497,7 @@ TEST_CASE("BackX gather: gathering only when a manager shows a write loses none"
         manager.Gather(callback);
         REQUIRE(gathered.size() == before);
         REQUIRE(std::ranges::includes(gathered, expected));
+        REQUIRE(std::ranges::includes(gathered, collected));
         REQUIRE(crossing > 0);
         REQUIRE(checks > 0);
     }
@@ -506,8 +558,9 @@ TEST_CASE("BackX gather: the verify classification finds no write the check miss
 
 TEST_CASE("BackX collect split: every byte of a write crossing 2 KiB granules is collected",
           "[core][nx2_backx]") {
-    // Without the switch the base loses such writes (BuildTransform); with it each granule gets
-    // its own transform. Each write is collected alone and gathered: exactly its 64-byte blocks.
+    // The base lost such writes (BuildTransform); Collect now gives each granule its own transform
+    // (the switch's split, always on since nx2's fix). Each write is collected alone and gathered:
+    // exactly its 64-byte blocks.
     const SwitchScope split{BackX::g_collect_split, true};
     std::mt19937_64 rng{11};
     u64 crossing = 0;
@@ -575,6 +628,27 @@ TEST_CASE("BackX verify: mismatches are counted per check", "[video_core][nx2_ba
     REQUIRE(BackX::Mismatches(BackX::Check::Gather) - gather == 100);
     REQUIRE(BackX::Mismatches(BackX::Check::Report) - report == 1);
     REQUIRE(Counted(BackX::Counter::Mismatches) - total == 101);
+}
+
+TEST_CASE("BackX verify: nx2's mismatches count as Other, its skipped gathers' misses as Gather",
+          "[video_core][nx2_backx]") {
+    const SwitchScope stats{BackX::g_stats, true};
+    const u64 other = BackX::Mismatches(BackX::Check::Other);
+    const u64 gather = BackX::Mismatches(BackX::Check::Gather);
+    const u64 total = Counted(BackX::Counter::Mismatches);
+    const u64 races = Counted(BackX::Counter::GatherRaces);
+    BackX::Mismatch("test", 0x2000, 8);
+    REQUIRE(BackX::Mismatches(BackX::Check::Other) - other == 1);
+    // A skip whose gather found nothing, or writes collected after its check, missed nothing.
+    BackX::SkippedGather(false, false, {});
+    BackX::SkippedGather(false, true, {});
+    BackX::SkippedGather(true, true, {0x3000, 0x40});
+    REQUIRE(BackX::Mismatches(BackX::Check::Gather) == gather);
+    REQUIRE(Counted(BackX::Counter::GatherRaces) - races == 1);
+    BackX::SkippedGather(true, false, {0x3000, 0x40});
+    REQUIRE(BackX::Mismatches(BackX::Check::Gather) - gather == 1);
+    REQUIRE(Counted(BackX::Counter::Mismatches) - total == 2);
+    REQUIRE(Counted(BackX::Counter::GatherRaces) - races == 1);
 }
 
 TEST_CASE("BackX ops: a recycled list comes back empty with the storage it grew to",
