@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <thread>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -74,18 +75,51 @@ void TrackSemaphoreView(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
 // Reads a semaphore word as a GPU acquire sees it in memory: a mirrored release the guest memory
 // does not hold counts (Nx2MirrorShadow). Without a flush: the buffer cache may hold the word
 // newer where the GPU wrote its page (ReadSemaphoreWord, AskView).
-// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: the front reads a word as settled while a landing converted in
-// a landing window is still to reach it (it noted the write fenced: the view should not read it).
-void NoteLandingRead(DAddr device, GPUVAddr address, const char* what) {
+// EDEN_NX2_RUNAHEAD_LANDINGS: the view reads a word as settled (the back ran every writer it waits
+// for) while a landing converted in a landing window has yet to reach it: the maximum or reduction
+// of a QMD signal the front could not value, which it never noted at the word. On a word the
+// acquire waits to reach, the older value decides as the baseline's read before that writer ran
+// would (the word only grows: what meets it now meets it later). On another word the acquire waits
+// for the landing, which latches it (not met). Returns whether the read may decide.
+bool SettledReadDecides(DAddr device, GPUVAddr address, bool advances) {
     if (!VideoCommon::GpuSplit::Get().LandingPendingAt(device)) {
+        return true;
+    }
+    auto& counts = VideoCommon::RunAhead::landing_counts;
+    (advances ? counts.advancing_reads : counts.held_reads).fetch_add(1, std::memory_order_relaxed);
+    if (!advances && VideoCommon::RunAhead::landings_verify) {
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(HW_GPU,
+                     "Run-ahead landings: semaphore {:#x} (device {:#x}) waits for a converted "
+                     "landing before memory decides",
+                     address, device);
+        }
+    }
+    return advances;
+}
+
+// EDEN_NX2_RUNAHEAD_LANDINGS: a read after a drain, which the baseline makes once every landing
+// sent before reached memory: converted landings to the word may still wait for their fence.
+void WaitLandingsAt(DAddr device, GPUVAddr address) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.LandingPendingAt(device)) {
         return;
     }
-    VideoCommon::RunAhead::landing_counts.early_reads.fetch_add(1, std::memory_order_relaxed);
-    if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        LOG_WARNING(HW_GPU,
-                    "Run-ahead landings verify: {} of semaphore {:#x} (device {:#x}) while a "
-                    "converted landing to it is pending",
-                    what, address, device);
+    VideoCommon::RunAhead::landing_counts.drain_waits.fetch_add(1, std::memory_order_relaxed);
+    const auto start = std::chrono::steady_clock::now();
+    while (split.LandingPendingAt(device)) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds{100}) {
+            VideoCommon::RunAhead::landing_counts.early_reads.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+            if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 8) {
+                LOG_WARNING(HW_GPU,
+                            "Run-ahead landings: a read of semaphore {:#x} (device {:#x}) after a "
+                            "drain waited 100 ms for a converted landing to it",
+                            address, device);
+            }
+            return;
+        }
+        std::this_thread::yield();
     }
 }
 
@@ -137,8 +171,8 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
                      before, dma_pusher.memory_manager.Read<u32>(address));
         }
     }
-    if (device && VideoCommon::RunAhead::landings_verify) [[unlikely]] {
-        NoteLandingRead(*device, address, "a read after a drain");
+    if (device && VideoCommon::RunAhead::landings) [[unlikely]] {
+        WaitLandingsAt(*device, address);
     }
     const u32 value = ReadSemaphoreMemory(dma_pusher, address, device);
     if (WatchSemaphore(address)) {
@@ -258,9 +292,14 @@ using ViewAnswer = VideoCommon::GpuSplit::SemaphoreView;
 ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, DAddr device) {
     using Kind = ViewAnswer::Kind;
     TrackSemaphoreView(dma_pusher, acquire.address, device);
+    // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
+    // KeplerCompute::ProcessNativeMethod). A word the mirror diverts (Nx2MirrorShadow) can
+    // instead fall behind when a direct release replaces the mirrored counter.
+    const bool advances = acquire.WaitsToReach() && !Nx2MirrorShadow::Get().Diverts(device);
     const auto memory = [&](bool fenced) -> std::optional<u32> {
-        if (!fenced && VideoCommon::RunAhead::landings_verify) [[unlikely]] {
-            NoteLandingRead(device, acquire.address, "a settled read");
+        if (!fenced && VideoCommon::RunAhead::landings &&
+            !SettledReadDecides(device, acquire.address, advances)) [[unlikely]] {
+            return std::nullopt;
         }
         bool shadow_used = false;
         const u32 value = ReadSemaphoreMemory(dma_pusher, acquire.address, device, &shadow_used);
@@ -271,10 +310,6 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
         }
         return value;
     };
-    // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
-    // KeplerCompute::ProcessNativeMethod). A word the mirror diverts (Nx2MirrorShadow) can
-    // instead fall behind when a direct release replaces the mirrored counter.
-    const bool advances = acquire.WaitsToReach() && !Nx2MirrorShadow::Get().Diverts(device);
     if (Nx2MayBeGpuWritten(device, sizeof(u32)) &&
         dma_pusher.rasterizer->MustFlushRegion(device, sizeof(u32),
                                                VideoCommon::CacheType::BufferCache)) {
@@ -491,9 +526,15 @@ void SweepW1Checks(bool all) {
 }
 
 void StartW1Check(const Puller::PendingAcquire& acquire, u64 device, u64 position, u32 payload,
-                  const void* waiter) {
+                  const void* waiter, bool met) {
     auto& waiters = Nx2SemaphoreWaiters::Get();
     auto& counts = VideoCommon::RunAhead::counters;
+    if (met) {
+        // Memory meets it already: the release landed before any waiter could see it (its entry
+        // had not completed), as the baseline's read after the landing would find.
+        ++counts.w1_confirmed;
+        return;
+    }
     const auto free = std::ranges::find(g_w1_checks, false, &W1Check::live);
     if (free == g_w1_checks.end() ||
         !waiters.Add(&*free, device, acquire.value, acquire.operation)) {
@@ -558,7 +599,8 @@ void SweepLandingChecks() {
     }
 }
 
-u64 StartLandingCheck(const Puller::PendingAcquire& acquire, u64 device, const void* waiter) {
+u64 StartLandingCheck(const Puller::PendingAcquire& acquire, u64 device, const void* waiter,
+                      bool met) {
     auto& waiters = Nx2SemaphoreWaiters::Get();
     auto& checks = VideoCommon::RunAhead::landing_checks;
     const size_t slot = g_landing_slot++ % checks.size();
@@ -571,6 +613,9 @@ u64 StartLandingCheck(const Puller::PendingAcquire& acquire, u64 device, const v
     // A new generation before the latch is cleared: a reader that sees it cleared sees the
     // generation move as well (CheckConvertedLanding).
     const u32 generation = check.generation.load(std::memory_order_relaxed) + 1;
+    check.device = device;
+    check.value = acquire.value;
+    check.operation = acquire.operation;
     check.generation.store(generation, std::memory_order_release);
     check.latched.store(false, std::memory_order_release);
     if (!waiters.Add(&check, device, acquire.value, acquire.operation)) {
@@ -578,8 +623,9 @@ u64 StartLandingCheck(const Puller::PendingAcquire& acquire, u64 device, const v
         return 0;
     }
     check.registered = true;
-    // A release that landed before the check's waiter was added latched the acquire's own.
-    if (waiters.Latched(waiter)) {
+    // A release that landed before the check's waiter was added latched the acquire's own, or,
+    // landed before the acquire's waiter was added too (its entry not complete yet), is in memory.
+    if (met || waiters.Latched(waiter)) {
         check.latched.store(true, std::memory_order_release);
     }
     return VideoCommon::RunAhead::PackLandingCheck(slot, generation);
@@ -603,7 +649,11 @@ void HoldForW1(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64
     }
     if (VideoCommon::RunAhead::landings) {
         const u64 check =
-            VideoCommon::RunAhead::landings_verify ? StartLandingCheck(acquire, device, waiter) : 0;
+            VideoCommon::RunAhead::landings_verify
+                ? StartLandingCheck(
+                      acquire, device, waiter,
+                      acquire.Matches(ReadSemaphoreMemory(dma_pusher, acquire.address, device)))
+                : 0;
         split.OpenLandingWindow(*entry, check, dma_pusher.rasterizer);
         return;
     }
@@ -881,7 +931,9 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
                 // EDEN_NX2_RUNAHEAD_W1: a fenced release sent since (another channel's) meets it.
                 if (const auto queued = W1Release(split, acquire, device, answer, false)) {
                     if (VideoCommon::RunAhead::w1_verify) {
-                        StartW1Check(acquire, device, queued->position, queued->payload, this);
+                        StartW1Check(acquire, device, queued->position, queued->payload, this,
+                                     acquire.Matches(
+                                         ReadSemaphoreMemory(dma_pusher, acquire.address, device)));
                     }
                     HoldForW1(dma_pusher, acquire, device, this);
                     split.NoteSync();
@@ -1319,7 +1371,9 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
         // reads after an acquire on it.
         if (const auto queued = W1Release(split, acquire, *device, answer, true)) {
             if (RunAhead::w1_verify) {
-                StartW1Check(acquire, *device, queued->position, queued->payload, this);
+                StartW1Check(
+                    acquire, *device, queued->position, queued->payload, this,
+                    acquire.Matches(ReadSemaphoreMemory(dma_pusher, acquire.address, *device)));
             }
             HoldForW1(dma_pusher, acquire, *device, this);
             waiters.Remove(this);

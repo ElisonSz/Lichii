@@ -174,7 +174,10 @@ public:
     /// line: once the back ran the entries before `position`, `bytes` are in guest memory from
     /// `address` of the address space `memory` (Memory::Id). Until then the front reads a QMD
     /// they cover from here, if the upload is the last write sent there (ReadDescriptor).
-    void NoteUpload(const void* memory, GPUVAddr address, std::span<const u8> bytes, u64 position) {
+    /// `prior`: the last write sent over the upload's granules before it (GpuSplit::
+    /// MemoryWritesTarget as it began), for EDEN_NX2_RUNAHEAD_QMD_PATCH.
+    void NoteUpload(const void* memory, GPUVAddr address, std::span<const u8> bytes, u64 position,
+                    u64 prior = ~u64{0}) {
         if (bytes.empty() || bytes.size() > MaxUploadBytes) {
             return;
         }
@@ -184,6 +187,7 @@ public:
         kept.address = address;
         kept.size = bytes.size();
         kept.position = position;
+        kept.prior = prior;
         std::memcpy(kept.bytes.data(), bytes.data(), bytes.size());
     }
 
@@ -587,8 +591,17 @@ private:
             // last writes to the rest ran, memory holds the rest as the back will find it: nothing
             // sent after the upload wrote anywhere in the QMD (it is the last write there), and
             // the exact placement tells the parts within a granule apart.
-            if (const KeptUpload* part =
-                    RunAhead::qmd ? PartUpload(split, memory.Id(), qmd_address, target) : nullptr;
+            if (RunAhead::qmd_patch &&
+                ReadPatched(split, memory, qmd_address, target, descriptor)) {
+                if (RunAhead::stats) {
+                    ++RunAhead::counters.upload_qmds;
+                    ++RunAhead::counters.upload_qmds_partial;
+                }
+                return std::nullopt;
+            }
+            if (const KeptUpload* part = RunAhead::qmd && !RunAhead::qmd_patch
+                                             ? PartUpload(split, memory.Id(), qmd_address, target)
+                                             : nullptr;
                 part != nullptr) {
                 const GPUVAddr qmd_end = qmd_address + sizeof(descriptor);
                 const GPUVAddr begin = (std::max)(part->address, qmd_address);
@@ -619,8 +632,51 @@ private:
         GPUVAddr address{};
         u64 size{};
         u64 position{};
+        u64 prior{}; ///< The last write over its granules before it (~0: unknown)
         std::array<u8, MaxUploadBytes> bytes{};
     };
+
+    /// EDEN_NX2_RUNAHEAD_QMD_PATCH: the QMD at `qmd_address`, whose last write (at `target`) is a
+    /// kept upload over part of it, as the back will find it: walking back from that upload through
+    /// the uploads that were each the last write over the QMD's granule before the next, until one
+    /// covers the whole QMD or the writes before the first ran (memory holds those), then those
+    /// uploads' words on top in the order sent. A QMD is one 256-byte granule (its address is the
+    /// register shifted by 8), so `prior` covers all of it.
+    template <typename Memory>
+    [[nodiscard]] bool ReadPatched(const GpuSplit& split, const Memory& memory,
+                                   GPUVAddr qmd_address, u64 target, Descriptor& descriptor) const {
+        const GPUVAddr qmd_end = qmd_address + sizeof(Descriptor);
+        std::array<const KeptUpload*, 8> chain{};
+        size_t count = 0;
+        bool covered = false;
+        for (u64 last = target; count < chain.size();) {
+            const KeptUpload* upload = PartUpload(split, memory.Id(), qmd_address, last);
+            if (upload == nullptr || upload->prior == ~u64{0}) {
+                return false;
+            }
+            chain[count++] = upload;
+            covered = upload->address <= qmd_address && upload->address + upload->size >= qmd_end;
+            if (covered || split.Ran(upload->prior)) {
+                break;
+            }
+            last = upload->prior;
+        }
+        if (count == 0 || !(covered || split.Ran(chain[count - 1]->prior))) {
+            return false;
+        }
+        if (!covered) {
+            memory.Read(qmd_address, descriptor.data(), sizeof(descriptor));
+        }
+        auto* const bytes = reinterpret_cast<u8*>(descriptor.data());
+        for (size_t i = count; i-- > 0;) {
+            const KeptUpload& upload = *chain[i];
+            const GPUVAddr begin = (std::max)(upload.address, qmd_address);
+            const GPUVAddr end = (std::min<GPUVAddr>)(upload.address + upload.size, qmd_end);
+            std::memcpy(bytes + (begin - qmd_address),
+                        upload.bytes.data() + (begin - upload.address), end - begin);
+        }
+        return true;
+    }
 
     /// EDEN_NX2_RUNAHEAD_STATS: whether the last write to the QMD at `qmd_address` (at `target`) is
     /// a kept upload that covers only part of it.
@@ -823,7 +879,9 @@ private:
     size_t inline_writes_count{};
     /// EDEN_NX2_RUNAHEAD: the last inline uploads sent (NoteUpload), oldest first from
     /// uploads_count on.
-    std::array<KeptUpload, 16> uploads{};
+    /// About as many uploads as the back runs behind the front (one patch per dispatch): the walk
+    /// back through a QMD's patches (ReadPatched) needs the older ones still here.
+    std::array<KeptUpload, 64> uploads{};
     size_t uploads_count{};
     /// TEST (EDEN_NX2_DRAIN_CHECK): see TakeChecks.
     std::vector<Nx2DrainCheck::QmdRelease> checks;

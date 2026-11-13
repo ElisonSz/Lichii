@@ -389,7 +389,7 @@ inline void ReportRunAhead() {
         "suspended ones passed at a poll {}, holds {} (the back waited {}, {:.2f} ms), verify "
         "confirmed {}, unconfirmed {}, unchecked {}; QMD reads placed exactly {} (read sooner "
         "{}); compute uploads {} (not one linear line {}, too long {}, with list placeholders "
-        "{}), QMDs last written by part of an upload {} (read with memory for the rest {})",
+        "{}), QMDs last written by part of an upload {} (read with the uploads over it {})",
         seconds, counts.valve_requests, counts.valve_drain_passes,
         static_cast<double>(counts.valve_wait_max_ns) / 1e6, counts.w1_candidates, counts.w1_passes,
         counts.w1_not_plain, counts.w1_unmet, counts.w1_unlatched, counts.w1_overwritten,
@@ -409,15 +409,17 @@ inline void ReportRunAhead() {
                  "(acknowledged {}), releases noted fenced {}; landings converted: reports {}, "
                  "fence operations {}, pending max {}; entries after a close with some pending "
                  "{}, fences made for them {}; writes over reports that waited {} ({:.2f} ms); "
-                 "verify ordered {}, out of order {}, unchecked {}, "
-                 "reads with one pending {}, windows without a check {}",
+                 "settled reads of a word with one pending: words that only grow {}, held until "
+                 "it landed {}; reads after a drain that waited for one {} (gave up {}); verify "
+                 "ordered {}, out of order {}, unchecked {}, windows without a check {}",
                  seconds, counts.windows_opened, counts.windows_extended, counts.windows_closed,
                  counts.windows_acked, counts.notes_fenced, take(landing.reports),
                  take(landing.operations), take(landing.pending_max), take(landing.extended),
                  take(landing.fences), take(landing.overwrite_waits),
-                 static_cast<double>(take(landing.overwrite_ns)) / 1e6, take(landing.ordered),
-                 take(landing.out_of_order), take(landing.unchecked), take(landing.early_reads),
-                 counts.checks_unregistered);
+                 static_cast<double>(take(landing.overwrite_ns)) / 1e6,
+                 take(landing.advancing_reads), take(landing.held_reads), take(landing.drain_waits),
+                 take(landing.early_reads), take(landing.ordered), take(landing.out_of_order),
+                 take(landing.unchecked), counts.checks_unregistered);
     }
     const double lead_avg = counts.acquires == 0 ? 0.0
                                                  : static_cast<double>(counts.lead_sum) /

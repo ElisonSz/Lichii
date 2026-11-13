@@ -47,9 +47,18 @@
 namespace Tegra::Engines {
 
 namespace {
-// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: the word a converted landing writes (0 unless verifying).
+// EDEN_NX2_RUNAHEAD_LANDINGS: the word a converted landing writes (the view holds settled reads
+// of it until it landed).
 [[nodiscard]] u64 LandingDevice(MemoryManager& memory, GPUVAddr address) {
-    return VideoCommon::RunAhead::landings_verify ? memory.GpuToCpuAddress(address).value_or(0) : 0;
+    return VideoCommon::RunAhead::landings ? memory.GpuToCpuAddress(address).value_or(0) : 0;
+}
+
+// EDEN_NX2_RUNAHEAD_LANDINGS with EDEN_NX2_DRAIN_CHECK: a QMD release the fence manager is about to
+// make a fence operation lands off the back, where the check does not look: record it now with the
+// value it would write now (the baseline writes it now), as the check compares the front's notes.
+[[nodiscard]] bool RecordsConvertedRelease() {
+    return VideoCommon::Nx2DrainCheck::g_enabled && VideoCommon::RunAhead::landings &&
+           VideoCommon::GpuSplit::Get().ConvertsLandings();
 }
 } // Anonymous namespace
 
@@ -466,6 +475,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // (FenceManager::SignalFence).
                     const VideoCommon::RunAhead::LandingScope landing_scope{
                         LandingDevice(memory_manager, address)};
+                    if (RecordsConvertedRelease()) [[unlikely]] {
+                        checked(0, ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
+                                                   memory_manager.Read<u32>(address), payload));
+                    }
                     rasterizer->SignalFence([this, address, payload, flags, checked,
                                              recorder_device, recorder_entry] {
                         const auto combine = [&](u32 current) {
@@ -525,6 +538,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // (FenceManager::SignalFence).
                     const VideoCommon::RunAhead::LandingScope landing_scope{
                         LandingDevice(memory_manager, address)};
+                    if (RecordsConvertedRelease()) [[unlikely]] {
+                        checked(0, (std::max)(memory_manager.Read<u32>(address), payload));
+                    }
                     rasterizer->SignalFence([this, address, payload, checked, recorder_device,
                                              recorder_entry] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
@@ -1866,6 +1882,8 @@ struct KeplerCompute::FrontState {
     /// (`upload_kept`: native, linear, one line, short, no list placeholders).
     std::vector<u32> upload_words;
     bool upload_kept{};
+    /// EDEN_NX2_RUNAHEAD_QMD_PATCH: the last write over the upload's granules before it began.
+    u64 upload_prior{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -2096,6 +2114,12 @@ void KeplerCompute::FrontKeepUpload(VideoCommon::GpuSplit& split, FrontState& fs
         const bool sized =
             fs.upload.size != 0 && fs.upload.size <= VideoCommon::FrontQmdView::MaxUploadBytes;
         fs.upload_kept = layout && sized;
+        if (fs.upload_kept) {
+            const GPUVAddr start =
+                (GPUVAddr{fs.registers[Nx2ListIndirect::UploadAddressHigh]} << 32) |
+                fs.registers[Nx2ListIndirect::UploadAddressLow];
+            fs.upload_prior = split.MemoryWritesTarget(memory_manager, start, fs.upload.size);
+        }
         if (counting) {
             ++counts.uploads;
             counts.upload_rejects[0] += layout ? 0 : 1;
@@ -2122,7 +2146,7 @@ void KeplerCompute::FrontKeepUpload(VideoCommon::GpuSplit& split, FrontState& fs
         &memory_manager, address,
         std::span<const u8>{reinterpret_cast<const u8*>(fs.upload_words.data()),
                             static_cast<size_t>(size)},
-        split.Position());
+        split.Position(), fs.upload_prior);
     fs.upload_kept = false;
 }
 

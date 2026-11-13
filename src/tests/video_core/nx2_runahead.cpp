@@ -1079,3 +1079,24 @@ TEST_CASE("Run-ahead landings: a write over reports waits for the window and its
     CHECK(RunAhead::landing_counts.overwrite_waits.load() == 1);
     Access::StopRing(*f.split);
 }
+
+TEST_CASE("Run-ahead landings: the words of converted landings are known while they are pending",
+          "[video_core][runahead]") {
+    Fixture f;
+    LandingsScope on;
+    const bool verify_was = RunAhead::landings_verify;
+    RunAhead::landings_verify = false; // The view holds reads by them without the verify too
+    CHECK_FALSE(f.split->LandingPendingAt(Fixture::Word));
+    auto first = f.split->ConvertedLanding(Fixture::Word + 2, true); // Its word
+    auto second = f.split->ConvertedLanding(Fixture::Word, false);
+    auto wordless = f.split->ConvertedLanding(0, false); // A syncpoint increment
+    CHECK(f.split->LandingPendingAt(Fixture::Word));
+    CHECK_FALSE(f.split->LandingPendingAt(Fixture::Word + 4));
+    first.reset();
+    CHECK(f.split->LandingPendingAt(Fixture::Word)); // The second still is
+    second.reset();
+    CHECK_FALSE(f.split->LandingPendingAt(Fixture::Word));
+    wordless.reset();
+    CHECK_FALSE(f.split->LandingPendingAt(0));
+    RunAhead::landings_verify = verify_was;
+}

@@ -68,6 +68,11 @@ inline bool landings_verify{};
 /// EDEN_NX2_RUNAHEAD_QMD=1: the QMD view places the writes to the QMDs it reads by exact range from
 /// the run-ahead write log, not by hashed 256-byte granule (FrontQmdView::ReadDescriptor).
 inline bool qmd{};
+/// EDEN_NX2_RUNAHEAD_QMD_PATCH=1 (implies EDEN_NX2_RUNAHEAD): the QMD view reads a QMD whose last
+/// writes are queued inline uploads over part of it (games patch a few words of a QMD before each
+/// dispatch) from memory with those uploads' words on top, once every write sent there before the
+/// first of them ran (FrontQmdView::ReadDescriptor, KeptUpload::prior).
+inline bool qmd_patch{};
 
 [[nodiscard]] inline bool SwitchIs(const char* name, char value) {
     const char* const set = std::getenv(name);
@@ -77,8 +82,9 @@ inline bool qmd{};
 inline void ReadSwitch() {
     verify = SwitchIs("EDEN_NX2_RUNAHEAD_VERIFY", '1');
     qmd = SwitchIs("EDEN_NX2_RUNAHEAD_QMD", '1');
-    // The QMD view's exact targets come from the write log the reach keeps.
-    enabled = verify || qmd || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
+    qmd_patch = SwitchIs("EDEN_NX2_RUNAHEAD_QMD_PATCH", '1');
+    // The QMD view's exact targets come from the write log the reach keeps; kept uploads need it.
+    enabled = verify || qmd || qmd_patch || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
     valve_verify = SwitchIs("EDEN_NX2_RUNAHEAD_VALVE_VERIFY", '1');
     valve = valve_verify || SwitchIs("EDEN_NX2_RUNAHEAD_VALVE", '1');
     w1_verify = SwitchIs("EDEN_NX2_RUNAHEAD_W1_VERIFY", '1');
@@ -135,7 +141,7 @@ struct Counters {
     u64 shim_met{}; ///< Syncpoint shim acquires met without a drain
     u64 shim_drained{};
     u64 upload_qmds{}; ///< QMD descriptors read from a queued inline upload
-    u64 upload_qmds_partial{}; ///< ..._QMD: of those, the upload wrote part, memory the rest
+    u64 upload_qmds_partial{}; ///< ..._QMD(_PATCH): of those, uploads wrote part, memory the rest
     u64 unvalued{};    ///< QMD signals whose releases the front did not note when it sent them
     u64 lead_sum{};    ///< Ring words the back had yet to run at the acquires (the front's lead)
     u64 lead_max{};
@@ -196,7 +202,10 @@ struct LandingCounters {
     std::atomic<u64> ordered{};  ///< ..._VERIFY: applied after their window's release landed
     std::atomic<u64> out_of_order{};
     std::atomic<u64> unchecked{};       ///< ..._VERIFY: their window's check slot was reused
-    std::atomic<u64> early_reads{};     ///< ..._VERIFY: front reads of a word with one pending
+    std::atomic<u64> early_reads{};     ///< ..._VERIFY: settled reads, landing pending, other words
+    std::atomic<u64> advancing_reads{}; ///< Of the words acquires wait to reach: harmless
+    std::atomic<u64> held_reads{};      ///< LANDINGS: answered not met until the landing landed
+    std::atomic<u64> drain_waits{};     ///< LANDINGS: reads after a drain that waited for one
     std::atomic<u64> overwrite_waits{}; ///< Writes over reports waiting for the window to land
     std::atomic<u64> overwrite_ns{};
 };
@@ -206,6 +215,9 @@ inline LandingCounters landing_counts;
 /// waiter's owner is the slot). The front registers and retires it; anyone reads it.
 struct LandingCheck {
     std::atomic<u32> generation{};
+    u64 device{}; ///< The window's acquire (written before `generation`), for the log
+    u32 value{};
+    u32 operation{};
     std::atomic<bool> latched{}; ///< Seen latched by the front (set before it removed the waiter)
     bool registered{};           ///< Front only: the waiter is registered
 };

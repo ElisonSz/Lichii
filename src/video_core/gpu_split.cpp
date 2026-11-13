@@ -442,7 +442,8 @@ std::shared_ptr<void> GpuSplit::ConvertedLanding(u64 device, bool report) {
          pending > max &&
          !counts.pending_max.compare_exchange_weak(max, pending, std::memory_order_relaxed);) {
     }
-    const u64 word = RunAhead::landings_verify ? device & ~u64{3} : 0;
+    // Its word: the view holds settled reads of it until it landed (puller's SettledReadDecides).
+    const u64 word = device & ~u64{3};
     if (word != 0) {
         std::scoped_lock lock{landing_words_mutex};
         ++landing_words[word];
@@ -474,8 +475,9 @@ void GpuSplit::CheckConvertedLanding(const std::shared_ptr<void>& token) {
     if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 16) {
         LOG_ERROR(HW_GPU,
                   "Run-ahead landings verify: a converted landing (word {:#x}) was applied before "
-                  "its window's release landed (check slot {}, generation {})",
-                  landing->device, slot, generation);
+                  "its window's release landed (the window's acquire: device {:#x}, op {}, {:#x}; "
+                  "check slot {}, generation {})",
+                  landing->device, check.device, check.operation, check.value, slot, generation);
     }
 }
 
@@ -524,6 +526,9 @@ void GpuSplit::WaitBeforeOverwrite() {
 }
 
 bool GpuSplit::LandingPendingAt(u64 device) const {
+    if (landing_pending.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
     std::scoped_lock lock{landing_words_mutex};
     return landing_words.contains(device & ~u64{3});
 }
