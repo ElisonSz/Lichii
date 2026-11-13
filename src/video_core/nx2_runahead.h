@@ -39,8 +39,26 @@ namespace VideoCommon::RunAhead {
 inline bool enabled{};
 /// EDEN_NX2_RUNAHEAD_VERIFY=1 (with or without EDEN_NX2_RUNAHEAD=1, which it implies).
 inline bool verify{};
-/// EDEN_NX2_RUNAHEAD_STATS=1, or the verifier: counts and logs every 10 s.
+/// EDEN_NX2_RUNAHEAD_STATS=1, or a verifier: counts and logs every 10 s.
 inline bool stats{};
+/// EDEN_NX2_RUNAHEAD_VALVE=1: a suspended acquire's 1 ms valve has the back submit what its idle
+/// hook defers and send the fence work, without draining the split (Puller::PollWithoutDrain).
+inline bool valve{};
+/// EDEN_NX2_RUNAHEAD_VALVE_VERIFY=1 (implies the valve): drains as well (the baseline's valve), and
+/// counts the passes that drain found then; the valve alone finds them at a later poll (latch or
+/// view), unless only a drain makes the release land, which a hang would show (ReportLongWait).
+inline bool valve_verify{};
+/// EDEN_NX2_RUNAHEAD_W1=1: an acquire that a fence-flagged release already sent before it will meet
+/// once it lands (its waiter latches then) passes now, not once the host GPU ran the work before
+/// the release (Puller::AcquireWithoutDrain); the back runs what follows once the release landed
+/// (GpuSplit::HoldBackUntilLanded), so only the front's decoding goes on sooner.
+inline bool w1{};
+/// EDEN_NX2_RUNAHEAD_W1_VERIFY=1 (implies W1): each such pass keeps a waiter of its own that the
+/// release must latch.
+inline bool w1_verify{};
+/// EDEN_NX2_RUNAHEAD_QMD=1: the QMD view places the writes to the QMDs it reads by exact range from
+/// the run-ahead write log, not by hashed 256-byte granule (FrontQmdView::ReadDescriptor).
+inline bool qmd{};
 
 [[nodiscard]] inline bool SwitchIs(const char* name, char value) {
     const char* const set = std::getenv(name);
@@ -49,8 +67,15 @@ inline bool stats{};
 
 inline void ReadSwitch() {
     verify = SwitchIs("EDEN_NX2_RUNAHEAD_VERIFY", '1');
-    enabled = verify || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
-    stats = enabled && (verify || SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));
+    qmd = SwitchIs("EDEN_NX2_RUNAHEAD_QMD", '1');
+    // The QMD view's exact targets come from the write log the reach keeps.
+    enabled = verify || qmd || SwitchIs("EDEN_NX2_RUNAHEAD", '1');
+    valve_verify = SwitchIs("EDEN_NX2_RUNAHEAD_VALVE_VERIFY", '1');
+    valve = valve_verify || SwitchIs("EDEN_NX2_RUNAHEAD_VALVE", '1');
+    w1_verify = SwitchIs("EDEN_NX2_RUNAHEAD_W1_VERIFY", '1');
+    w1 = w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_W1", '1');
+    stats = (enabled || valve || w1) &&
+            (verify || valve_verify || w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));
 }
 
 /// What the reach of an acquire is (GpuSplit::RunAheadReach): the last kind of entry sent before
@@ -75,6 +100,16 @@ struct Answer {
     Reach reason;
 };
 
+/// EDEN_NX2_RUNAHEAD_W1: whether a fence-flagged release decides an acquire now
+/// (GpuSplit::W1Release), or why not.
+enum class W1 : u8 {
+    Pass,     ///< The release meets it and will latch its waiter as it lands
+    NotW1,    ///< The view's answer does not wait for a fence-flagged release
+    NotPlain, ///< The release is a reduction, a maximum, or a value the front can't tell
+    Unmet,    ///< Its payload does not meet the acquire
+    Unlatched ///< The acquire's waiter has no slot
+};
+
 /// The front's counts, logged every 10 s and cleared (ReportCounters; EDEN_NX2_RUNAHEAD_STATS).
 struct Counters {
     u64 acquires{}; ///< Acquires the view decided with a reach
@@ -92,6 +127,22 @@ struct Counters {
     u64 lead_max{};
     u64 valve_drains{}; ///< Polls' 1 ms valve drains (each runs the back dry, whatever the lead)
     u64 valve_ns{};
+    u64 valve_requests{};     ///< EDEN_NX2_RUNAHEAD_VALVE: valves that only asked for the submit
+    u64 valve_drain_passes{}; ///< ..._VERIFY: of those, passes only the drain found
+    u64 w1_candidates{};      ///< Acquires a fence-flagged release sent before them decides
+    u64 w1_passes{};          ///< EDEN_NX2_RUNAHEAD_W1: of those, passed at once
+    u64 w1_poll_passes{};     ///< Suspended acquires a fenced release sent since let go on
+    u64 w1_not_plain{};       ///< Not passed: the last release is a reduction, maximum, or unknown
+    u64 w1_unmet{};           ///< Not passed: its payload does not meet the acquire
+    u64 w1_unlatched{};       ///< Not passed: no waiter slot (the release could not latch it)
+    u64 w1_confirmed{};       ///< ..._VERIFY: passes whose own waiter a write latched
+    u64 w1_unconfirmed{};     ///< ..._VERIFY: passes no write latched within 250 ms
+    u64 w1_unchecked{};       ///< ..._VERIFY: passes with no check slot free
+    u64 w1_holds{};   ///< Passes whose release had not landed: the back waits for it (W1 hold)
+    u64 qmd_exact{};  ///< EDEN_NX2_RUNAHEAD_QMD: QMD reads with the exact placement
+    u64 qmd_sooner{}; ///< Of those: read now where the granules held them back
+    u64 uploads{};    ///< Compute inline uploads seen (exec)
+    std::array<u64, 5> upload_rejects{}; ///< Not kept: layout, size, placeholder, short, other
 };
 inline Counters counters;
 
@@ -105,5 +156,12 @@ struct VerifyCounters {
     std::atomic<u64> raced{};
 };
 inline VerifyCounters verified;
+
+/// EDEN_NX2_RUNAHEAD_W1: the back's waits in a W1 hold (GpuSplit::WaitLanded), cleared by the log.
+struct HoldCounters {
+    std::atomic<u64> waits{}; ///< Holds the back reached before their release landed
+    std::atomic<u64> wait_ns{};
+};
+inline HoldCounters holds;
 
 } // namespace VideoCommon::RunAhead

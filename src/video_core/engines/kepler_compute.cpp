@@ -1774,6 +1774,19 @@ struct FrontQmdMemory {
     }
     [[nodiscard]] u64 WritesTarget(const VideoCommon::GpuSplit& split, GPUVAddr address,
                                    u64 size) const {
+        if (VideoCommon::RunAhead::qmd) [[unlikely]] {
+            // EDEN_NX2_RUNAHEAD_QMD: the writes sent there by their exact ranges.
+            const u64 exact = split.ExactWritesTarget(memory, address, size);
+            if (VideoCommon::RunAhead::stats) {
+                auto& counts = VideoCommon::RunAhead::counters;
+                ++counts.qmd_exact;
+                if (split.Ran(exact) &&
+                    !split.Ran(split.MemoryWritesTarget(memory, address, size))) {
+                    ++counts.qmd_sooner;
+                }
+            }
+            return exact;
+        }
         return split.MemoryWritesTarget(memory, address, size);
     }
     void NoteWrite(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size) const {
@@ -2054,12 +2067,21 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
 // does not know: such an upload stays memory's, as do longer and other layouts.
 void KeplerCompute::FrontKeepUpload(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                     u32 argument, bool last_call) {
+    auto& counts = VideoCommon::RunAhead::counters;
+    const bool counting = VideoCommon::RunAhead::stats;
     if (method == Nx2ListIndirect::UploadExec) {
         fs.upload_words.clear();
         // FrontApply took the upload's size and layout (NoteUploadMethod) as ProcessExec does.
-        fs.upload_kept = native_mode && fs.upload.linear && fs.upload.size != 0 &&
-                         fs.upload.size <= VideoCommon::FrontQmdView::MaxUploadBytes &&
-                         fs.registers[Nx2ListIndirect::UploadLineCount] == 1;
+        const bool layout =
+            native_mode && fs.upload.linear && fs.registers[Nx2ListIndirect::UploadLineCount] == 1;
+        const bool sized =
+            fs.upload.size != 0 && fs.upload.size <= VideoCommon::FrontQmdView::MaxUploadBytes;
+        fs.upload_kept = layout && sized;
+        if (counting) {
+            ++counts.uploads;
+            counts.upload_rejects[0] += layout ? 0 : 1;
+            counts.upload_rejects[1] += layout && !sized ? 1 : 0;
+        }
         return;
     }
     if (method != Nx2ListIndirect::UploadData || !fs.upload_kept) {
@@ -2067,10 +2089,9 @@ void KeplerCompute::FrontKeepUpload(VideoCommon::GpuSplit& split, FrontState& fs
     }
     const u64 size = fs.upload.size;
     if (fs.upload_words.size() * sizeof(u32) < size) {
-        if (Nx2ListIndirect::IsPlaceholder(argument)) {
-            fs.upload_kept = false;
-            return;
-        }
+        // A list placeholder (Nx2ListIndirect) is written to guest memory as it is: the back's QMD
+        // reads find it there too (the owed words are patched into constant buffers only).
+        counts.upload_rejects[2] += counting && Nx2ListIndirect::IsPlaceholder(argument) ? 1 : 0;
         fs.upload_words.push_back(argument); // Words past the size: ProcessData drops them
     }
     if (!last_call || fs.upload_words.size() * sizeof(u32) < size) {

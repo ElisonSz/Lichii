@@ -168,7 +168,7 @@ public:
     }
 
     /// EDEN_NX2_RUNAHEAD: the longest inline upload the view keeps (NoteUpload).
-    static constexpr u64 MaxUploadBytes = 1024;
+    static constexpr u64 MaxUploadBytes = 2048;
 
     /// EDEN_NX2_RUNAHEAD: a compute engine's front sent all of an inline upload of one linear
     /// line: once the back ran the entries before `position`, `bytes` are in guest memory from
@@ -579,6 +579,9 @@ private:
                 }
                 return std::nullopt;
             }
+            if (RunAhead::stats && PartlyUploaded(memory.Id(), qmd_address, target)) {
+                ++RunAhead::counters.upload_rejects[3];
+            }
         }
         return Outcome{false, target, lost, qmd_address};
     }
@@ -591,6 +594,21 @@ private:
         u64 position{};
         std::array<u8, MaxUploadBytes> bytes{};
     };
+
+    /// EDEN_NX2_RUNAHEAD_STATS: whether the last write to the QMD at `qmd_address` (at `target`) is
+    /// a kept upload that covers only part of it.
+    [[nodiscard]] bool PartlyUploaded(const void* memory, GPUVAddr qmd_address, u64 target) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (kept.memory == memory && kept.position == target &&
+                kept.address < qmd_address + sizeof(Descriptor) &&
+                qmd_address < kept.address + kept.size) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// The newest kept upload of `memory` the back has not run yet that covers the QMD at
     /// `qmd_address`.

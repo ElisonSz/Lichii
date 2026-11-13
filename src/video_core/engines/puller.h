@@ -95,6 +95,8 @@ public:
         /// the drain this replaces.
         u64 sent_at{};
         bool fences_released{};
+        /// Its waiter has a slot: a release the back runs latches it (Nx2SemaphoreWaiters::Add).
+        bool registered{};
         // The scheduler already polled this acquire before resuming the channel.
         bool met{};
         bool stats_flushed{}; ///< EDEN_NX2_ACQUIRE_STATS: a cache flush was requested

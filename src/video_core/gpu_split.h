@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -443,6 +444,15 @@ public:
     /// and on a page GPU work wrote, `writers_before` itself (shader stores reach guest memory
     /// only there, through the caches).
     [[nodiscard]] RunAhead::Answer RunAheadReach(u64 word, u64 writers_before);
+    /// EDEN_NX2_RUNAHEAD_QMD: MemoryWritesTarget with the writes placed by their exact ranges (the
+    /// run-ahead log; a page is watched from the first read of it on), never later than the
+    /// granules' answer. Granules are 256 bytes in 4-way hashed sets: a QMD's slot evicted by the
+    /// constant buffer and upload traffic made its reads wait for writes elsewhere.
+    [[nodiscard]] u64 ExactWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                        u64 size) const;
+    /// The same for device memory [address, address + size) of one GPU page, without the writes the
+    /// front could not place; none if the log can't tell (no page slot left).
+    [[nodiscard]] std::optional<u64> LoggedWritesTarget(DAddr address, u64 size) const;
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
@@ -575,6 +585,49 @@ public:
         }
         return settled ? SemaphoreView{ViewKind::Met}
                        : SemaphoreView{ViewKind::Unknown, writers_before};
+    }
+    /// EDEN_NX2_RUNAHEAD_W1: the entry (EntryTag) whose fenced writes must land before the word
+    /// holds its last noted release, while they have not landed (it lands once a fence ran).
+    [[nodiscard]] std::optional<u64> UnlandedFencedEntry(u64 device_address) const;
+    /// EDEN_NX2_RUNAHEAD_W1: an acquire just went on before the fenced writes of `entry` landed
+    /// (W1Release, UnlandedFencedEntry). Sends an entry that holds the back until they landed, as
+    /// the baseline's front sent nothing more before: whatever the back does for the work that
+    /// follows (releases landing as it runs them, memory writes) reaches the guest after that
+    /// release, in the baseline's order. Only the front's own decoding goes on sooner. The sender
+    /// first sends the fence work that lands them (Puller: ReleaseFences).
+    void HoldBackUntilLanded(u64 entry);
+    /// EDEN_NX2_RUNAHEAD_W1: whether the fence-flagged release `answer` waits for (or, NotMet, the
+    /// last release sent to the word, not landed yet) decides the acquire now: it writes a payload
+    /// the front knows (no reduction or maximum) that meets it (`matches`), and the acquire's
+    /// waiter has a slot (`registered`), so the release latches it as it lands even if a later
+    /// write changes the word. The baseline goes on then at the latest; nothing else decides.
+    template <typename Matches>
+    [[nodiscard]] RunAhead::W1 W1Release(u64 device_address, const SemaphoreView& answer,
+                                         bool registered, Matches&& matches,
+                                         std::optional<QueuedSemaphoreWrite>* release) const {
+        using ViewKind = SemaphoreView::Kind;
+        if (!((answer.kind == ViewKind::Unknown && answer.write_dependency) ||
+              answer.kind == ViewKind::NotMet)) {
+            return RunAhead::W1::NotW1;
+        }
+        const auto queued = QueuedSemaphoreWriteAt(device_address);
+        if (!queued || !queued->fenced ||
+            (answer.kind == ViewKind::Unknown && queued->position != answer.position)) {
+            return RunAhead::W1::NotW1;
+        }
+        if (!queued->known || queued->at_least) {
+            return RunAhead::W1::NotPlain;
+        }
+        if (!matches(queued->payload)) {
+            return RunAhead::W1::Unmet;
+        }
+        if (!registered) {
+            return RunAhead::W1::Unlatched;
+        }
+        if (release != nullptr) {
+            *release = queued;
+        }
+        return RunAhead::W1::Pass;
     }
     /// Waits until the back executed the compute and copy work sent before the last NoteSync:
     /// the writers a command list fetched now is ordered after. Returns whether any of it was
@@ -888,13 +941,15 @@ private:
         u64 key;   ///< The device page number + 1; 0: free
         u64 since; ///< write_position when it was added
     };
-    static constexpr size_t WatchedPageSlots = 64;
-    static constexpr size_t MaxWatchedPages = 48;
+    static constexpr size_t WatchedPageSlots = 512;
+    static constexpr size_t MaxWatchedPages = 192;
     [[nodiscard]] static size_t WatchedSlot(u64 page) {
-        return static_cast<size_t>((page * 0x9E3779B97F4A7C15ULL) >> 58);
+        return static_cast<size_t>((page * 0x9E3779B97F4A7C15ULL) >> 55);
     }
     [[nodiscard]] const WatchedPage* FindWatchedPage(u64 page) const;
-    [[nodiscard]] const WatchedPage* WatchPage(u64 page);
+    /// Adds the page if it is not watched yet (the readers that ask are const: the log is the
+    /// front's bookkeeping of what it sent, not the split's state).
+    [[nodiscard]] const WatchedPage* WatchPage(u64 page) const;
     void LogRunAheadWrite(DAddr address, u64 size, u64 position);
     void NoteRunAheadWord(u64 word);
     std::unique_ptr<RunAheadWrite[]> run_ahead_log;
@@ -902,8 +957,8 @@ private:
     u64 run_ahead_lost{};      ///< The last position of a logged write the log dropped
     u64 last_unknown_writer{}; ///< After the last QMD signal whose releases stay unknown
     u64 run_ahead_waiting{};   ///< After the newest QMD signal that waits to be valued, or 0
-    std::array<WatchedPage, WatchedPageSlots> watched_pages{};
-    size_t watched_count{};
+    mutable std::array<WatchedPage, WatchedPageSlots> watched_pages{};
+    mutable size_t watched_count{};
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
     /// NoteWrite placed, and the last placed write in each slot's granules.
@@ -948,6 +1003,11 @@ private:
     void CompleteFencedEntry(u64 tag);
     void SealFencedEntries(u64 position);
     void PublishFencedEntries(); ///< With fenced_entries_mutex held
+    /// EDEN_NX2_RUNAHEAD_W1 (the back, HoldBackUntilLanded's entry): waits until the fenced writes
+    /// of the entries up to `entry` landed. PublishFencedEntries wakes it (landing_waits).
+    void WaitLanded(u64 entry);
+    std::condition_variable landed_cv;
+    bool landing_waits{}; ///< With fenced_entries_mutex held: the back waits in WaitLanded
 
     /// An entry's position as fenced writes name it: with this start of the split in the high
     /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions

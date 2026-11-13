@@ -284,6 +284,71 @@ void GpuSplit::PublishFencedEntries() {
     const u64 landed = fenced_entries.empty() ? fenced_sealed
                                               : std::min(fenced_sealed, fenced_entries.front().tag);
     fenced_landed.store(landed, std::memory_order_release);
+    if (landing_waits) [[unlikely]] {
+        landed_cv.notify_all();
+    }
+}
+
+std::optional<u64> GpuSplit::UnlandedFencedEntry(u64 device_address) const {
+    const auto it = semaphore_writes.find(device_address & ~u64{3});
+    if (!active || it == semaphore_writes.end() || !it->second.fenced ||
+        fenced_landed.load(std::memory_order_acquire) > it->second.entry) {
+        return std::nullopt;
+    }
+    return it->second.entry;
+}
+
+void GpuSplit::HoldBackUntilLanded(u64 entry) {
+    // It changes nothing a draw resolves to (the idle hook's submit runs between entries too).
+    Defer([this, entry] { WaitLanded(entry); }, FastDrawNeutral, Writes::Noted);
+    if (RunAhead::stats) {
+        ++RunAhead::counters.w1_holds;
+    }
+}
+
+void GpuSplit::WaitLanded(u64 entry) {
+    if (fenced_landed.load(std::memory_order_acquire) > entry) {
+        return;
+    }
+    // Every entry before this one ran, so their reports are registered (as after a batch).
+    SealFencedEntries(back_entry_start);
+    if (fenced_landed.load(std::memory_order_acquire) > entry) {
+        return;
+    }
+    // The release's fence may wait for the deferred submit only this thread makes
+    // (FenceManager::WaitPendingFences); nothing is recorded while it waits.
+    if (idle_hook != nullptr) {
+        idle_hook(idle_argument);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const std::stop_token stop = back_thread.get_stop_token();
+    bool warned = false;
+    std::unique_lock lock{fenced_entries_mutex};
+    landing_waits = true;
+    while (fenced_landed.load(std::memory_order_relaxed) <= entry && !stop.stop_requested()) {
+        if (landed_cv.wait_for(lock, std::chrono::milliseconds{1}) != std::cv_status::timeout) {
+            continue;
+        }
+        // Serve a guest read meanwhile, as between entries.
+        lock.unlock();
+        MaybeTick();
+        lock.lock();
+        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds{2}) {
+            warned = true;
+            LOG_WARNING(HW_GPU,
+                        "Run-ahead W1: the back waits 2 s for a fence-flagged release to land "
+                        "(entry {:#x}, landed {:#x})",
+                        entry, fenced_landed.load(std::memory_order_relaxed));
+        }
+    }
+    landing_waits = false;
+    lock.unlock();
+    RunAhead::holds.waits.fetch_add(1, std::memory_order_relaxed);
+    RunAhead::holds.wait_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()),
+        std::memory_order_relaxed);
 }
 
 void GpuSplit::CompleteFencedEntry(u64 tag) {
@@ -667,7 +732,7 @@ const GpuSplit::WatchedPage* GpuSplit::FindWatchedPage(u64 page) const {
     return nullptr;
 }
 
-const GpuSplit::WatchedPage* GpuSplit::WatchPage(u64 page) {
+const GpuSplit::WatchedPage* GpuSplit::WatchPage(u64 page) const {
     if (const WatchedPage* const watched = FindWatchedPage(page)) {
         return watched;
     }
@@ -811,6 +876,60 @@ u64 GpuSplit::MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr ad
         });
     }
     return std::min(target, write_position);
+}
+
+u64 GpuSplit::ExactWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                u64 size) const {
+    const u64 granules = MemoryWritesTarget(memory, address, size);
+    if (!run_ahead_log || size == 0 || size > MaxNotedBytes || address + size < address) {
+        return granules;
+    }
+    // The writes the front could not place, and those the log dropped, may be anywhere.
+    u64 target = (std::max)(last_unplaced_write, run_ahead_lost);
+    bool known = true;
+    ForEachDeviceRange(memory, address, size, [this, &target, &known](DAddr device, u64 bytes) {
+        if (const auto piece = LoggedWritesTarget(device, bytes)) {
+            target = (std::max)(target, *piece);
+        } else {
+            known = false;
+        }
+    });
+    // Both bound the last write sent there from above: the smaller one is as safe.
+    return known ? (std::min)(target, granules) : granules;
+}
+
+std::optional<u64> GpuSplit::LoggedWritesTarget(DAddr address, u64 size) const {
+    if (!run_ahead_log || size == 0) {
+        return std::nullopt;
+    }
+    u64 target = 0;
+    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
+        const WatchedPage* const watched = WatchPage(page);
+        if (watched == nullptr) {
+            return std::nullopt;
+        }
+        // Writes to it sent before it was watched were not logged.
+        target = (std::max)(target, watched->since);
+    }
+    // As RunAheadReach: newest first, down to the writes logged before the back's position.
+    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 logged = (std::min<u64>)(run_ahead_count, RunAheadLogSize);
+    u64 scanned = 0;
+    for (u64 i = 1; i <= logged; ++i) {
+        const RunAheadWrite& entry = run_ahead_log[(run_ahead_count - i) % RunAheadLogSize];
+        if (entry.appended <= done) {
+            break;
+        }
+        ++scanned;
+        if (entry.position > target && entry.begin < address + size &&
+            address < entry.begin + entry.size) {
+            target = entry.position;
+        }
+    }
+    if (RunAhead::stats) {
+        RunAhead::counters.scanned += scanned;
+    }
+    return target;
 }
 
 u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {

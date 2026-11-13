@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 
@@ -399,6 +401,117 @@ struct RunAheadCheck {
     }
 };
 
+// EDEN_NX2_RUNAHEAD_W1_VERIFY: an acquire passed before its fence-flagged release landed. It has a
+// waiter of its own (the slot's address is the owner), which the release must latch as it lands,
+// as it would have latched the baseline's suspended acquire. Front only.
+struct W1Check {
+    GPUVAddr address{};
+    u64 device{};
+    u64 position{}; ///< Of the release
+    u32 value{};
+    u32 operation{};
+    u32 payload{};
+    std::chrono::steady_clock::time_point since{};
+    bool live{};
+};
+std::array<W1Check, 16> g_w1_checks{};
+
+/// How long a release may take to land before its pass counts as unconfirmed (frames with
+/// texture uploads or pipeline builds hold the host queue for tens of milliseconds).
+constexpr auto W1CheckLimit = std::chrono::milliseconds{250};
+
+void SweepW1Checks(bool all) {
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    auto& counts = VideoCommon::RunAhead::counters;
+    const auto now = std::chrono::steady_clock::now();
+    for (W1Check& check : g_w1_checks) {
+        if (!check.live) {
+            continue;
+        }
+        if (waiters.Latched(&check)) {
+            ++counts.w1_confirmed;
+        } else if (all || now - check.since > W1CheckLimit) {
+            ++counts.w1_unconfirmed;
+            if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 32) {
+                LOG_WARNING(HW_GPU,
+                            "Run-ahead W1 verify: semaphore {:#x} (device {:#x}, op {}, {:#x}) "
+                            "passed before the release of {:#x} at {:#x} landed; no write met it "
+                            "within {} ms",
+                            check.address, check.device, check.operation, check.value,
+                            check.payload, check.position, W1CheckLimit.count());
+            }
+        } else {
+            continue;
+        }
+        waiters.Remove(&check);
+        check.live = false;
+    }
+}
+
+void StartW1Check(const Puller::PendingAcquire& acquire, u64 device, u64 position, u32 payload,
+                  const void* waiter) {
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    auto& counts = VideoCommon::RunAhead::counters;
+    const auto free = std::ranges::find(g_w1_checks, false, &W1Check::live);
+    if (free == g_w1_checks.end() ||
+        !waiters.Add(&*free, device, acquire.value, acquire.operation)) {
+        ++counts.w1_unchecked;
+        return;
+    }
+    // A landing before the check's waiter was added latched the acquire's own (still added).
+    if (waiters.Latched(waiter)) {
+        waiters.Remove(&*free);
+        ++counts.w1_confirmed;
+        return;
+    }
+    *free = {acquire.address,
+             device,
+             position,
+             acquire.value,
+             acquire.operation,
+             payload,
+             std::chrono::steady_clock::now(),
+             true};
+}
+
+// EDEN_NX2_RUNAHEAD_W1: the fence-flagged release that decides an acquire the view can't pass now
+// (it waits for the release's entry, or the word does not meet it yet), if the acquire may go on
+// at once: the last release sent to the word, not landed yet, writes a payload the front knows
+// (no reduction or maximum) that meets the acquire, and the acquire's waiter has a slot, so the
+// release latches it as it lands even if a later write changes the word. The baseline goes on
+// then at the latest; until then nothing else decides (see AcquireWithoutDrain).
+std::optional<VideoCommon::GpuSplit::QueuedSemaphoreWrite> W1Release(
+    const VideoCommon::GpuSplit& split, const Puller::PendingAcquire& acquire, u64 device,
+    const ViewAnswer& answer, bool count) {
+    using VideoCommon::RunAhead::W1;
+    std::optional<VideoCommon::GpuSplit::QueuedSemaphoreWrite> release;
+    const W1 decision = split.W1Release(
+        device, answer, acquire.registered,
+        [&acquire](u32 value) { return acquire.Matches(value); }, &release);
+    if (count && VideoCommon::RunAhead::stats && decision != W1::NotW1) [[unlikely]] {
+        auto& counts = VideoCommon::RunAhead::counters;
+        ++counts.w1_candidates;
+        counts.w1_not_plain += decision == W1::NotPlain ? 1 : 0;
+        counts.w1_unmet += decision == W1::Unmet ? 1 : 0;
+        // Without a waiter slot the baseline sees the release only if a poll finds it.
+        counts.w1_unlatched += decision == W1::Unlatched ? 1 : 0;
+    }
+    return decision == W1::Pass ? release : std::nullopt;
+}
+
+// EDEN_NX2_RUNAHEAD_W1: the acquire on `device` goes on before its fence-flagged release landed.
+// The fence work the baseline's poll sends once the back ran what was sent before the acquire
+// (MaybeReleaseFences: a fence for the reports that wait for the next one, those of the release's
+// own entry included, and the deferred submit) goes out now, then the back holds until the release
+// landed (GpuSplit::HoldBackUntilLanded).
+void HoldForW1(DmaPusher& dma_pusher, u64 device) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (const auto entry = split.UnlandedFencedEntry(device)) {
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); }, FenceWrites);
+        split.HoldBackUntilLanded(*entry);
+    }
+}
+
 // EDEN_NX2_RUNAHEAD: a greater-or-equal acquire on the syncpoint shim (no device memory there:
 // the view does not apply, and the baseline drains the split, then reads the syncpoint) that the
 // guest syncpoint meets already. Syncpoints only grow, so the value read after the drain meets it
@@ -661,6 +774,25 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
             break;
         case Kind::NotMet:
         case Kind::Unknown:
+            if (VideoCommon::RunAhead::w1 && !VideoCommon::g_acquire_verify) [[unlikely]] {
+                // EDEN_NX2_RUNAHEAD_W1: a fenced release sent since (another channel's) meets it.
+                if (const auto queued = W1Release(split, acquire, device, answer, false)) {
+                    if (VideoCommon::RunAhead::w1_verify) {
+                        StartW1Check(acquire, device, queued->position, queued->payload, this);
+                    }
+                    HoldForW1(dma_pusher, device);
+                    split.NoteSync();
+                    VideoCommon::Count(stats.passed);
+                    VideoCommon::Count(stats.by_queued);
+                    VideoCommon::Nx2AcquireStats::NoteQueuedPass(device);
+                    if constexpr (Track) {
+                        Details::NoteResume(this, acquire, Details::Resume::Queued);
+                    }
+                    VideoCommon::RunAhead::counters.w1_poll_passes +=
+                        VideoCommon::RunAhead::stats ? 1 : 0;
+                    return true;
+                }
+            }
             // Poll again later, without waiting for the back: until it runs a release that meets
             // the acquire (which latches the waiter) or the work before `position`, nothing the
             // front sees meets it.
@@ -684,6 +816,24 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
     if (const auto now = std::chrono::steady_clock::now();
         now - acquire.last_drain >= std::chrono::milliseconds{1}) {
         acquire.last_drain = now;
+        if (VideoCommon::RunAhead::valve) [[unlikely]] {
+            // EDEN_NX2_RUNAHEAD_VALVE: what the drain is for is the back's idle-hook submit (a
+            // release that lands only once that work is on the host GPU: the Mario Kart World
+            // hang) and the fence work; its read found the word met almost never (run I: 6 of
+            // 2,101), and it emptied the front's lead each time. The back submits at its next
+            // entry boundary instead, the fence work goes out once it ran everything before the
+            // acquire, and the view and the latch go on deciding at every poll.
+            split.RequestIdleHook();
+            MaybeReleaseFences(dma_pusher, acquire);
+            if (VideoCommon::RunAhead::stats) {
+                ++VideoCommon::RunAhead::counters.valve_requests;
+            }
+            if (!VideoCommon::RunAhead::valve_verify) {
+                ReportLongWait(dma_pusher, acquire, std::nullopt);
+                return false;
+            }
+            // _VERIFY: the baseline's valve follows; a pass only its drain finds is counted.
+        }
         VideoCommon::Count(stats.drained);
         VideoCommon::Count(stats.valve_drains);
         if constexpr (Track) {
@@ -700,6 +850,15 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         }
         const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
         if (Nx2SemaphoreWaiters::Get().Latched(this) || acquire.Matches(current)) {
+            if (VideoCommon::RunAhead::valve) [[unlikely]] {
+                ++VideoCommon::RunAhead::counters.valve_drain_passes;
+                if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "Run-ahead valve verify: semaphore {:#x} (op {}, {:#x}) met only "
+                                "after the drain: {:#x}",
+                                acquire.address, acquire.operation, acquire.value, current);
+                }
+            }
             VideoCommon::Count(stats.valve_passes);
             if constexpr (Track) {
                 ++Details::Get().valve_passes[Details::Operation(acquire.operation)];
@@ -995,12 +1154,16 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
     // Registered before the view reads the word: a release the back runs from now on latches the
     // waiter even if a later one overwrites it before a poll looks (no drain orders them).
     auto& waiters = Nx2SemaphoreWaiters::Get();
-    if (!waiters.Add(this, *device, acquire.value, acquire.operation)) {
+    acquire.registered = waiters.Add(this, *device, acquire.value, acquire.operation);
+    if (!acquire.registered) {
         if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
             LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
                       dma_pusher.channel_state.bind_id, acquire.address,
                       Nx2SemaphoreWaiters::MaxWaiters);
         }
+    }
+    if (RunAhead::w1_verify) [[unlikely]] {
+        SweepW1Checks(false);
     }
     ViewAnswer answer = AskView(dma_pusher, acquire, *device);
     // EDEN_NX2_RUNAHEAD_STATS / _VERIFY: whether the baseline would wait for its writers here (the
@@ -1018,6 +1181,38 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire,
             const ViewAnswer base_answer = AskView(dma_pusher, base, *device);
             base_waits = base_answer.kind == Kind::Unknown && !base_answer.write_dependency &&
                          base_answer.position > reach.position;
+        }
+    }
+    if (RunAhead::w1 && !VideoCommon::g_acquire_verify &&
+        ((answer.kind == Kind::Unknown && answer.write_dependency) || answer.kind == Kind::NotMet))
+        [[unlikely]] {
+        // EDEN_NX2_RUNAHEAD_W1: the last release sent to the word lands once a fence ran (W1),
+        // and its payload meets the acquire. The baseline waits for that landing, then goes on
+        // (the release latches the waiter as it lands, even if a later write changes the word):
+        // its decision is to go on, and only the time differs. The release is in the ring before
+        // the acquire, and the back runs nothing sent after it until the release landed
+        // (HoldBackUntilLanded): releases that land as the back runs them, and its memory writes,
+        // keep the baseline's order. The front's reads after the acquire have waits of their own
+        // (GPU-written lists after NoteSync, macro DMA reads drain through the hold, QMD reads),
+        // and words the CPU writes once the release landed cannot be ordered against the GPU's
+        // reads after an acquire on it.
+        if (const auto queued = W1Release(split, acquire, *device, answer, true)) {
+            if (RunAhead::w1_verify) {
+                StartW1Check(acquire, *device, queued->position, queued->payload, this);
+            }
+            waiters.Remove(this);
+            HoldForW1(dma_pusher, *device);
+            // What the front reads after the acquire waits for the work sent before the release,
+            // as after a pass on a queued release (GpuSplit::NoteSync).
+            split.NoteSync();
+            VideoCommon::Count(stats.passed);
+            VideoCommon::Count(stats.by_queued);
+            VideoCommon::Nx2AcquireStats::NoteQueuedPass(*device);
+            if constexpr (Track) {
+                observed->decision = Details::Decision::Queued;
+            }
+            RunAhead::counters.w1_passes += RunAhead::stats ? 1 : 0;
+            return true;
         }
     }
     bool waited = false;
