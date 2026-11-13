@@ -32,6 +32,10 @@ inline bool g_gather{};
 /// EDEN_NX2_BACKX_TICK=1: a buffer's usage tracker clears only the words it set since its last
 /// reset (BufferCacheRuntime::TickFrame cleared every word of every used buffer each frame).
 inline bool g_tick{};
+/// EDEN_NX2_BACKX_APPLY=1: collected CPU writes are applied with each cache's lock taken once for
+/// all of them (OnCacheInvalidations took the buffer cache's twice, the texture cache's once, per
+/// write). The caches are independent and their page counts commute.
+inline bool g_apply{};
 /// EDEN_NX2_BACKX_VERIFY=1: every skip above also runs the base's own check, logs a mismatch and
 /// then does what the base does.
 inline bool g_verify{};
@@ -47,10 +51,12 @@ enum class Counter : std::size_t {
     ReportLocked,     ///< reports that took it
     GatherSkipped,    ///< InvalidateGPUCache calls that found no manager with a collected write
     GatherRun,        ///< calls that gathered
-    GatherEmpty,      ///< gathers that found nothing (the flag was set, the write already gone)
+    GatherEmpty,      ///< gathers that found nothing (a write collected and gathered meanwhile)
     TickResets,       ///< usage tracker resets
     TickWordsCleared, ///< words cleared by them
     TickWordsSkipped, ///< words the base would have cleared too (already zero)
+    ApplyPasses,      ///< OnCacheInvalidations calls with each lock taken once
+    ApplyRanges,      ///< collected writes they applied
     Mismatches,       ///< verify: skips the base's check contradicted
     Count,
 };
@@ -126,11 +132,12 @@ inline void ReadSwitches() {
     g_report = ReadFlag("EDEN_NX2_BACKX_REPORT");
     g_gather = ReadFlag("EDEN_NX2_BACKX_GATHER");
     g_tick = ReadFlag("EDEN_NX2_BACKX_TICK");
+    g_apply = ReadFlag("EDEN_NX2_BACKX_APPLY");
     g_verify = ReadFlag("EDEN_NX2_BACKX_VERIFY");
     g_stats = ReadFlag("EDEN_NX2_BACKX_STATS");
-    if (g_inline || g_report || g_gather || g_tick || g_verify || g_stats) {
-        LOG_INFO(HW_GPU, "BackX: inline {} report {} gather {} tick {} verify {} stats {}",
-                 g_inline, g_report, g_gather, g_tick, g_verify, g_stats);
+    if (g_inline || g_report || g_gather || g_tick || g_apply || g_verify || g_stats) {
+        LOG_INFO(HW_GPU, "BackX: inline {} report {} gather {} tick {} apply {} verify {} stats {}",
+                 g_inline, g_report, g_gather, g_tick, g_apply, g_verify, g_stats);
     }
 }
 
@@ -160,15 +167,17 @@ inline void Report() {
     const u64 tick_resets = Take(Counter::TickResets);
     const u64 tick_cleared = Take(Counter::TickWordsCleared);
     const u64 tick_skipped = Take(Counter::TickWordsSkipped);
+    const u64 apply_passes = Take(Counter::ApplyPasses);
+    const u64 apply_ranges = Take(Counter::ApplyRanges);
     const u64 mismatches = Take(Counter::Mismatches);
     LOG_INFO(HW_GPU,
              "BackX {:.1f} s: inline writes {} without the buffer lock, {} with it; query "
              "invalidations {} skipped, {} run; reports {} without the buffer lock, {} with it; "
              "gathers {} skipped, {} run ({} found nothing); usage resets {} clearing {} words, "
-             "{} words left alone; verify mismatches {}",
+             "{} words left alone; collected writes {} in {} passes; verify mismatches {}",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
              report_locked, gather_skipped, gather_run, gather_empty, tick_resets, tick_cleared,
-             tick_skipped, mismatches);
+             tick_skipped, apply_ranges, apply_passes, mismatches);
 }
 
 } // namespace VideoCommon::BackX

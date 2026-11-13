@@ -3364,7 +3364,57 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     return false;
 }
 
+namespace {
+
+/// EDEN_NX2_BACKX_APPLY: the calls OnCacheInvalidation makes for each range, by cache: the buffer
+/// cache's (after ClaimCpuWrites, as before) under one hold of its lock, then the texture
+/// cache's, then the shader cache's. TextureCache::WriteMemory reads and changes only texture
+/// state, and the page counts both caches change commute, so every cache ends as before.
+void BackXApplyCacheInvalidations(BufferCache& buffer_cache, TextureCache& texture_cache,
+                                  PipelineCache& pipeline_cache,
+                                  std::span<const std::pair<DAddr, u64>> ranges) {
+    namespace BackX = VideoCommon::BackX;
+    const auto valid = [](const std::pair<DAddr, u64>& range) {
+        return range.first != 0 && range.second != 0;
+    };
+    BackX::Count(BackX::Counter::ApplyPasses);
+    BackX::Count(BackX::Counter::ApplyRanges, ranges.size());
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes
+        // elsewhere on its pages (WriteMemory), which would write over the next collected write.
+        buffer_cache.ClaimCpuWrites(ranges);
+        const VideoCommon::Nx2Protect::SourceScope source{
+            VideoCommon::Nx2Protect::Source::Collected};
+        for (const auto& range : ranges) {
+            if (valid(range)) {
+                buffer_cache.WriteMemory(range.first, range.second);
+            }
+        }
+    }
+    const VideoCommon::Nx2Protect::SourceScope source{VideoCommon::Nx2Protect::Source::Collected};
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& range : ranges) {
+            if (valid(range)) {
+                texture_cache.WriteMemory(range.first, range.second);
+            }
+        }
+    }
+    for (const auto& range : ranges) {
+        if (valid(range)) {
+            pipeline_cache.InvalidateRegion(range.first, range.second);
+        }
+    }
+}
+
+} // Anonymous namespace
+
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (VideoCommon::BackX::g_apply) [[unlikely]] {
+        BackXApplyCacheInvalidations(buffer_cache, texture_cache, pipeline_cache, ranges);
+        return;
+    }
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
     {
