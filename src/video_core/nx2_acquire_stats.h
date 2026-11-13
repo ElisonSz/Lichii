@@ -399,6 +399,21 @@ inline void ReportRunAhead() {
         counts.w1_confirmed, counts.w1_unconfirmed, counts.w1_unchecked, counts.qmd_exact,
         counts.qmd_sooner, counts.uploads, counts.upload_rejects[0], counts.upload_rejects[1],
         counts.upload_rejects[2], counts.upload_rejects[3], counts.upload_qmds_partial);
+    // Round 4: the W1 candidates the rule for plain payloads does not pass, by what their release
+    // is and by the acquire's operation; the passes on maxima (EDEN_NX2_RUNAHEAD_W1_MAX).
+    std::string kinds;
+    for (size_t i = 0; i < counts.w1_kinds.size(); ++i) {
+        const auto& operations = counts.w1_kinds[i];
+        kinds += fmt::format("{}{} {}/{}/{}", i == 0 ? "" : ", ", RunAhead::w1_kind_names[i],
+                             operations[0], operations[1], operations[2]);
+    }
+    LOG_INFO(HW_GPU,
+             "Run-ahead W1 releases {:.1f} s (acquires equal/greater or equal/mask): {}; made "
+             "fenced by a landing window {}; maxima passed {} (verify confirmed {}, unconfirmed "
+             "{}); idle front waits with 1/2/3+ channels suspended {}/{}/{}",
+             seconds, kinds, counts.w1_windowed, counts.w1_max_passes, counts.w1_max_confirmed,
+             counts.w1_max_unconfirmed, counts.idle_channels[0], counts.idle_channels[1],
+             counts.idle_channels[2]);
     if (RunAhead::landings) {
         auto& landing = RunAhead::landing_counts;
         const auto take = [](std::atomic<u64>& value) {
@@ -408,10 +423,11 @@ inline void ReportRunAhead() {
                  "Run-ahead landings {:.1f} s: windows opened {}, extended {}, closed {} "
                  "(acknowledged {}), releases noted fenced {}; landings converted: reports {}, "
                  "fence operations {}, pending max {}; entries after a close with some pending "
-                 "{}, fences made for them {}; writes over reports that waited {} ({:.2f} ms); "
-                 "settled reads of a word with one pending: words that only grow {}, held until "
-                 "it landed {}; reads after a drain that waited for one {} (gave up {}); verify "
-                 "ordered {}, out of order {}, unchecked {}, windows without a check {}",
+                 "{}, fences made for them {}; writes over reports or landings that waited {} "
+                 "({:.2f} ms); settled reads of a word with one pending: words that only grow {}, "
+                 "held until it landed {}; reads after a drain that waited for one {} (gave up "
+                 "{}); verify ordered {}, out of order {}, unchecked {}, windows without a check "
+                 "{}",
                  seconds, counts.windows_opened, counts.windows_extended, counts.windows_closed,
                  counts.windows_acked, counts.notes_fenced, take(landing.reports),
                  take(landing.operations), take(landing.pending_max), take(landing.extended),

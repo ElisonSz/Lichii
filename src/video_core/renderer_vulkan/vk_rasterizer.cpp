@@ -4594,6 +4594,18 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
+    if (VideoCommon::RunAhead::landings) [[unlikely]] {
+        // EDEN_NX2_RUNAHEAD_LANDINGS: in a landing window, a landing made a fence operation (a
+        // report, a QMD maximum or reduction) over these words lands before the write, as the
+        // baseline landed it at run; so do the reports the window's releases are. Not after the
+        // write (QueryCacheBase::InvalidateRegion waits there too): they would land over it.
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.ConvertsLandings() && (split.LandingPendingIn(*cpu_addr, copy_size) ||
+                                         (query_cache.page_filter.Any(*cpu_addr, copy_size) &&
+                                          query_cache.HoldsQueries(*cpu_addr, copy_size)))) {
+            split.WaitBeforeOverwrite();
+        }
+    }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {

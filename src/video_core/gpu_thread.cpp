@@ -139,6 +139,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                             counts.idle_wait_ns +=
                                 Suspension::Nanoseconds(Suspension::Clock::now() - begin);
                             counts.idle_timeouts += reached ? 0 : 1;
+                            if (VideoCommon::RunAhead::stats) {
+                                // EDEN_NX2_RUNAHEAD_STATS: one channel waiting, or several.
+                                const size_t suspended = scheduler.PendingChannelCount();
+                                const size_t bucket = suspended <= 1 ? 0 : suspended == 2 ? 1 : 2;
+                                ++VideoCommon::RunAhead::counters.idle_channels[bucket];
+                            }
                             last_progress = std::chrono::steady_clock::now();
                             continue;
                         }

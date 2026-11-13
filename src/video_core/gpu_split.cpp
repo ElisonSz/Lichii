@@ -418,6 +418,7 @@ struct GpuSplit::LandingToken {
                 it != split.landing_words.end() && --it->second == 0) {
                 split.landing_words.erase(it);
             }
+            split.landing_pages[LandingPageSlot(device)].fetch_sub(1, std::memory_order_release);
         }
         if (split.landing_pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             // The last one: a write waiting before it overwrites may go on (WaitBeforeOverwrite).
@@ -447,6 +448,7 @@ std::shared_ptr<void> GpuSplit::ConvertedLanding(u64 device, bool report) {
     if (word != 0) {
         std::scoped_lock lock{landing_words_mutex};
         ++landing_words[word];
+        landing_pages[LandingPageSlot(word)].fetch_add(1, std::memory_order_release);
     }
     return std::make_shared<LandingToken>(*this, word, landing_check);
 }
@@ -476,8 +478,12 @@ void GpuSplit::CheckConvertedLanding(const std::shared_ptr<void>& token) {
         LOG_ERROR(HW_GPU,
                   "Run-ahead landings verify: a converted landing (word {:#x}) was applied before "
                   "its window's release landed (the window's acquire: device {:#x}, op {}, {:#x}; "
-                  "check slot {}, generation {})",
-                  landing->device, check.device, check.operation, check.value, slot, generation);
+                  "its release: {}{:#x} at {:#x}, writer {}, {}; check slot {}, generation {})",
+                  landing->device, check.device, check.operation, check.value,
+                  check.release_at_least ? "at least " : "", check.release_payload,
+                  check.release_position, check.release_writer,
+                  check.release_windowed ? "fenced by a window" : "fence-flagged", slot,
+                  generation);
     }
 }
 
@@ -531,6 +537,29 @@ bool GpuSplit::LandingPendingAt(u64 device) const {
     }
     std::scoped_lock lock{landing_words_mutex};
     return landing_words.contains(device & ~u64{3});
+}
+
+bool GpuSplit::LandingPendingIn(u64 device, u64 size) const {
+    if (size == 0 || landing_pending.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    const u64 begin = device & ~u64{3};
+    const u64 end = device + size;
+    // Most writes in a window go to pages no pending landing is on: no lock for those.
+    if (((end - 1) >> 12) - (begin >> 12) < LandingPageSlots) {
+        bool any = false;
+        for (u64 page = begin >> 12; page <= (end - 1) >> 12 && !any; ++page) {
+            any = landing_pages[LandingPageSlot(page << 12)].load(std::memory_order_acquire) != 0;
+        }
+        if (!any) {
+            return false;
+        }
+    }
+    std::scoped_lock lock{landing_words_mutex};
+    // A few dozen words at most (the pending landings).
+    return std::ranges::any_of(landing_words, [begin, end](const auto& word) {
+        return word.first >= begin && word.first < end;
+    });
 }
 
 void GpuSplit::WaitLanded(u64 entry) {
@@ -718,9 +747,11 @@ bool GpuSplit::WaitForSync() {
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing,
                                   bool at_least, SemaphoreWriter writer) {
+    bool windowed = false;
     if (landing == Landing::AtRun && (landing_window_open || landing_close_pending)) [[unlikely]] {
         // EDEN_NX2_RUNAHEAD_LANDINGS: the back may make it a fence operation (OpenLandingWindow).
         landing = Landing::Fenced;
+        windowed = true;
         RunAhead::counters.notes_fenced += RunAhead::stats ? 1 : 0;
     }
     if (semaphore_writes.size() >= semaphore_writes_limit) {
@@ -740,6 +771,8 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         .fenced = landing == Landing::Fenced,
         .writer = writer,
         .settle = 0,
+        .windowed = windowed,
+        .raced = false,
     };
     const u64 word = device_address & ~u64{3};
     if (const auto it = semaphore_writes.find(word);
@@ -750,6 +783,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, L
         write.entry = it->second.entry;
         write.known = false;
         write.fenced = true;
+        write.raced = true;
     }
     if (SyncSuspend::enabled) [[unlikely]] {
         write.settle = SettleBefore(word, write, landing == Landing::AtRun);
@@ -813,9 +847,9 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     if (!queued) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known,  it->second.at_least,
-                                it->second.fenced,  it->second.writer, it->second.position,
-                                it->second.settle};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known,    it->second.at_least,
+                                it->second.fenced,  it->second.writer,   it->second.position,
+                                it->second.settle,  it->second.windowed, it->second.raced};
 }
 
 u64 GpuSplit::SettleBefore(u64 word, const SemaphoreWrite& write, bool lands_at_run) const {
@@ -849,8 +883,9 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::SemaphoreWriteForStats(
         return std::nullopt;
     }
     const auto& write = it->second;
-    return QueuedSemaphoreWrite{write.payload, write.known,  write.at_least, write.fenced,
-                                write.writer,  write.position, write.settle};
+    return QueuedSemaphoreWrite{write.payload, write.known,    write.at_least,
+                                write.fenced,  write.writer,   write.position,
+                                write.settle,  write.windowed, write.raced};
 }
 
 namespace {

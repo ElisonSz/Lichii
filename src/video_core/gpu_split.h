@@ -557,6 +557,11 @@ public:
         /// work, writes the front could not place, earlier writes to the word landing at run (and
         /// this one, unless it lands once a fence ran).
         u64 settle{};
+        /// Diagnostic (EDEN_NX2_RUNAHEAD_STATS), never part of a decision: it lands at run, but a
+        /// landing window made it fenced (NoteSemaphoreWrite); or an earlier fenced write to the
+        /// word that may land after it made it fenced and unknown.
+        bool windowed{};
+        bool raced{};
     };
     /// The last write sent to the semaphore word at `device_address`, if it may not be in memory
     /// yet.
@@ -678,11 +683,16 @@ public:
     static void CheckConvertedLanding(const std::shared_ptr<void>& token);
     /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: a converted landing to the word at `device` is pending.
     [[nodiscard]] bool LandingPendingAt(u64 device) const;
+    /// EDEN_NX2_RUNAHEAD_LANDINGS: a converted landing to a word in [device, device + size) is
+    /// pending (a write there must wait for it: WaitBeforeOverwrite).
+    [[nodiscard]] bool LandingPendingIn(u64 device, u64 size) const;
     /// EDEN_NX2_RUNAHEAD_LANDINGS (back, no cache lock held): a write is about to drop the reports
-    /// still to land where it writes (QueryCacheBase::InvalidateRegion). Waits until the window's
-    /// releases and every converted landing landed: the baseline sent the write only after its
-    /// acquire's release landed, and landed the converted ones as it ran them, so it never dropped
-    /// those.
+    /// still to land where it writes (QueryCacheBase::InvalidateRegion), or to write words a
+    /// converted landing still has to land on (an inline upload, before it writes:
+    /// RasterizerVulkan::AccelerateInlineToMemory). Waits until the window's releases and every
+    /// converted landing landed: the baseline sent the write only after its acquire's release
+    /// landed, and landed the converted ones as it ran them, so it never dropped those and wrote
+    /// over them.
     void WaitBeforeOverwrite();
     /// EDEN_NX2_RUNAHEAD_W1: whether the fence-flagged release `answer` waits for (or, NotMet, the
     /// last release sent to the word, not landed yet) decides the acquire now: it writes a payload
@@ -692,11 +702,18 @@ public:
     /// unless a write over the word was sent after the release: the back drops a report that an
     /// upload or a copy covers before its fence ran (the query cache's InvalidateRegion), and the
     /// baseline decides from what that write left. `writers_before`: the acquire's (its reach), for
-    /// when no write log covers the word.
+    /// when no write log covers the word. `release`: the release, for every candidate (not
+    /// NotW1), whatever the decision. `reaches`: the acquire is greater-or-equal.
+    ///
+    /// EDEN_NX2_RUNAHEAD_W1_MAX: a maximum the front noted as "at least" its payload (a QMD
+    /// completion) decides a greater-or-equal acquire its payload meets in the same way: once it
+    /// landed the word holds max(word, payload) whatever it held (the mirror's view of a word too,
+    /// Nx2MirrorShadow::NoteCombinedRelease), so its write latches the waiter.
     template <typename Matches>
     [[nodiscard]] RunAhead::W1 W1Release(u64 device_address, const SemaphoreView& answer,
                                          bool registered, u64 writers_before, Matches&& matches,
-                                         std::optional<QueuedSemaphoreWrite>* release) const {
+                                         std::optional<QueuedSemaphoreWrite>* release,
+                                         bool reaches = false) const {
         using ViewKind = SemaphoreView::Kind;
         if (!((answer.kind == ViewKind::Unknown && answer.write_dependency) ||
               answer.kind == ViewKind::NotMet)) {
@@ -707,11 +724,15 @@ public:
             (answer.kind == ViewKind::Unknown && queued->position != answer.position)) {
             return RunAhead::W1::NotW1;
         }
-        if (!queued->known || queued->at_least) {
+        if (release != nullptr) {
+            *release = queued;
+        }
+        const bool maximum = queued->at_least && RunAhead::w1_max && reaches;
+        if (!queued->known || (queued->at_least && !maximum)) {
             return RunAhead::W1::NotPlain;
         }
         if (!matches(queued->payload)) {
-            return RunAhead::W1::Unmet;
+            return maximum ? RunAhead::W1::NotPlain : RunAhead::W1::Unmet;
         }
         if (!registered) {
             return RunAhead::W1::Unlatched;
@@ -723,10 +744,25 @@ public:
         if (written > queued->position) {
             return RunAhead::W1::Overwritten;
         }
-        if (release != nullptr) {
-            *release = queued;
-        }
         return RunAhead::W1::Pass;
+    }
+    /// EDEN_NX2_RUNAHEAD_STATS: the kind of a W1 candidate's release (`decision`, W1Release's for
+    /// it) that the rule for plain payloads does not pass; `reaches`: the acquire is
+    /// greater-or-equal, `met`: the release's payload meets it.
+    [[nodiscard]] static RunAhead::W1Kind W1KindOf(const QueuedSemaphoreWrite& release,
+                                                   RunAhead::W1 decision, bool reaches, bool met) {
+        using Kind = RunAhead::W1Kind;
+        if (release.known && release.at_least) {
+            return !reaches ? Kind::MaxOther : met ? Kind::MaxMet : Kind::MaxShort;
+        }
+        if (!release.known) {
+            return release.raced                                         ? Kind::Raced
+                   : release.writer == SemaphoreWriter::QmdReduction     ? Kind::QmdReduction
+                   : release.writer == SemaphoreWriter::ReductionCompute ? Kind::ComputeReduction
+                   : release.writer == SemaphoreWriter::Report3D         ? Kind::Counter
+                                                                         : Kind::Unknown;
+        }
+        return decision == RunAhead::W1::Unmet ? Kind::Unmet : Kind::Other;
     }
     /// Waits until the back executed the compute and copy work sent before the last NoteSync:
     /// the writers a command list fetched now is ordered after. Returns whether any of it was
@@ -1017,6 +1053,8 @@ private:
         bool fenced;
         SemaphoreWriter writer;
         u64 settle; ///< QueuedSemaphoreWrite::settle
+        bool windowed; ///< QueuedSemaphoreWrite::windowed
+        bool raced;    ///< QueuedSemaphoreWrite::raced
     };
     /// The front's NoteSemaphoreWrite, by word address.
     std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
@@ -1131,6 +1169,13 @@ private:
     /// ..._VERIFY: the words with converted landings pending, and how many (any thread).
     mutable std::mutex landing_words_mutex;
     std::unordered_map<u64, u32> landing_words;
+    /// The same by hashed 4 KiB page, without the lock: a write to a page whose slot is 0 has no
+    /// converted landing to wait for (LandingPendingIn, on every inline upload in a window).
+    static constexpr size_t LandingPageSlots = 64;
+    [[nodiscard]] static size_t LandingPageSlot(u64 word) {
+        return static_cast<size_t>(((word >> 12) * 0x9E3779B97F4A7C15ULL) >> 58);
+    }
+    std::array<std::atomic<u32>, LandingPageSlots> landing_pages{};
 
     /// An entry's position as fenced writes name it: with this start of the split in the high
     /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions

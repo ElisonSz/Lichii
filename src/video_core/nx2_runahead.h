@@ -65,6 +65,13 @@ inline bool landings{};
 /// its release must latch before any landing converted in the window is applied, and the front
 /// counts its reads of a word whose converted landing is still pending.
 inline bool landings_verify{};
+/// EDEN_NX2_RUNAHEAD_W1_MAX=1 (with W1 or LANDINGS): a W1 pass also on a maximum (NVN2's QMD
+/// completions), the release the front notes as leaving the word at its payload at least, when
+/// the acquire is greater-or-equal and that payload meets it: once it lands the word holds
+/// max(word, payload), which meets the acquire whatever the word held, and its write latches the
+/// waiter (GpuSplit::W1Release). In a landing window every such release is fenced: without this
+/// the acquire waits for the fence after it.
+inline bool w1_max{};
 /// EDEN_NX2_RUNAHEAD_QMD=1: the QMD view places the writes to the QMDs it reads by exact range from
 /// the run-ahead write log, not by hashed 256-byte granule (FrontQmdView::ReadDescriptor).
 inline bool qmd{};
@@ -91,6 +98,7 @@ inline void ReadSwitch() {
     w1 = w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_W1", '1');
     landings_verify = SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY", '1');
     landings = landings_verify || SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS", '1');
+    w1_max = SwitchIs("EDEN_NX2_RUNAHEAD_W1_MAX", '1');
     stats = (enabled || valve || w1 || landings) &&
             (verify || valve_verify || w1_verify || landings_verify ||
              SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));
@@ -129,6 +137,33 @@ enum class W1 : u8 {
     Overwritten ///< A write over the word was sent after it (it may drop the release)
 };
 
+/// EDEN_NX2_RUNAHEAD_STATS: what the fence-flagged release of a W1 candidate is, where the rule for
+/// plain payloads does not pass it (GpuSplit::W1KindOf). Diagnostic only.
+enum class W1Kind : u8 {
+    MaxMet,           ///< A maximum whose payload meets the greater-or-equal acquire (W1_MAX)
+    MaxShort,         ///< A maximum whose payload does not meet the greater-or-equal acquire
+    MaxOther,         ///< A maximum under an equal or mask acquire
+    QmdReduction,     ///< A QMD reduction whose base the front can't tell
+    ComputeReduction, ///< A compute report reduction whose base the front can't tell
+    Counter,          ///< A counter report (what the GPU counted)
+    Raced,            ///< Behind an earlier fenced write to the word that may land after it
+    Unknown,          ///< Another value the front can't tell
+    Unmet,            ///< A plain payload that does not meet the acquire
+    Other,            ///< No waiter slot, or a write over the word sent after it
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(W1Kind::Count)> w1_kind_names{
+    "maxima meeting it",      "maxima short of it", "maxima under an equal or mask acquire",
+    "QMD reductions",         "compute reductions", "counters",
+    "behind a fenced write",  "other unknown",      "plain unmet",
+    "no slot or written over"};
+
+/// The acquire operations the W1 kinds are counted by: equal, greater or equal, mask.
+[[nodiscard]] constexpr size_t W1OperationIndex(u32 operation) {
+    return operation == 0x4 ? 1 : operation == 0x8 ? 2 : 0;
+}
+
 /// The front's counts, logged every 10 s and cleared (ReportCounters; EDEN_NX2_RUNAHEAD_STATS).
 struct Counters {
     u64 acquires{}; ///< Acquires the view decided with a reach
@@ -161,6 +196,15 @@ struct Counters {
     u64 w1_unchecked{};       ///< ..._VERIFY: passes with no check slot free
     u64 w1_overwritten{};     ///< Not passed: a write over the word was sent after the release
     u64 w1_holds{};   ///< Passes whose release had not landed: the back waits for it (W1 hold)
+    /// Candidates the plain rule does not pass, at their first decision, by W1Kind and by the
+    /// acquire's operation (W1OperationIndex).
+    std::array<std::array<u64, 3>, static_cast<size_t>(W1Kind::Count)> w1_kinds{};
+    u64 w1_windowed{};        ///< Of those: a landing window made the release fenced
+    u64 w1_max_passes{};      ///< EDEN_NX2_RUNAHEAD_W1_MAX: passes on a maximum (poll ones too)
+    u64 w1_max_confirmed{};   ///< ..._W1_VERIFY: of their checks, latched
+    u64 w1_max_unconfirmed{}; ///< ..._W1_VERIFY: of their checks, not latched within 250 ms
+    /// Idle front waits (EDEN_NX2_SYNC_SUSPEND) by the channels suspended then: 1, 2, 3 or more.
+    std::array<u64, 3> idle_channels{};
     u64 windows_opened{};      ///< LANDINGS: landing windows opened at a W1 pass
     u64 windows_extended{};    ///< ... passes on a later release while one was open
     u64 windows_closed{};      ///< ... closes sent once the windows' releases landed
@@ -218,6 +262,12 @@ struct LandingCheck {
     u64 device{}; ///< The window's acquire (written before `generation`), for the log
     u32 value{};
     u32 operation{};
+    /// The release the acquire went on before, as the front noted it (for the log).
+    u64 release_position{};
+    u32 release_payload{};
+    u8 release_writer{};
+    bool release_at_least{};
+    bool release_windowed{};
     std::atomic<bool> latched{}; ///< Seen latched by the front (set before it removed the waiter)
     bool registered{};           ///< Front only: the waiter is registered
 };

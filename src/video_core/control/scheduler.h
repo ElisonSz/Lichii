@@ -39,6 +39,10 @@ public:
     /// EDEN_NX2_SYNC_SUSPEND: the earliest ring position a pending channel's acquire, suspended
     /// before the back ran its release, waits for (Puller::EarlyPosition).
     [[nodiscard]] std::optional<u64> EarlyWaitPosition() const;
+    /// The channels suspended on an acquire (GPU thread only).
+    [[nodiscard]] size_t PendingChannelCount() const {
+        return pending_channels.size();
+    }
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -128,6 +129,10 @@ struct RunAheadTestAccess {
     static bool Landed(const GpuSplit& split, u64 position) {
         return split.fenced_landed.load(std::memory_order_acquire) > split.EntryTag(position);
     }
+    /// The front's window state alone (what NoteSemaphoreWrite looks at), without its entries.
+    static void SetWindowOpen(GpuSplit& split, bool open) {
+        split.landing_window_open = open;
+    }
 };
 } // namespace VideoCommon
 
@@ -208,6 +213,20 @@ TEST_CASE("Run-ahead switch values", "[video_core][runahead]") {
     set("EDEN_NX2_RUNAHEAD", "");
     RunAhead::ReadSwitch();
     CHECK(!RunAhead::enabled);
+    // EDEN_NX2_RUNAHEAD_W1_MAX: off by default, on only with "1", implies nothing else.
+    const bool w1_max = RunAhead::w1_max;
+    CHECK_FALSE(RunAhead::w1_max);
+    set("EDEN_NX2_RUNAHEAD_W1_MAX", "1");
+    RunAhead::ReadSwitch();
+    CHECK((RunAhead::w1_max && !RunAhead::enabled && !RunAhead::landings && !RunAhead::w1 &&
+           !RunAhead::stats));
+    set("EDEN_NX2_RUNAHEAD_W1_MAX", "2");
+    RunAhead::ReadSwitch();
+    CHECK_FALSE(RunAhead::w1_max);
+    set("EDEN_NX2_RUNAHEAD_W1_MAX", "");
+    RunAhead::ReadSwitch();
+    CHECK_FALSE(RunAhead::w1_max);
+    RunAhead::w1_max = w1_max;
     RunAhead::enabled = enabled;
     RunAhead::verify = verify;
     RunAhead::stats = stats;
@@ -1099,4 +1118,245 @@ TEST_CASE("Run-ahead landings: the words of converted landings are known while t
     wordless.reset();
     CHECK_FALSE(f.split->LandingPendingAt(0));
     RunAhead::landings_verify = verify_was;
+}
+
+// Round 4: W1 passes on maxima (EDEN_NX2_RUNAHEAD_W1_MAX), what the releases the plain rule does
+// not pass are, and writes over the words of pending landings.
+
+namespace {
+struct MaxScope {
+    explicit MaxScope(bool value) : was{RunAhead::w1_max} {
+        RunAhead::w1_max = value;
+    }
+    ~MaxScope() {
+        RunAhead::w1_max = was;
+    }
+    MaxScope(const MaxScope&) = delete;
+    MaxScope& operator=(const MaxScope&) = delete;
+    bool was;
+};
+
+Split::SemaphoreView UnknownAt(u64 position) {
+    return Split::SemaphoreView{ViewKind::Unknown, position, true};
+}
+} // namespace
+
+TEST_CASE("Run-ahead W1 on maxima (EDEN_NX2_RUNAHEAD_W1_MAX)", "[video_core][runahead]") {
+    Fixture f;
+    const auto reaches_to = [](u32 target) {
+        return [target](u32 value) { return value >= target; };
+    };
+    const auto equals = [](u32 target) { return [target](u32 value) { return value == target; }; };
+    // A maximum sent while a landing window is open (a QMD completion): the front notes it as
+    // landing once a fence ran, at least its payload (no base: the word's last write is fenced).
+    Access::SetWindowOpen(*f.split, true);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 9, true, true, Split::SemaphoreWriter::QmdReduction);
+    const u64 maximum = f.split->Position();
+    Access::SetWindowOpen(*f.split, false);
+    Access::Send(*f.split, 2);
+    const auto queued = f.split->QueuedSemaphoreWriteAt(Fixture::Word);
+    REQUIRE(queued.has_value());
+    CHECK((queued->fenced && queued->windowed && queued->at_least && queued->known &&
+           !queued->raced));
+    std::optional<Split::QueuedSemaphoreWrite> release;
+    {
+        // Off: not plain, as before (the release is still handed out, for the stats).
+        MaxScope off{false};
+        CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, reaches_to(9),
+                                 &release, true) == W1::NotPlain);
+        REQUIRE(release.has_value());
+        CHECK(release->at_least);
+    }
+    MaxScope on{true};
+    release.reset();
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, reaches_to(9), &release,
+                             true) == W1::Pass);
+    REQUIRE(release.has_value());
+    CHECK(release->payload == 9);
+    CHECK(release->position == maximum);
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, reaches_to(4), nullptr,
+                             true) == W1::Pass);
+    // Ran but not landed, memory short of it (the view's NotMet on an advancing word).
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, 0,
+                             reaches_to(9), nullptr, true) == W1::Pass);
+    // Short of the acquire; an equal (or mask) acquire; no waiter slot.
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, reaches_to(10), nullptr,
+                             true) == W1::NotPlain);
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, equals(9), nullptr,
+                             false) == W1::NotPlain);
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), false, 0, reaches_to(9), nullptr,
+                             true) == W1::Unlatched);
+    // Another position: not W1 at all.
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum + 1), true, 0, reaches_to(9), nullptr,
+                             true) == W1::NotW1);
+    // A write over the word sent after it.
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Fixture::Word, 4);
+    CHECK(f.split->W1Release(Fixture::Word, UnknownAt(maximum), true, 0, reaches_to(9), nullptr,
+                             true) == W1::Overwritten);
+    // A value the front can't tell (a reduction without a base) stays: only maxima pass.
+    Access::SetWindowOpen(*f.split, true);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 8, 0, false, false,
+                                Split::SemaphoreWriter::ReductionCompute);
+    Access::SetWindowOpen(*f.split, false);
+    CHECK(f.split->W1Release(Fixture::Word + 8, UnknownAt(f.split->Position()), true, 0,
+                             reaches_to(0), nullptr, true) == W1::NotPlain);
+}
+
+TEST_CASE("Run-ahead W1_MAX passes where the maximum's landing latches the baseline's waiter",
+          "[video_core][runahead]") {
+    // The baseline's acquire waits with a registered waiter until the maximum lands (in a window
+    // the landing is a fence operation): it writes max(word, payload) and latches the waiter with
+    // what acquires see then, through the mirror's shadow too. Whenever W1Release lets the
+    // acquire go on, that landing latches it, whatever the word held: the baseline goes on too.
+    std::mt19937_64 random{0x4d41};
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    auto& shadow = Tegra::Nx2MirrorShadow::Get();
+    shadow.Clear();
+    MaxScope on{true};
+    u64 passes = 0;
+    u64 mirrored_passes = 0;
+    for (u32 round = 0; round < 600; ++round) {
+        Fixture f;
+        const u64 device = Fixture::Word;
+        const u32 payload = static_cast<u32>(random() % 8);
+        const u32 target = static_cast<u32>(random() % 8);
+        constexpr std::array operations{Tegra::Nx2SemaphoreWaiters::AcquireEqual,
+                                        Tegra::Nx2SemaphoreWaiters::AcquireGequal,
+                                        Tegra::Nx2SemaphoreWaiters::AcquireMask};
+        const u32 operation = operations[random() % operations.size()];
+        const bool reaches = operation == Tegra::Nx2SemaphoreWaiters::AcquireGequal;
+        const auto matches = [&](u32 value) {
+            return operation == Tegra::Nx2SemaphoreWaiters::AcquireEqual    ? value == target
+                   : operation == Tegra::Nx2SemaphoreWaiters::AcquireGequal ? value >= target
+                                                                            : (value & target) != 0;
+        };
+        Access::SetWindowOpen(*f.split, true);
+        Access::Send(*f.split, 4);
+        f.split->NoteSemaphoreWrite(device, payload, true, true,
+                                    Split::SemaphoreWriter::QmdReduction);
+        Access::SetWindowOpen(*f.split, false);
+        const u64 position = f.split->Position();
+        Access::Send(*f.split, 2);
+        int owner = 0;
+        REQUIRE(waiters.Add(&owner, device, target, operation));
+        const W1 decision =
+            f.split->W1Release(device, UnknownAt(position), true, 0, matches, nullptr, reaches);
+        // The word as the maximum lands: anything (earlier writes, the CPU); the mirror's shadow
+        // may hold a value of its own for acquires.
+        const u32 guest = static_cast<u32>(random() % 8);
+        const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
+        u32 seen = combine(guest);
+        const bool mirrored = random() % 2 == 0;
+        if (mirrored) {
+            shadow.Set(device, static_cast<u32>(random() % 8), guest);
+            seen = shadow.NoteCombinedRelease(device, 0, guest, combine(guest), combine);
+        }
+        waiters.OnWrite(device, seen);                           // The maximum lands
+        waiters.OnWrite(device, static_cast<u32>(random() % 8)); // Later writes change nothing
+        if (decision == W1::Pass) {
+            ++passes;
+            mirrored_passes += mirrored ? 1 : 0;
+            CHECK(reaches);
+            CHECK(payload >= target);
+            CHECK(waiters.Latched(&owner));
+        } else {
+            CHECK(decision == W1::NotPlain);
+            CHECK((!reaches || payload < target));
+        }
+        waiters.Remove(&owner);
+        shadow.Clear();
+    }
+    CHECK(passes > 50);
+    CHECK(mirrored_passes > 20);
+}
+
+TEST_CASE("Run-ahead W1 kinds of the releases the plain rule does not pass",
+          "[video_core][runahead]") {
+    using Kind = RunAhead::W1Kind;
+    using Writer = Split::SemaphoreWriter;
+    const auto write = [](bool known, bool at_least, Writer writer, bool raced = false) {
+        Split::QueuedSemaphoreWrite queued{5, known, at_least, true, writer, 10};
+        queued.raced = raced;
+        return queued;
+    };
+    CHECK(Split::W1KindOf(write(true, true, Writer::QmdReduction), W1::Pass, true, true) ==
+          Kind::MaxMet);
+    CHECK(Split::W1KindOf(write(true, true, Writer::QmdReduction), W1::NotPlain, true, false) ==
+          Kind::MaxShort);
+    CHECK(Split::W1KindOf(write(true, true, Writer::QmdReduction), W1::NotPlain, false, true) ==
+          Kind::MaxOther);
+    CHECK(Split::W1KindOf(write(false, false, Writer::QmdReduction), W1::NotPlain, true, false) ==
+          Kind::QmdReduction);
+    CHECK(Split::W1KindOf(write(false, false, Writer::ReductionCompute), W1::NotPlain, true,
+                          false) == Kind::ComputeReduction);
+    CHECK(Split::W1KindOf(write(false, false, Writer::Report3D), W1::NotPlain, false, false) ==
+          Kind::Counter);
+    CHECK(Split::W1KindOf(write(false, false, Writer::Report3D, true), W1::NotPlain, true, false) ==
+          Kind::Raced);
+    CHECK(Split::W1KindOf(write(false, false, Writer::Puller), W1::NotPlain, true, false) ==
+          Kind::Unknown);
+    CHECK(Split::W1KindOf(write(true, false, Writer::Puller), W1::Unmet, true, false) ==
+          Kind::Unmet);
+    CHECK(Split::W1KindOf(write(true, false, Writer::Puller), W1::Unlatched, true, true) ==
+          Kind::Other);
+    CHECK(Split::W1KindOf(write(true, false, Writer::Copy), W1::Overwritten, false, true) ==
+          Kind::Other);
+    CHECK(RunAhead::W1OperationIndex(Tegra::Nx2SemaphoreWaiters::AcquireEqual) == 0);
+    CHECK(RunAhead::W1OperationIndex(Tegra::Nx2SemaphoreWaiters::AcquireGequal) == 1);
+    CHECK(RunAhead::W1OperationIndex(Tegra::Nx2SemaphoreWaiters::AcquireMask) == 2);
+    // The flags as NoteSemaphoreWrite sets them.
+    Fixture f;
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 3, true, Split::Landing::Fenced); // Fence-flagged
+    const auto own = f.split->QueuedSemaphoreWriteAt(Fixture::Word);
+    REQUIRE(own.has_value());
+    CHECK((own->fenced && own->known && !own->windowed && !own->raced));
+    // Behind it, a release landing at run holds either value until it landed: raced.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 4, true, Split::Landing::AtRun);
+    const auto raced = f.split->QueuedSemaphoreWriteAt(Fixture::Word);
+    REQUIRE(raced.has_value());
+    CHECK((raced->fenced && !raced->known && raced->raced && !raced->windowed));
+    // In a window (or until the back acknowledged its close), one landing at run is fenced.
+    Access::SetWindowOpen(*f.split, true);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 8, 1, true, Split::Landing::AtRun);
+    const auto windowed = f.split->QueuedSemaphoreWriteAt(Fixture::Word + 8);
+    REQUIRE(windowed.has_value());
+    CHECK((windowed->fenced && windowed->known && windowed->windowed && !windowed->raced));
+    // A fence-flagged one in a window is fenced on its own.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 0x10, 1, true, Split::Landing::Fenced);
+    const auto flagged = f.split->QueuedSemaphoreWriteAt(Fixture::Word + 0x10);
+    REQUIRE(flagged.has_value());
+    CHECK((flagged->fenced && !flagged->windowed));
+    Access::SetWindowOpen(*f.split, false);
+}
+
+TEST_CASE("Run-ahead landings: a write over the words of pending landings is found",
+          "[video_core][runahead]") {
+    Fixture f;
+    LandingsScope on;
+    constexpr u64 Word = Fixture::Word + 0x40;
+    CHECK_FALSE(f.split->LandingPendingIn(Fixture::Word, 0x100)); // None pending
+    auto landing = f.split->ConvertedLanding(Word, false);        // A QMD maximum's word
+    auto wordless = f.split->ConvertedLanding(0, false);          // A syncpoint increment
+    CHECK(f.split->LandingPendingIn(Fixture::Word, 0x100));
+    CHECK(f.split->LandingPendingIn(Word, 4));
+    CHECK(f.split->LandingPendingIn(Word + 2, 1));          // One byte of the word
+    CHECK(f.split->LandingPendingIn(Word - 4, 5));          // Into its first byte
+    CHECK_FALSE(f.split->LandingPendingIn(Word - 4, 4));    // Right before it
+    CHECK_FALSE(f.split->LandingPendingIn(Word + 4, 0x10)); // Right after it
+    CHECK_FALSE(f.split->LandingPendingIn(Word, 0));        // Nothing written
+    // Other pages, one or many (more than the page slots: the exact look under the lock).
+    CHECK_FALSE(f.split->LandingPendingIn(Word + 0x1000, 0x2000));
+    CHECK(f.split->LandingPendingIn(0, 0x80000));
+    CHECK_FALSE(f.split->LandingPendingIn(Word + 0x1000, 0x80000));
+    landing.reset();
+    CHECK_FALSE(f.split->LandingPendingIn(Fixture::Word, 0x100));
+    CHECK_FALSE(f.split->LandingPendingIn(0, 0x80000));
+    wordless.reset();
 }
