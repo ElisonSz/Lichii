@@ -90,12 +90,27 @@ inline void Count(Counter counter, u64 amount = 1) {
     }
 }
 
-/// Verify: a skip the base's own check contradicts (logged 64 times at most).
-inline void Mismatch(const char* what, u64 address, u64 size) {
+/// Verify: the skips the base's own check can contradict.
+enum class Check : std::size_t {
+    InlineGpuData, ///< INLINE: an inline write into GPU-written buffer data
+    InlineQuery,   ///< INLINE: an inline write over a cached query
+    Report,        ///< REPORT: a report on a read-back page
+    Gather,        ///< GATHER: collected CPU writes no manager showed (no Collect raced)
+    Tick,          ///< TICK: a usage word set outside the tracked extent
+    Count,
+};
+
+/// Verify mismatches of each check since the start (each kind logged 16 times at most, so one
+/// kind cannot hide the others).
+inline std::array<std::atomic<u64>, static_cast<std::size_t>(Check::Count)> g_mismatches{};
+
+/// Verify: a skip the base's own check contradicts.
+inline void Mismatch(Check check, const char* what, u64 address, u64 size) {
     g_counters[static_cast<std::size_t>(Counter::Mismatches)].fetch_add(1,
                                                                         std::memory_order_relaxed);
-    static std::atomic<u32> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+    const u64 seen =
+        g_mismatches[static_cast<std::size_t>(check)].fetch_add(1, std::memory_order_relaxed);
+    if (seen < 16) {
         LOG_ERROR(HW_GPU, "BackX verify mismatch: {} at {:#x}+{:#x}", what, address, size);
     }
 }
@@ -172,6 +187,10 @@ inline void ReadSwitches() {
     }
 }
 
+[[nodiscard]] inline u64 Mismatches(Check check) {
+    return g_mismatches[static_cast<std::size_t>(check)].load(std::memory_order_relaxed);
+}
+
 [[nodiscard]] inline u64 Take(Counter counter) {
     return g_counters[static_cast<std::size_t>(counter)].exchange(0, std::memory_order_relaxed);
 }
@@ -210,11 +229,14 @@ inline void Report() {
              "gathers {} skipped, {} run ({} found nothing, {} skipped with writes collected after "
              "the check); crossing writes {} ({}); usage resets {} clearing {} words, {} words "
              "left alone; collected writes {} in {} passes; deferred fence flushes submitted "
-             "early {}; verify mismatches {}",
+             "early {}; verify mismatches {} (since start: inline {}, query {}, report {}, gather "
+             "{}, tick {})",
              seconds, inline_fast, inline_locked, query_skipped, query_run, report_fast,
              report_locked, gather_skipped, gather_run, gather_empty, gather_races, crossing_writes,
              g_collect_split ? "split" : "lost", tick_resets, tick_cleared, tick_skipped,
-             apply_ranges, apply_passes, early_submits, mismatches);
+             apply_ranges, apply_passes, early_submits, mismatches,
+             Mismatches(Check::InlineGpuData), Mismatches(Check::InlineQuery),
+             Mismatches(Check::Report), Mismatches(Check::Gather), Mismatches(Check::Tick));
 }
 
 } // namespace VideoCommon::BackX

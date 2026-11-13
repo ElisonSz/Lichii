@@ -477,3 +477,16 @@ TEST_CASE("BackX collect split: a racing gatherer gets every byte of every write
         REQUIRE(gathered == collected);
     }
 }
+
+TEST_CASE("BackX verify: mismatches are counted per check", "[video_core][nx2_backx]") {
+    const u64 gather = BackX::Mismatches(BackX::Check::Gather);
+    const u64 report = BackX::Mismatches(BackX::Check::Report);
+    const u64 total = Counted(BackX::Counter::Mismatches);
+    for (int i = 0; i < 100; ++i) {
+        BackX::Mismatch(BackX::Check::Gather, "test", 0, 0);
+    }
+    BackX::Mismatch(BackX::Check::Report, "test", 0x1000, 4);
+    REQUIRE(BackX::Mismatches(BackX::Check::Gather) - gather == 100);
+    REQUIRE(BackX::Mismatches(BackX::Check::Report) - report == 1);
+    REQUIRE(Counted(BackX::Counter::Mismatches) - total == 101);
+}

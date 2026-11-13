@@ -3304,7 +3304,8 @@ bool RasterizerVulkan::NoteReportPending(DAddr addr, u64 size) {
             std::scoped_lock lock{buffer_cache.mutex};
             const bool noted = buffer_cache.NoteReportPending(addr, size);
             if (noted) {
-                VideoCommon::BackX::Mismatch("report on a read-back page", addr, size);
+                VideoCommon::BackX::Mismatch(VideoCommon::BackX::Check::Report,
+                                             "report on a read-back page", addr, size);
             }
             return noted;
         }
@@ -4452,7 +4453,8 @@ bool BackXInlineCaches(BufferCache& buffer_cache, QueryCache& query_cache, DAddr
         if (BackX::g_verify) [[unlikely]] {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
-                BackX::Mismatch("inline write into GPU-written buffer data", addr, size);
+                BackX::Mismatch(BackX::Check::InlineGpuData,
+                                "inline write into GPU-written buffer data", addr, size);
                 buffer_cache.Nx2NoteListHostWrite(addr, size);
                 uploaded = buffer_cache.InlineMemory(addr, size, memory);
             }
@@ -4473,7 +4475,8 @@ bool BackXInlineCaches(BufferCache& buffer_cache, QueryCache& query_cache, DAddr
         // HoldsQueries looks at every report overlapping the range (a superset of what
         // InvalidateRegion drops).
         if (BackX::g_verify && query_cache.HoldsQueries(addr, size)) [[unlikely]] {
-            BackX::Mismatch("inline write over a cached query", addr, size);
+            BackX::Mismatch(BackX::Check::InlineQuery, "inline write over a cached query", addr,
+                            size);
             query_cache.InvalidateRegion(addr, size);
         }
     }

@@ -116,7 +116,8 @@ private:
         BackX::Count(BackX::Counter::TickWordsSkipped, pages.size() - (set_end - set_begin));
         if (BackX::g_verify) [[unlikely]] {
             if (std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
-                BackX::Mismatch("usage tracker word set outside the tracked extent", set_begin,
+                BackX::Mismatch(BackX::Check::Tick,
+                                "usage tracker word set outside the tracked extent", set_begin,
                                 set_end);
                 std::ranges::fill(pages, 0ULL);
             }

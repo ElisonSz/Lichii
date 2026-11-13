@@ -208,7 +208,8 @@ struct GPU::Impl {
         if (collect_ran) {
             BackX::Count(BackX::Counter::GatherRaces);
         } else {
-            BackX::Mismatch("collected CPU write while no manager showed one", 0, 0);
+            BackX::Mismatch(BackX::Check::Gather, "collected CPU write while no manager showed one",
+                            0, 0);
         }
     }
 
