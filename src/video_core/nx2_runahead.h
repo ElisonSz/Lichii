@@ -56,6 +56,15 @@ inline bool w1{};
 /// EDEN_NX2_RUNAHEAD_W1_VERIFY=1 (implies W1): each such pass keeps a waiter of its own that the
 /// release must latch.
 inline bool w1_verify{};
+/// EDEN_NX2_RUNAHEAD_LANDINGS=1: W1 passes (as EDEN_NX2_RUNAHEAD_W1) without holding the back:
+/// from the pass until it closes a landing window, the back makes every guest-visible landing a
+/// fence operation (after the release's fence), and the front notes the releases it sends as
+/// landing once a fence ran (GpuSplit::OpenLandingWindow). Takes precedence over the W1 hold.
+inline bool landings{};
+/// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY=1 (implies LANDINGS): each window's acquire keeps a waiter
+/// its release must latch before any landing converted in the window is applied, and the front
+/// counts its reads of a word whose converted landing is still pending.
+inline bool landings_verify{};
 /// EDEN_NX2_RUNAHEAD_QMD=1: the QMD view places the writes to the QMDs it reads by exact range from
 /// the run-ahead write log, not by hashed 256-byte granule (FrontQmdView::ReadDescriptor).
 inline bool qmd{};
@@ -74,8 +83,11 @@ inline void ReadSwitch() {
     valve = valve_verify || SwitchIs("EDEN_NX2_RUNAHEAD_VALVE", '1');
     w1_verify = SwitchIs("EDEN_NX2_RUNAHEAD_W1_VERIFY", '1');
     w1 = w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_W1", '1');
-    stats = (enabled || valve || w1) &&
-            (verify || valve_verify || w1_verify || SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));
+    landings_verify = SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY", '1');
+    landings = landings_verify || SwitchIs("EDEN_NX2_RUNAHEAD_LANDINGS", '1');
+    stats = (enabled || valve || w1 || landings) &&
+            (verify || valve_verify || w1_verify || landings_verify ||
+             SwitchIs("EDEN_NX2_RUNAHEAD_STATS", '1'));
 }
 
 /// What the reach of an acquire is (GpuSplit::RunAheadReach): the last kind of entry sent before
@@ -103,11 +115,12 @@ struct Answer {
 /// EDEN_NX2_RUNAHEAD_W1: whether a fence-flagged release decides an acquire now
 /// (GpuSplit::W1Release), or why not.
 enum class W1 : u8 {
-    Pass,     ///< The release meets it and will latch its waiter as it lands
-    NotW1,    ///< The view's answer does not wait for a fence-flagged release
-    NotPlain, ///< The release is a reduction, a maximum, or a value the front can't tell
-    Unmet,    ///< Its payload does not meet the acquire
-    Unlatched ///< The acquire's waiter has no slot
+    Pass,       ///< The release meets it and will latch its waiter as it lands
+    NotW1,      ///< The view's answer does not wait for a fence-flagged release
+    NotPlain,   ///< The release is a reduction, a maximum, or a value the front can't tell
+    Unmet,      ///< Its payload does not meet the acquire
+    Unlatched,  ///< The acquire's waiter has no slot
+    Overwritten ///< A write over the word was sent after it (it may drop the release)
 };
 
 /// The front's counts, logged every 10 s and cleared (ReportCounters; EDEN_NX2_RUNAHEAD_STATS).
@@ -122,6 +135,7 @@ struct Counters {
     u64 shim_met{}; ///< Syncpoint shim acquires met without a drain
     u64 shim_drained{};
     u64 upload_qmds{}; ///< QMD descriptors read from a queued inline upload
+    u64 upload_qmds_partial{}; ///< ..._QMD: of those, the upload wrote part, memory the rest
     u64 unvalued{};    ///< QMD signals whose releases the front did not note when it sent them
     u64 lead_sum{};    ///< Ring words the back had yet to run at the acquires (the front's lead)
     u64 lead_max{};
@@ -139,7 +153,14 @@ struct Counters {
     u64 w1_confirmed{};       ///< ..._VERIFY: passes whose own waiter a write latched
     u64 w1_unconfirmed{};     ///< ..._VERIFY: passes no write latched within 250 ms
     u64 w1_unchecked{};       ///< ..._VERIFY: passes with no check slot free
+    u64 w1_overwritten{};     ///< Not passed: a write over the word was sent after the release
     u64 w1_holds{};   ///< Passes whose release had not landed: the back waits for it (W1 hold)
+    u64 windows_opened{};      ///< LANDINGS: landing windows opened at a W1 pass
+    u64 windows_extended{};    ///< ... passes on a later release while one was open
+    u64 windows_closed{};      ///< ... closes sent once the windows' releases landed
+    u64 windows_acked{};       ///< ... closes the back acknowledged (it converts no more)
+    u64 notes_fenced{};        ///< ... releases noted as landing once a fence ran, not at run
+    u64 checks_unregistered{}; ///< ..._VERIFY: windows without a check waiter (no slot)
     u64 qmd_exact{};  ///< EDEN_NX2_RUNAHEAD_QMD: QMD reads with the exact placement
     u64 qmd_sooner{}; ///< Of those: read now where the granules held them back
     u64 uploads{};    ///< Compute inline uploads seen (exec)
@@ -164,5 +185,56 @@ struct HoldCounters {
     std::atomic<u64> wait_ns{};
 };
 inline HoldCounters holds;
+
+/// EDEN_NX2_RUNAHEAD_LANDINGS: the back's and the fencing thread's counts, cleared by the log.
+struct LandingCounters {
+    std::atomic<u64> reports{};    ///< Payload reports that would land at once, made fenced
+    std::atomic<u64> operations{}; ///< Fence operations that would run at once, attached
+    std::atomic<u64> pending_max{};
+    std::atomic<u64> extended{}; ///< Entry boundaries after a close with landings still pending
+    std::atomic<u64> fences{};   ///< Fences made for pending landings (close, extension)
+    std::atomic<u64> ordered{};  ///< ..._VERIFY: applied after their window's release landed
+    std::atomic<u64> out_of_order{};
+    std::atomic<u64> unchecked{};       ///< ..._VERIFY: their window's check slot was reused
+    std::atomic<u64> early_reads{};     ///< ..._VERIFY: front reads of a word with one pending
+    std::atomic<u64> overwrite_waits{}; ///< Writes over reports waiting for the window to land
+    std::atomic<u64> overwrite_ns{};
+};
+inline LandingCounters landing_counts;
+
+/// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: a window's check, a waiter its release must latch (the
+/// waiter's owner is the slot). The front registers and retires it; anyone reads it.
+struct LandingCheck {
+    std::atomic<u32> generation{};
+    std::atomic<bool> latched{}; ///< Seen latched by the front (set before it removed the waiter)
+    bool registered{};           ///< Front only: the waiter is registered
+};
+inline std::array<LandingCheck, 16> landing_checks;
+/// A check as an entry carries it: slot + 1 in the low byte (0: none), generation above.
+[[nodiscard]] inline u64 PackLandingCheck(size_t slot, u32 generation) {
+    return static_cast<u64>(slot + 1) | (u64{generation} << 8);
+}
+
+/// EDEN_NX2_RUNAHEAD_LANDINGS: set around a fence operation that is a guest-visible landing
+/// (FenceManager::SignalFence converts only those): syncpoint increments, QMD reductions.
+/// `device`: the word it writes, for the verify (0 if not one word).
+struct LandingScope {
+    explicit LandingScope(u64 device_ = 0) : previous{device}, was_active{active} {
+        active = true;
+        device = device_;
+    }
+    ~LandingScope() {
+        active = was_active;
+        device = previous;
+    }
+    LandingScope(const LandingScope&) = delete;
+    LandingScope& operator=(const LandingScope&) = delete;
+    static inline thread_local bool active{};
+    static inline thread_local u64 device{};
+
+private:
+    u64 previous;
+    bool was_active;
+};
 
 } // namespace VideoCommon::RunAhead

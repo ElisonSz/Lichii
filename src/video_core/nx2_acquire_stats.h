@@ -384,19 +384,41 @@ inline void ReportRunAhead() {
         HW_GPU,
         "Run-ahead front {:.1f} s: valves without a drain {} (only the drain found {}, longest "
         "wait at one {:.1f} ms); W1 "
-        "candidates {}, passed {} (not plain {}, payload unmet {}, no waiter slot {}), "
+        "candidates {}, passed {} (not plain {}, payload unmet {}, no waiter slot {}, written "
+        "over after it {}), "
         "suspended ones passed at a poll {}, holds {} (the back waited {}, {:.2f} ms), verify "
         "confirmed {}, unconfirmed {}, unchecked {}; QMD reads placed exactly {} (read sooner "
         "{}); compute uploads {} (not one linear line {}, too long {}, with list placeholders "
-        "{}), QMDs last written by part of an upload {}",
+        "{}), QMDs last written by part of an upload {} (read with memory for the rest {})",
         seconds, counts.valve_requests, counts.valve_drain_passes,
         static_cast<double>(counts.valve_wait_max_ns) / 1e6, counts.w1_candidates, counts.w1_passes,
-        counts.w1_not_plain, counts.w1_unmet, counts.w1_unlatched, counts.w1_poll_passes,
-        counts.w1_holds, RunAhead::holds.waits.exchange(0, std::memory_order_relaxed),
+        counts.w1_not_plain, counts.w1_unmet, counts.w1_unlatched, counts.w1_overwritten,
+        counts.w1_poll_passes, counts.w1_holds,
+        RunAhead::holds.waits.exchange(0, std::memory_order_relaxed),
         static_cast<double>(RunAhead::holds.wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
         counts.w1_confirmed, counts.w1_unconfirmed, counts.w1_unchecked, counts.qmd_exact,
         counts.qmd_sooner, counts.uploads, counts.upload_rejects[0], counts.upload_rejects[1],
-        counts.upload_rejects[2], counts.upload_rejects[3]);
+        counts.upload_rejects[2], counts.upload_rejects[3], counts.upload_qmds_partial);
+    if (RunAhead::landings) {
+        auto& landing = RunAhead::landing_counts;
+        const auto take = [](std::atomic<u64>& value) {
+            return value.exchange(0, std::memory_order_relaxed);
+        };
+        LOG_INFO(HW_GPU,
+                 "Run-ahead landings {:.1f} s: windows opened {}, extended {}, closed {} "
+                 "(acknowledged {}), releases noted fenced {}; landings converted: reports {}, "
+                 "fence operations {}, pending max {}; entries after a close with some pending "
+                 "{}, fences made for them {}; writes over reports that waited {} ({:.2f} ms); "
+                 "verify ordered {}, out of order {}, unchecked {}, "
+                 "reads with one pending {}, windows without a check {}",
+                 seconds, counts.windows_opened, counts.windows_extended, counts.windows_closed,
+                 counts.windows_acked, counts.notes_fenced, take(landing.reports),
+                 take(landing.operations), take(landing.pending_max), take(landing.extended),
+                 take(landing.fences), take(landing.overwrite_waits),
+                 static_cast<double>(take(landing.overwrite_ns)) / 1e6, take(landing.ordered),
+                 take(landing.out_of_order), take(landing.unchecked), take(landing.early_reads),
+                 counts.checks_unregistered);
+    }
     const double lead_avg = counts.acquires == 0 ? 0.0
                                                  : static_cast<double>(counts.lead_sum) /
                                                        static_cast<double>(counts.acquires);

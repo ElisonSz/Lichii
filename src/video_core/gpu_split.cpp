@@ -30,6 +30,7 @@
 #include "video_core/nx2_sync_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
@@ -242,6 +243,17 @@ void GpuSplit::Stop() {
     run_ahead_waiting = 0;
     watched_pages.fill({});
     watched_count = 0;
+    landing_window_open = false;
+    landing_close_pending = false;
+    landing_window_tag = 0;
+    landing_close_end = 0;
+    landing_converting = false;
+    landing_closing = false;
+    landing_uncommitted = false;
+    landing_check = 0;
+    landing_back_tag = 0;
+    landing_rasterizer = nullptr;
+    landing_ack.store(0, std::memory_order_relaxed);
     published_local = 0;
     publish_held = false;
     logged_method_count = 0;
@@ -304,6 +316,216 @@ void GpuSplit::HoldBackUntilLanded(u64 entry) {
     if (RunAhead::stats) {
         ++RunAhead::counters.w1_holds;
     }
+}
+
+void GpuSplit::OpenLandingWindow(u64 entry, u64 check, VideoCore::RasterizerInterface* rasterizer) {
+    if (!active) {
+        return;
+    }
+    auto& counts = RunAhead::counters;
+    if (!landing_window_open) {
+        landing_window_open = true;
+        landing_close_pending = false; // Notes stay fenced: the window is open again
+        landing_window_tag = entry;
+        Defer([this, entry, check, rasterizer] { BackOpenLanding(entry, check, rasterizer); },
+              FastDrawNeutral, Writes::Noted);
+        counts.windows_opened += RunAhead::stats ? 1 : 0;
+        return;
+    }
+    if (entry > landing_window_tag) {
+        // Fences run in order: once this later release landed, the window's earlier ones have.
+        landing_window_tag = entry;
+        Defer(
+            [this, entry, check] {
+                landing_check = check;
+                landing_back_tag = (std::max)(landing_back_tag, entry);
+            },
+            FastDrawNeutral, Writes::Noted);
+        counts.windows_extended += RunAhead::stats ? 1 : 0;
+    }
+}
+
+void GpuSplit::CheckLandingWindow(VideoCore::RasterizerInterface* rasterizer) {
+    auto& counts = RunAhead::counters;
+    if (landing_close_pending && landing_ack.load(std::memory_order_acquire) >= landing_close_end) {
+        landing_close_pending = false;
+        counts.windows_acked += RunAhead::stats ? 1 : 0;
+    }
+    if (!landing_window_open ||
+        fenced_landed.load(std::memory_order_acquire) <= landing_window_tag) {
+        return;
+    }
+    landing_window_open = false;
+    landing_close_pending = true;
+    Defer([this, rasterizer] { BackCloseLanding(rasterizer); }, FastDrawNeutral, Writes::Noted);
+    landing_close_end = write_position;
+    counts.windows_closed += RunAhead::stats ? 1 : 0;
+}
+
+void GpuSplit::BackOpenLanding(u64 entry, u64 check, VideoCore::RasterizerInterface* rasterizer) {
+    landing_back_tag = (std::max)(landing_back_tag, entry);
+    landing_converting = true;
+    landing_closing = false;
+    landing_check = check;
+    landing_rasterizer = rasterizer;
+    // The submit the baseline's back made once it ran dry at the acquire: the release's fence
+    // goes to the host GPU now.
+    if (idle_hook != nullptr) {
+        idle_hook(idle_argument);
+    }
+}
+
+void GpuSplit::BackCloseLanding(VideoCore::RasterizerInterface* rasterizer) {
+    landing_closing = true;
+    landing_rasterizer = rasterizer;
+    // Converted landings not attached to a fence yet go with the next one: make it now.
+    MakeLandingFence();
+}
+
+void GpuSplit::MakeLandingFence() {
+    if (!landing_uncommitted || landing_rasterizer == nullptr) {
+        return;
+    }
+    landing_uncommitted = false;
+    landing_rasterizer->SignalReference();
+    landing_fence_at = std::chrono::steady_clock::now();
+    RunAhead::landing_counts.fences.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GpuSplit::MaybeEndLandings(u64 position) {
+    if (landing_pending.load(std::memory_order_acquire) == 0) {
+        // Nothing converted is pending: what lands from here on can land at run again.
+        landing_converting = false;
+        landing_closing = false;
+        landing_check = 0;
+        landing_ack.store(position, std::memory_order_release);
+        return;
+    }
+    RunAhead::landing_counts.extended.fetch_add(1, std::memory_order_relaxed);
+    if (landing_uncommitted &&
+        std::chrono::steady_clock::now() - landing_fence_at > std::chrono::milliseconds{1}) {
+        MakeLandingFence();
+    }
+}
+
+struct GpuSplit::LandingToken {
+    LandingToken(GpuSplit& split_, u64 device_, u64 check_)
+        : split{split_}, device{device_}, check{check_} {}
+    ~LandingToken() {
+        if (device != 0) {
+            std::scoped_lock lock{split.landing_words_mutex};
+            if (const auto it = split.landing_words.find(device);
+                it != split.landing_words.end() && --it->second == 0) {
+                split.landing_words.erase(it);
+            }
+        }
+        if (split.landing_pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            // The last one: a write waiting before it overwrites may go on (WaitBeforeOverwrite).
+            std::scoped_lock lock{split.fenced_entries_mutex};
+            if (split.landing_waits) {
+                split.landed_cv.notify_all();
+            }
+        }
+    }
+    LandingToken(const LandingToken&) = delete;
+    LandingToken& operator=(const LandingToken&) = delete;
+    GpuSplit& split;
+    u64 device; ///< ..._VERIFY: the word it writes (0: not tracked)
+    u64 check;  ///< ..._VERIFY: its window's check (RunAhead::PackLandingCheck), 0: none
+};
+
+std::shared_ptr<void> GpuSplit::ConvertedLanding(u64 device, bool report) {
+    auto& counts = RunAhead::landing_counts;
+    const u64 pending = landing_pending.fetch_add(1, std::memory_order_acq_rel) + 1;
+    (report ? counts.reports : counts.operations).fetch_add(1, std::memory_order_relaxed);
+    for (u64 max = counts.pending_max.load(std::memory_order_relaxed);
+         pending > max &&
+         !counts.pending_max.compare_exchange_weak(max, pending, std::memory_order_relaxed);) {
+    }
+    const u64 word = RunAhead::landings_verify ? device & ~u64{3} : 0;
+    if (word != 0) {
+        std::scoped_lock lock{landing_words_mutex};
+        ++landing_words[word];
+    }
+    return std::make_shared<LandingToken>(*this, word, landing_check);
+}
+
+void GpuSplit::CheckConvertedLanding(const std::shared_ptr<void>& token) {
+    auto& counts = RunAhead::landing_counts;
+    const auto* const landing = static_cast<const LandingToken*>(token.get());
+    if (landing == nullptr || landing->check == 0) {
+        counts.unchecked.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const size_t slot = static_cast<size_t>(landing->check & 0xff) - 1;
+    const u32 generation = static_cast<u32>(landing->check >> 8);
+    auto& check = RunAhead::landing_checks[slot % RunAhead::landing_checks.size()];
+    const bool latched = check.latched.load(std::memory_order_acquire) ||
+                         Tegra::Nx2SemaphoreWaiters::Get().Latched(&check);
+    if (check.generation.load(std::memory_order_acquire) != generation) {
+        counts.unchecked.fetch_add(1, std::memory_order_relaxed); // The slot went to a later window
+        return;
+    }
+    if (latched) {
+        counts.ordered.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counts.out_of_order.fetch_add(1, std::memory_order_relaxed);
+    if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_ERROR(HW_GPU,
+                  "Run-ahead landings verify: a converted landing (word {:#x}) was applied before "
+                  "its window's release landed (check slot {}, generation {})",
+                  landing->device, slot, generation);
+    }
+}
+
+void GpuSplit::WaitBeforeOverwrite() {
+    const auto start = std::chrono::steady_clock::now();
+    const auto done = [this] {
+        return landing_pending.load(std::memory_order_acquire) == 0 &&
+               fenced_landed.load(std::memory_order_acquire) > landing_back_tag;
+    };
+    if (done()) {
+        return;
+    }
+    // As WaitLanded: what they wait for goes to a fence and to the host GPU first.
+    SealFencedEntries(back_entry_start);
+    MakeLandingFence();
+    if (idle_hook != nullptr) {
+        idle_hook(idle_argument);
+    }
+    const std::stop_token stop = back_thread.get_stop_token();
+    bool warned = false;
+    std::unique_lock lock{fenced_entries_mutex};
+    landing_waits = true;
+    while (!done() && !stop.stop_requested()) {
+        // In the middle of an engine method: no tick is served here, unlike between entries.
+        if (landed_cv.wait_for(lock, std::chrono::milliseconds{1}) != std::cv_status::timeout) {
+            continue;
+        }
+        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds{2}) {
+            warned = true;
+            LOG_WARNING(HW_GPU,
+                        "Run-ahead landings: a write waits 2 s for {} converted landings and the "
+                        "window's releases (entry {:#x}, landed {:#x})",
+                        landing_pending.load(std::memory_order_relaxed), landing_back_tag,
+                        fenced_landed.load(std::memory_order_relaxed));
+        }
+    }
+    landing_waits = false;
+    lock.unlock();
+    auto& counts = RunAhead::landing_counts;
+    counts.overwrite_waits.fetch_add(1, std::memory_order_relaxed);
+    counts.overwrite_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()),
+        std::memory_order_relaxed);
+}
+
+bool GpuSplit::LandingPendingAt(u64 device) const {
+    std::scoped_lock lock{landing_words_mutex};
+    return landing_words.contains(device & ~u64{3});
 }
 
 void GpuSplit::WaitLanded(u64 entry) {
@@ -491,6 +713,11 @@ bool GpuSplit::WaitForSync() {
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, Landing landing,
                                   bool at_least, SemaphoreWriter writer) {
+    if (landing == Landing::AtRun && (landing_window_open || landing_close_pending)) [[unlikely]] {
+        // EDEN_NX2_RUNAHEAD_LANDINGS: the back may make it a fence operation (OpenLandingWindow).
+        landing = Landing::Fenced;
+        RunAhead::counters.notes_fenced += RunAhead::stats ? 1 : 0;
+    }
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases in memory hold their values.
         std::erase_if(semaphore_writes,
@@ -911,16 +1138,21 @@ std::optional<u64> GpuSplit::LoggedWritesTarget(DAddr address, u64 size) const {
         // Writes to it sent before it was watched were not logged.
         target = (std::max)(target, watched->since);
     }
-    // As RunAheadReach: newest first, down to the writes logged before the back's position.
-    const u64 done = consumed.load(std::memory_order_acquire);
+    // Newest first: the last write sent over the range, whether the back ran it or not. The QMD
+    // view orders it against the signal it values (a write sent after a signal valued late counts
+    // even once it ran: memory holds it, the back read what was before). No write logged at or
+    // before the target can place one later (a position never passes its `appended`).
+    constexpr u64 MaxScan = 1024;
     const u64 logged = (std::min<u64>)(run_ahead_count, RunAheadLogSize);
     u64 scanned = 0;
     for (u64 i = 1; i <= logged; ++i) {
         const RunAheadWrite& entry = run_ahead_log[(run_ahead_count - i) % RunAheadLogSize];
-        if (entry.appended <= done) {
+        if (entry.appended <= target) {
             break;
         }
-        ++scanned;
+        if (++scanned > MaxScan) {
+            return std::nullopt; // The granules decide
+        }
         if (entry.position > target && entry.begin < address + size &&
             address < entry.begin + entry.size) {
             target = entry.position;
@@ -1374,6 +1606,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             // Keep registration open through Execute: an entry can send several reports, and
             // the first fence can finish before the back has even sent the last one.
             back_fenced_entry.reset();
+            if (landing_closing) [[unlikely]] {
+                MaybeEndLandings(read_position);
+            }
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
@@ -1395,6 +1630,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         SealFencedEntries(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
+        if (landing_uncommitted) [[unlikely]] {
+            // EDEN_NX2_RUNAHEAD_LANDINGS: about to run dry; converted landings not attached to a
+            // fence yet would wait for the next one, which nothing may make while the back sleeps.
+            MakeLandingFence();
+        }
     }
     if (SyncTrace::enabled) {
         SyncTrace::IdleEnd(true);

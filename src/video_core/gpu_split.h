@@ -37,6 +37,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace VideoCore {
+class RasterizerInterface;
+}
+
 namespace Tegra::Engines {
 class EngineInterface;
 enum class EngineTypes : u32;
@@ -634,14 +638,57 @@ public:
     /// release, in the baseline's order. Only the front's own decoding goes on sooner. The sender
     /// first sends the fence work that lands them (Puller: ReleaseFences).
     void HoldBackUntilLanded(u64 entry);
+
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (front): an acquire just went on before the fenced writes of
+    /// `entry` landed (W1Release). Opens a landing window, or extends the open one to `entry`:
+    /// the back makes every guest-visible landing of what follows a fence operation, run after
+    /// every fence made before it (that release's included), until it closes the window; and the
+    /// front notes the releases it sends meanwhile as landing once a fence ran
+    /// (NoteSemaphoreWrite), so the view never reads their words before they landed. `check`:
+    /// ..._VERIFY's waiter for the release (RunAhead::PackLandingCheck), or 0. `rasterizer` makes
+    /// the fences that converted landings wait for when nothing else does.
+    void OpenLandingWindow(u64 entry, u64 check, VideoCore::RasterizerInterface* rasterizer);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (front, between methods: no release half sent): closes the window
+    /// once its releases landed, and takes the back's acknowledgement of a close. Notes stay fenced
+    /// until then: the back converts landings past a close while converted ones are pending.
+    void CheckLandingWindow(VideoCore::RasterizerInterface* rasterizer);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (back): whether a guest-visible landing now must become a fence
+    /// operation (query cache reports, FenceManager::SignalFence in a RunAhead::LandingScope).
+    [[nodiscard]] bool ConvertsLandings() const {
+        return on_back_thread && landing_converting;
+    }
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (back): a landing just became a fence operation; it holds the
+    /// token until it ran or was dropped (the back closes no window while one is pending).
+    /// `device`: its word (0: not one word), `report`: a query report (else a fence operation).
+    [[nodiscard]] std::shared_ptr<void> ConvertedLanding(u64 device, bool report);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (back): a converted landing waits for the next fence made
+    /// (SyncOperation); the back makes one before it runs dry or stops converting.
+    void NoteLandingUncommitted() {
+        landing_uncommitted = true;
+    }
+    /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY (whoever applies it, before it writes): its window's
+    /// release has landed (the window's check waiter latched).
+    static void CheckConvertedLanding(const std::shared_ptr<void>& token);
+    /// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: a converted landing to the word at `device` is pending.
+    [[nodiscard]] bool LandingPendingAt(u64 device) const;
+    /// EDEN_NX2_RUNAHEAD_LANDINGS (back, no cache lock held): a write is about to drop the reports
+    /// still to land where it writes (QueryCacheBase::InvalidateRegion). Waits until the window's
+    /// releases and every converted landing landed: the baseline sent the write only after its
+    /// acquire's release landed, and landed the converted ones as it ran them, so it never dropped
+    /// those.
+    void WaitBeforeOverwrite();
     /// EDEN_NX2_RUNAHEAD_W1: whether the fence-flagged release `answer` waits for (or, NotMet, the
     /// last release sent to the word, not landed yet) decides the acquire now: it writes a payload
     /// the front knows (no reduction or maximum) that meets it (`matches`), and the acquire's
     /// waiter has a slot (`registered`), so the release latches it as it lands even if a later
-    /// write changes the word. The baseline goes on then at the latest; nothing else decides.
+    /// write changes the word. The baseline goes on then at the latest; nothing else decides,
+    /// unless a write over the word was sent after the release: the back drops a report that an
+    /// upload or a copy covers before its fence ran (the query cache's InvalidateRegion), and the
+    /// baseline decides from what that write left. `writers_before`: the acquire's (its reach), for
+    /// when no write log covers the word.
     template <typename Matches>
     [[nodiscard]] RunAhead::W1 W1Release(u64 device_address, const SemaphoreView& answer,
-                                         bool registered, Matches&& matches,
+                                         bool registered, u64 writers_before, Matches&& matches,
                                          std::optional<QueuedSemaphoreWrite>* release) const {
         using ViewKind = SemaphoreView::Kind;
         if (!((answer.kind == ViewKind::Unknown && answer.write_dependency) ||
@@ -661,6 +708,13 @@ public:
         }
         if (!registered) {
             return RunAhead::W1::Unlatched;
+        }
+        // The release's own bytes are logged at its position; anything later wrote over it.
+        const auto logged = LoggedWritesTarget(device_address & ~u64{3}, sizeof(u32));
+        const u64 written =
+            logged ? (std::max)({*logged, last_unplaced_write, run_ahead_lost}) : writers_before;
+        if (written > queued->position) {
+            return RunAhead::W1::Overwritten;
         }
         if (release != nullptr) {
             *release = queued;
@@ -1046,6 +1100,30 @@ private:
     void WaitLanded(u64 entry);
     std::condition_variable landed_cv;
     bool landing_waits{}; ///< With fenced_entries_mutex held: the back waits in WaitLanded
+
+    // EDEN_NX2_RUNAHEAD_LANDINGS (OpenLandingWindow). Front:
+    bool landing_window_open{};
+    bool landing_close_pending{}; ///< A close sent that the back has not acknowledged
+    u64 landing_window_tag{};     ///< The latest release entry a window waits for
+    u64 landing_close_end{};      ///< The ring position after the last close sent
+    // Back:
+    bool landing_converting{};
+    bool landing_closing{}; ///< A close ran: stop converting once no converted landing is pending
+    bool landing_uncommitted{}; ///< A converted landing may wait for the next fence made
+    u64 landing_check{}; ///< ..._VERIFY: the open window's check (RunAhead::PackLandingCheck)
+    VideoCore::RasterizerInterface* landing_rasterizer{};
+    std::chrono::steady_clock::time_point landing_fence_at{};
+    void BackOpenLanding(u64 entry, u64 check, VideoCore::RasterizerInterface* rasterizer);
+    u64 landing_back_tag{};  ///< Back: the latest release entry the window waits for
+    void MakeLandingFence(); ///< Commits converted landings waiting for the next fence
+    void BackCloseLanding(VideoCore::RasterizerInterface* rasterizer);
+    void MaybeEndLandings(u64 position); ///< At entry boundaries while closing
+    struct LandingToken;
+    std::atomic<u64> landing_pending{}; ///< Converted landings not run or dropped yet (any thread)
+    std::atomic<u64> landing_ack{};     ///< The back's position when it stopped converting
+    /// ..._VERIFY: the words with converted landings pending, and how many (any thread).
+    mutable std::mutex landing_words_mutex;
+    std::unordered_map<u64, u32> landing_words;
 
     /// An entry's position as fenced writes name it: with this start of the split in the high
     /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions

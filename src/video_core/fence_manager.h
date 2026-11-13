@@ -26,6 +26,7 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_backx.h"
@@ -102,6 +103,24 @@ public:
                                       ? Settings::IsGPULevelHigh()
                                       : Settings::IsGPUFenceBehaviorBalanced() ||
                                             Settings::IsGPUFenceBehaviorAccurate());
+        // EDEN_NX2_RUNAHEAD_LANDINGS: a guest-visible landing (RunAhead::LandingScope) in a landing
+        // window becomes an operation of this fence, or of the next one if this one is skipped,
+        // instead of running now: after the fence-flagged release an acquire went on before
+        // (GpuSplit::OpenLandingWindow). No fence is made for it, no work submitted.
+        const bool converted = !delay_fence && RunAhead::LandingScope::active &&
+                               RunAhead::landings && GpuSplit::Get().ConvertsLandings();
+        if (converted) [[unlikely]] {
+            // The entry's fenced writes include it (the front noted the release fenced).
+            func = [operation = std::move(func),
+                    token = GpuSplit::Get().ConvertedLanding(RunAhead::LandingScope::device, false),
+                    entry = GpuSplit::Get().TrackFencedWrite()]() mutable {
+                if (RunAhead::landings_verify) {
+                    GpuSplit::CheckConvertedLanding(token);
+                }
+                operation();
+                entry.reset(); // Landed: the entry's fenced writes may complete
+            };
+        }
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -111,6 +130,12 @@ public:
         }
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+            if (converted) [[unlikely]] {
+                SyncOperation(std::move(func));
+                GpuSplit::Get().NoteLandingUncommitted();
+                rasterizer.InvalidateGPUCache();
+                return;
+            }
             func();
             rasterizer.InvalidateGPUCache();
             return;
@@ -127,7 +152,7 @@ public:
         }
         {
             std::scoped_lock lock{uncommitted_guard};
-            if (delay_fence) {
+            if (delay_fence || converted) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
@@ -143,7 +168,7 @@ public:
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
-        if (!delay_fence) {
+        if (!delay_fence && !converted) {
             func();
         }
         fences.push(std::move(new_fence));
@@ -170,6 +195,8 @@ public:
         }
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
+        // The guest waits on host values (nvhost event waits): a landing.
+        const RunAhead::LandingScope landing_scope;
         SignalFence(std::move(func));
     }
 

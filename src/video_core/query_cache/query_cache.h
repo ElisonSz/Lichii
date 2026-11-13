@@ -263,8 +263,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     // Even an unmapped query completes its entry's report registration. Retaining this guard
     // until the operation finishes (or is discarded) keeps every report in the entry pending.
-    const bool immediate =
-        !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
+    bool immediate = !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
+    // EDEN_NX2_RUNAHEAD_LANDINGS: in a landing window it lands as the next fence's operation, after
+    // the fence-flagged release an acquire went on before (GpuSplit::OpenLandingWindow).
+    const bool converted = immediate && RunAhead::landings && GpuSplit::Get().ConvertsLandings();
+    immediate = immediate && !converted;
     auto split_completion =
         immediate ? std::shared_ptr<void>{} : VideoCommon::GpuSplit::Get().TrackFencedWrite();
     auto cpu_addr_opt = gpu_memory->GpuToCpuAddress(addr);
@@ -283,6 +286,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    std::shared_ptr<void> landing_token;
+    if (converted) [[unlikely]] {
+        landing_token = GpuSplit::Get().ConvertedLanding(cpu_addr, true);
+        GpuSplit::Get().NoteLandingUncommitted(); // SyncOperation below
+    }
     if (SemRecorder::Relevant(cpu_addr, has_timestamp ? 16U : 4U)) {
         const GPUVAddr partner = Tegra::Nx2SemaphoreMirror(addr);
         const GPUVAddr pair_gpu = partner != 0                           ? partner
@@ -319,11 +327,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
     std::function<void()> operation([this, streamer, query_base = query, query_location, pointer,
                                      pointer_timestamp, cpu_addr, addr, asid = gpu_memory->GetID(),
-                                     counter_type, mirrored, report_size, report_noted, sync_trace_id,
-                                     split_completion = std::move(split_completion),
+                                     counter_type, mirrored, report_size, report_noted,
+                                     sync_trace_id, split_completion = std::move(split_completion),
+                                     landing_token = std::move(landing_token),
                                      split_entry = VideoCommon::GpuSplit::Get().BackEntry(),
                                      watched =
                                          watch != 0 && (addr & ~GPUVAddr{0xf}) == watch]() mutable {
+        if (landing_token && RunAhead::landings_verify) [[unlikely]] {
+            GpuSplit::CheckConvertedLanding(landing_token);
+        }
         if (SemRecorder::Relevant(cpu_addr, report_size)) {
             SemRecorder::Add({.kind = "report-callback",
                               .address = cpu_addr,

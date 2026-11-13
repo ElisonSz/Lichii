@@ -102,6 +102,29 @@ struct RunAheadTestAccess {
     static u64 Tag(const GpuSplit& split, u64 position) {
         return split.EntryTag(position);
     }
+    /// The thread acts as the back (GpuSplit::ConvertsLandings looks at it).
+    static void ActAsBack(bool back) {
+        GpuSplit::on_back_thread = back;
+    }
+    /// The back finished entries up to `position` (BackLoop's seal).
+    static void Seal(GpuSplit& split, u64 position) {
+        split.SealFencedEntries(position);
+    }
+    /// BackLoop's check at an entry boundary.
+    static void Boundary(GpuSplit& split, u64 position) {
+        if (split.landing_closing) {
+            split.MaybeEndLandings(position);
+        }
+    }
+    static bool Converting(const GpuSplit& split) {
+        return split.landing_converting;
+    }
+    static void ClearLandings(GpuSplit& split) {
+        split.landing_window_open = false;
+        split.landing_close_pending = false;
+        split.landing_converting = false;
+        split.landing_closing = false;
+    }
     static bool Landed(const GpuSplit& split, u64 position) {
         return split.fenced_landed.load(std::memory_order_acquire) > split.EntryTag(position);
     }
@@ -554,46 +577,59 @@ TEST_CASE("Run-ahead W1 decisions", "[video_core][runahead]") {
     f.split->NoteSemaphoreWrite(Fixture::Word, 7, true, Split::Landing::Fenced);
     const u64 report = f.split->Position();
     Access::Send(*f.split, 2);
-    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, equals(7), &release) ==
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, 0, equals(7), &release) ==
           W1::Pass);
     REQUIRE(release.has_value());
     CHECK(release->payload == 7);
     CHECK(release->position == report);
     // Not met by its payload, no waiter slot, another position, a wait for writers.
-    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, equals(8), nullptr) ==
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), true, 0, equals(8), nullptr) ==
           W1::Unmet);
-    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), false, equals(7), nullptr) ==
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report), false, 0, equals(7), nullptr) ==
           W1::Unlatched);
-    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report + 1), true, equals(7), nullptr) ==
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(report + 1), true, 0, equals(7), nullptr) ==
           W1::NotW1);
     CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::Unknown, report}, true,
-                             equals(7), nullptr) == W1::NotW1);
-    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::Met}, true, equals(7),
+                             0, equals(7), nullptr) == W1::NotW1);
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::Met}, true, 0, equals(7),
                              nullptr) == W1::NotW1);
     // Ran but not landed: memory does not meet it yet (NotMet); the release still decides.
     Access::Consume(*f.split, f.split->Position());
-    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, equals(7),
-                             nullptr) == W1::Pass);
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, 0,
+                             equals(7), nullptr) == W1::Pass);
     // Landed: memory decides, as always.
     Access::Land(*f.split, f.split->Position());
-    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, equals(7),
-                             nullptr) == W1::NotW1);
+    CHECK(f.split->W1Release(Fixture::Word, Split::SemaphoreView{ViewKind::NotMet}, true, 0,
+                             equals(7), nullptr) == W1::NotW1);
     // A reduction or maximum, or a release behind a pending fenced one: the front can't tell.
     Access::Send(*f.split, 4);
     f.split->NoteSemaphoreWrite(Fixture::Word, 0, false, Split::Landing::Fenced);
     const u64 reduction = f.split->Position();
-    CHECK(f.split->W1Release(Fixture::Word, unknown_at(reduction), true, equals(0), nullptr) ==
+    CHECK(f.split->W1Release(Fixture::Word, unknown_at(reduction), true, 0, equals(0), nullptr) ==
           W1::NotPlain);
     Access::Send(*f.split, 4);
     f.split->NoteSemaphoreWrite(Fixture::Word + 4, 3, true, Split::Landing::Fenced);
     Access::Send(*f.split, 4);
     f.split->NoteSemaphoreWrite(Fixture::Word + 4, 5, true, Split::Landing::AtRun);
-    CHECK(f.split->W1Release(Fixture::Word + 4, Split::SemaphoreView{ViewKind::NotMet}, true,
+    CHECK(f.split->W1Release(Fixture::Word + 4, Split::SemaphoreView{ViewKind::NotMet}, true, 0,
                              equals(5), nullptr) == W1::NotPlain);
+    // A write over the word sent after a release (an upload, a copy) can drop it at the back: the
+    // baseline decides from what that write left. A write next to it, or one before it, does not.
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Fixture::Word + 0x20, 6, true, Split::Landing::Fenced);
+    const u64 later = f.split->Position();
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Fixture::Word + 0x24, 4);
+    CHECK(f.split->W1Release(Fixture::Word + 0x20, unknown_at(later), true, 0, equals(6),
+                             nullptr) == W1::Pass);
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Fixture::Word + 0x20, 4);
+    CHECK(f.split->W1Release(Fixture::Word + 0x20, unknown_at(later), true, 0, equals(6),
+                             nullptr) == W1::Overwritten);
     // A release landing at run is not W1 (the view waits for its entry and memory decides).
     Access::Send(*f.split, 4);
     f.split->NoteSemaphoreWrite(Fixture::Word + 8, 2, true, Split::Landing::AtRun);
-    CHECK(f.split->W1Release(Fixture::Word + 8, unknown_at(f.split->Position()), true, equals(2),
+    CHECK(f.split->W1Release(Fixture::Word + 8, unknown_at(f.split->Position()), true, 0, equals(2),
                              nullptr) == W1::NotW1);
 }
 
@@ -620,8 +656,9 @@ TEST_CASE("Run-ahead W1 passes where the release latches the baseline's waiter",
         int owner = 0;
         REQUIRE(waiters.Add(&owner, device, target, operation));
         const auto matches = [&](u32 value) { return gequal ? value >= target : value == target; };
-        const W1 decision = f.split->W1Release(
-            device, Split::SemaphoreView{ViewKind::Unknown, report, true}, true, matches, nullptr);
+        const W1 decision =
+            f.split->W1Release(device, Split::SemaphoreView{ViewKind::Unknown, report, true}, true,
+                               0, matches, nullptr);
         // Writes before the landing that don't meet it, then the landing, then later writes.
         for (u32 i = random() % 3; i > 0; --i) {
             const u32 value = static_cast<u32>(random() % 6);
@@ -689,6 +726,18 @@ TEST_CASE("Run-ahead exact placement of the writes a QMD read waits for",
     exact = f.split->LoggedWritesTarget(Qmd, 256);
     REQUIRE(exact.has_value());
     CHECK(*exact == into + 2);
+    // A write sent after a signal that the back already ran still orders after the signal: a
+    // view valuing the signal late must not read the QMD the write changed.
+    const u64 signal = f.split->Position();
+    Access::Send(*f.split, 4);
+    Access::Write(*f.split, Qmd + 0x68, 4); // Word 26
+    const u64 rewrite = f.split->Position();
+    Access::Send(*f.split, 2);
+    Access::Consume(*f.split, f.split->Position());
+    exact = f.split->LoggedWritesTarget(Qmd, 256);
+    REQUIRE(exact.has_value());
+    CHECK(*exact == rewrite);
+    CHECK(*exact > signal);
 }
 
 } // namespace
@@ -746,5 +795,287 @@ TEST_CASE("Run-ahead W1 hold: the back runs what follows once the release landed
     CHECK(Access::RunEntry(*f.split, hold2)); // Seals: lands at once
     CHECK(Access::Landed(*f.split, q2));
     CHECK(RunAhead::holds.waits.load() == 1);
+    Access::StopRing(*f.split);
+}
+
+namespace {
+struct LandingsScope {
+    LandingsScope() : was{RunAhead::landings} {
+        RunAhead::landings = true;
+    }
+    ~LandingsScope() {
+        RunAhead::landings = was;
+        Access::ActAsBack(false);
+    }
+    LandingsScope(const LandingsScope&) = delete;
+    LandingsScope& operator=(const LandingsScope&) = delete;
+    bool was;
+};
+
+bool NotedFenced(const Split& split, u64 word) {
+    const auto queued = split.QueuedSemaphoreWriteAt(word);
+    return queued && queued->fenced;
+}
+} // namespace
+
+TEST_CASE("Run-ahead landings: a window converts until its close is acknowledged",
+          "[video_core][runahead]") {
+    Fixture f;
+    LandingsScope on;
+    Access::StartRing(*f.split);
+    constexpr u64 Other = Fixture::Word + 0x100;
+    // The fence-flagged release Q, run by the back: its report waits for its fence.
+    Access::Send(*f.split, 4);
+    const u64 q = Access::LastEntry(*f.split);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 7, true, Split::Landing::Fenced);
+    Access::PendFenced(*f.split, q);
+    // An acquire went on before Q landed: the window opens.
+    const u64 open = Access::WritePosition(*f.split);
+    f.split->OpenLandingWindow(Access::Tag(*f.split, q), 0, nullptr);
+    REQUIRE(Access::WritePosition(*f.split) > open);
+    // A release sent in the window is noted as landing once a fence ran.
+    Access::Send(*f.split, 4);
+    const u64 r = Access::LastEntry(*f.split);
+    f.split->NoteSemaphoreWrite(Other, 1, true, Split::Landing::AtRun);
+    CHECK(NotedFenced(*f.split, Other));
+    // The back runs the window's entry and then the release: it converts its landing.
+    Access::ActAsBack(true);
+    CHECK_FALSE(f.split->ConvertsLandings());
+    REQUIRE(Access::RunEntry(*f.split, open));
+    CHECK(f.split->ConvertsLandings());
+    auto landing = f.split->ConvertedLanding(Other, true);
+    Access::PendFenced(*f.split, r); // Its report holds the entry's fenced writes
+    Access::Seal(*f.split, Access::WritePosition(*f.split));
+    Access::ActAsBack(false);
+    CHECK_FALSE(f.split->ConvertsLandings()); // Only the back converts
+    // Q has not landed: no close yet.
+    f.split->CheckLandingWindow(nullptr);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Other + 0x10, 1, true, Split::Landing::AtRun);
+    CHECK(NotedFenced(*f.split, Other + 0x10));
+    // Q lands: the front closes the window; until the back acknowledges it, notes stay fenced.
+    Access::CompleteFenced(*f.split, q);
+    REQUIRE(Access::Landed(*f.split, q));
+    const u64 close = Access::WritePosition(*f.split);
+    f.split->CheckLandingWindow(nullptr);
+    REQUIRE(Access::WritePosition(*f.split) > close);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Other + 0x20, 1, true, Split::Landing::AtRun);
+    CHECK(NotedFenced(*f.split, Other + 0x20));
+    // The back runs the close with a converted landing still pending: it keeps converting.
+    Access::ActAsBack(true);
+    REQUIRE(Access::RunEntry(*f.split, close));
+    Access::Boundary(*f.split, Access::WritePosition(*f.split));
+    CHECK(f.split->ConvertsLandings());
+    f.split->CheckLandingWindow(nullptr);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Other + 0x30, 1, true, Split::Landing::AtRun);
+    CHECK(NotedFenced(*f.split, Other + 0x30));                // Not acknowledged yet
+    CHECK(f.split->QueuedSemaphoreWriteAt(Other).has_value()); // Not landed: not in memory
+    // The converted landing ran: the back stops converting and acknowledges.
+    landing.reset();
+    Access::CompleteFenced(*f.split, r);
+    Access::Boundary(*f.split, Access::WritePosition(*f.split));
+    CHECK_FALSE(f.split->ConvertsLandings());
+    Access::ActAsBack(false);
+    f.split->CheckLandingWindow(nullptr);
+    Access::Send(*f.split, 4);
+    f.split->NoteSemaphoreWrite(Other + 0x40, 1, true, Split::Landing::AtRun);
+    CHECK_FALSE(NotedFenced(*f.split, Other + 0x40));
+    Access::StopRing(*f.split);
+}
+
+TEST_CASE("Run-ahead landings model: the back converts only what the front noted fenced, and "
+          "lands nothing at run before a converted landing",
+          "[video_core][runahead]") {
+    std::mt19937 random{0x1a4d};
+    u64 converted = 0;
+    u64 at_run = 0;
+    u64 extended = 0;
+    for (int round = 0; round < 200; ++round) {
+        Fixture f;
+        LandingsScope on;
+        Access::StartRing(*f.split);
+        enum class Kind { Release, Fenced, Protocol };
+        struct Sent {
+            u64 position;
+            Kind kind;
+            u64 word;
+            bool noted_fenced;
+        };
+        std::vector<Sent> sent;
+        u64 next_run = 0; // Index into `sent` the back runs next
+        // Fence order (FIFO): Q reports and converted landings complete in the order the back made
+        // them; a landing completes as its token drops.
+        struct Op {
+            u64 position;
+            std::shared_ptr<void> token; // Converted landings only
+        };
+        std::vector<Op> fence_ops;
+        size_t completed_ops = 0;
+        std::vector<u64> unlanded_q;
+        u64 word_counter = 0;
+        const auto front_step = [&] {
+            const int choice = static_cast<int>(random() % 10);
+            if (choice < 5) { // A release that lands at run
+                Access::Send(*f.split, 2);
+                const u64 word = Fixture::Word + 0x1000 + (word_counter++ % 64) * 0x10;
+                f.split->NoteSemaphoreWrite(word, 1, true, Split::Landing::AtRun);
+                sent.push_back({Access::LastEntry(*f.split), Kind::Release, word,
+                                NotedFenced(*f.split, word)});
+            } else if (choice < 7) { // A fence-flagged release
+                Access::Send(*f.split, 2);
+                f.split->NoteSemaphoreWrite(Fixture::Word, 3, true, Split::Landing::Fenced);
+                sent.push_back({Access::LastEntry(*f.split), Kind::Fenced, Fixture::Word, true});
+                unlanded_q.push_back(Access::LastEntry(*f.split));
+            } else if (choice < 9) { // An acquire on a release not landed goes on: a window
+                if (const auto entry = f.split->UnlandedFencedEntry(Fixture::Word)) {
+                    const u64 before = Access::WritePosition(*f.split);
+                    f.split->OpenLandingWindow(*entry, 0, nullptr);
+                    if (Access::WritePosition(*f.split) != before) {
+                        sent.push_back({before, Kind::Protocol, 0, false});
+                    }
+                }
+            } else { // Between methods: maybe close, take an acknowledgement
+                const u64 before = Access::WritePosition(*f.split);
+                f.split->CheckLandingWindow(nullptr);
+                if (Access::WritePosition(*f.split) != before) {
+                    sent.push_back({before, Kind::Protocol, 0, false});
+                }
+            }
+        };
+        const auto back_step = [&] {
+            if (next_run == sent.size()) {
+                return;
+            }
+            const Sent& entry = sent[next_run++];
+            Access::ActAsBack(true);
+            if (entry.kind == Kind::Protocol) {
+                REQUIRE(Access::RunEntry(*f.split, entry.position));
+            } else if (entry.kind == Kind::Fenced) {
+                Access::PendFenced(*f.split, entry.position);
+                fence_ops.push_back({entry.position, {}});
+            } else if (f.split->ConvertsLandings()) {
+                // Converted: the front must have noted it fenced.
+                CHECK(entry.noted_fenced);
+                ++converted;
+                Access::PendFenced(*f.split, entry.position);
+                fence_ops.push_back({entry.position, f.split->ConvertedLanding(entry.word, true)});
+            } else {
+                // Lands at run: nothing converted may still be pending.
+                ++at_run;
+                for (size_t i = completed_ops; i < fence_ops.size(); ++i) {
+                    CHECK_FALSE(fence_ops[i].token);
+                }
+            }
+            const u64 end =
+                next_run < sent.size() ? sent[next_run].position : Access::WritePosition(*f.split);
+            Access::Seal(*f.split, end);
+            const bool closing_with_pending = Access::Converting(*f.split);
+            Access::Boundary(*f.split, end);
+            extended += closing_with_pending && Access::Converting(*f.split) ? 1 : 0;
+            Access::ActAsBack(false);
+        };
+        const auto fence_step = [&] {
+            if (completed_ops == fence_ops.size()) {
+                return;
+            }
+            Op& op = fence_ops[completed_ops++];
+            op.token.reset();
+            Access::CompleteFenced(*f.split, op.position);
+            std::erase(unlanded_q, op.position);
+        };
+        for (int step = 0; step < 300; ++step) {
+            const int who = static_cast<int>(random() % 3);
+            if (who == 0) {
+                front_step();
+            } else if (who == 1) {
+                back_step();
+            } else {
+                fence_step();
+            }
+        }
+        Access::StopRing(*f.split);
+    }
+    // The model reaches every state: conversions, landings at run, and closes that wait.
+    CHECK(converted > 100);
+    CHECK(at_run > 100);
+    CHECK(extended > 10);
+}
+
+TEST_CASE("Run-ahead landings verify: a converted landing checks its window's release",
+          "[video_core][runahead]") {
+    Fixture f;
+    LandingsScope on;
+    const bool verify_was = RunAhead::landings_verify;
+    RunAhead::landings_verify = true;
+    Access::StartRing(*f.split);
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    auto& counts = RunAhead::landing_counts;
+    counts.ordered.store(0);
+    counts.out_of_order.store(0);
+    counts.unchecked.store(0);
+    // The window's check: a waiter for the acquire (equal 7) its release must latch.
+    auto& check = RunAhead::landing_checks[0];
+    const u32 generation = check.generation.load() + 1;
+    check.generation.store(generation);
+    check.latched.store(false);
+    REQUIRE(waiters.Add(&check, Fixture::Word, 7, Tegra::Nx2SemaphoreWaiters::AcquireEqual));
+    f.split->OpenLandingWindow(1, RunAhead::PackLandingCheck(0, generation), nullptr);
+    Access::ActAsBack(true);
+    REQUIRE(Access::RunEntry(*f.split, 2));
+    auto early = f.split->ConvertedLanding(Fixture::Word + 0x40, true);
+    CHECK(f.split->LandingPendingAt(Fixture::Word + 0x40));
+    Split::CheckConvertedLanding(early); // Applied before the release landed
+    CHECK(counts.out_of_order.load() == 1);
+    waiters.OnWrite(Fixture::Word, 7); // The release lands
+    auto later = f.split->ConvertedLanding(Fixture::Word + 0x40, true);
+    Split::CheckConvertedLanding(later);
+    CHECK(counts.ordered.load() == 1);
+    // The slot went to a later window: not checked.
+    check.generation.store(generation + 1);
+    Split::CheckConvertedLanding(later);
+    CHECK(counts.unchecked.load() == 1);
+    early.reset();
+    later.reset();
+    CHECK_FALSE(f.split->LandingPendingAt(Fixture::Word + 0x40));
+    waiters.Remove(&check);
+    Access::ActAsBack(false);
+    RunAhead::landings_verify = verify_was;
+    Access::StopRing(*f.split);
+}
+
+TEST_CASE("Run-ahead landings: a write over reports waits for the window and its landings",
+          "[video_core][runahead]") {
+    Fixture f;
+    LandingsScope on;
+    Access::StartRing(*f.split);
+    RunAhead::landing_counts.overwrite_waits.store(0);
+    Access::Send(*f.split, 4);
+    const u64 q = Access::LastEntry(*f.split);
+    f.split->NoteSemaphoreWrite(Fixture::Word, 7, true, Split::Landing::Fenced);
+    Access::PendFenced(*f.split, q);
+    const u64 open = Access::WritePosition(*f.split);
+    f.split->OpenLandingWindow(Access::Tag(*f.split, q), 0, nullptr);
+    Access::ActAsBack(true);
+    REQUIRE(Access::RunEntry(*f.split, open));
+    auto landing = f.split->ConvertedLanding(Fixture::Word + 0x40, true);
+    Access::ActAsBack(false);
+    std::atomic<bool> done{false};
+    std::thread back{[&] {
+        Access::ActAsBack(true);
+        f.split->WaitBeforeOverwrite();
+        Access::ActAsBack(false);
+        done.store(true);
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    CHECK_FALSE(done.load()); // The window's release has not landed
+    Access::CompleteFenced(*f.split, q);
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    CHECK_FALSE(done.load()); // A converted landing is still pending
+    landing.reset();
+    back.join();
+    CHECK(done.load());
+    CHECK(RunAhead::landing_counts.overwrite_waits.load() == 1);
     Access::StopRing(*f.split);
 }

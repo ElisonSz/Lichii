@@ -46,6 +46,13 @@
 
 namespace Tegra::Engines {
 
+namespace {
+// EDEN_NX2_RUNAHEAD_LANDINGS_VERIFY: the word a converted landing writes (0 unless verifying).
+[[nodiscard]] u64 LandingDevice(MemoryManager& memory, GPUVAddr address) {
+    return VideoCommon::RunAhead::landings_verify ? memory.GpuToCpuAddress(address).value_or(0) : 0;
+}
+} // Anonymous namespace
+
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
     , upload_state{memory_manager, regs.upload}
@@ -135,6 +142,9 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
                                        .value = payload,
                                        .entry = recorder_entry,
                                        .flags = reduction});
+        // EDEN_NX2_RUNAHEAD_LANDINGS: a guest-visible landing (FenceManager::SignalFence).
+        const VideoCommon::RunAhead::LandingScope landing_scope{
+            LandingDevice(memory_manager, address)};
         rasterizer->SignalFence([this, address, payload, reduction, recorder_device,
                                  recorder_entry] {
             const u32 before = memory_manager.Read<u32>(address);
@@ -452,6 +462,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                                                .entry = recorder_entry,
                                                .flags = flags});
                 if (flags & (1U << 26)) {
+                    // EDEN_NX2_RUNAHEAD_LANDINGS: a guest-visible landing
+                    // (FenceManager::SignalFence).
+                    const VideoCommon::RunAhead::LandingScope landing_scope{
+                        LandingDevice(memory_manager, address)};
                     rasterizer->SignalFence([this, address, payload, flags, checked,
                                              recorder_device, recorder_entry] {
                         const auto combine = [&](u32 current) {
@@ -507,6 +521,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
+                    // EDEN_NX2_RUNAHEAD_LANDINGS: a guest-visible landing
+                    // (FenceManager::SignalFence).
+                    const VideoCommon::RunAhead::LandingScope landing_scope{
+                        LandingDevice(memory_manager, address)};
                     rasterizer->SignalFence([this, address, payload, checked, recorder_device,
                                              recorder_entry] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };

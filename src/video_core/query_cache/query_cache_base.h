@@ -18,6 +18,7 @@
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/types.h"
@@ -62,6 +63,12 @@ public:
     ~QueryCacheBase();
 
     void InvalidateRegion(VAddr addr, std::size_t size) {
+        // EDEN_NX2_RUNAHEAD_LANDINGS: the back, in a landing window, must not drop reports the
+        // baseline had landed before this write (GpuSplit::WaitBeforeOverwrite).
+        if (RunAhead::landings && GpuSplit::Get().ConvertsLandings() && HoldsQueries(addr, size))
+            [[unlikely]] {
+            GpuSplit::Get().WaitBeforeOverwrite();
+        }
         IterateCache<true>(addr, size,
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }

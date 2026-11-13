@@ -582,6 +582,33 @@ private:
             if (RunAhead::stats && PartlyUploaded(memory.Id(), qmd_address, target)) {
                 ++RunAhead::counters.upload_rejects[3];
             }
+            // EDEN_NX2_RUNAHEAD_QMD: the last write to the QMD is an upload still queued that
+            // covers part of it (games rewrite a few words of a QMD between dispatches). Where the
+            // last writes to the rest ran, memory holds the rest as the back will find it: nothing
+            // sent after the upload wrote anywhere in the QMD (it is the last write there), and
+            // the exact placement tells the parts within a granule apart.
+            if (const KeptUpload* part =
+                    RunAhead::qmd ? PartUpload(split, memory.Id(), qmd_address, target) : nullptr;
+                part != nullptr) {
+                const GPUVAddr qmd_end = qmd_address + sizeof(descriptor);
+                const GPUVAddr begin = (std::max)(part->address, qmd_address);
+                const GPUVAddr end = (std::min<GPUVAddr>)(part->address + part->size, qmd_end);
+                const bool before_ran =
+                    begin == qmd_address ||
+                    split.Ran(memory.WritesTarget(split, qmd_address, begin - qmd_address));
+                const bool after_ran =
+                    end == qmd_end || split.Ran(memory.WritesTarget(split, end, qmd_end - end));
+                if (before_ran && after_ran) {
+                    memory.Read(qmd_address, descriptor.data(), sizeof(descriptor));
+                    std::memcpy(reinterpret_cast<u8*>(descriptor.data()) + (begin - qmd_address),
+                                part->bytes.data() + (begin - part->address), end - begin);
+                    if (RunAhead::stats) {
+                        ++RunAhead::counters.upload_qmds;
+                        ++RunAhead::counters.upload_qmds_partial;
+                    }
+                    return std::nullopt;
+                }
+            }
         }
         return Outcome{false, target, lost, qmd_address};
     }
@@ -608,6 +635,25 @@ private:
             }
         }
         return false;
+    }
+
+    /// EDEN_NX2_RUNAHEAD_QMD: the kept upload the back has not run yet that wrote last (at
+    /// `target`) over part of the QMD at `qmd_address`.
+    [[nodiscard]] const KeptUpload* PartUpload(const GpuSplit& split, const void* memory,
+                                               GPUVAddr qmd_address, u64 target) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (split.Ran(kept.position)) {
+                break; // The back wrote it, and the older ones
+            }
+            if (kept.memory == memory && kept.position == target &&
+                kept.address < qmd_address + sizeof(Descriptor) &&
+                qmd_address < kept.address + kept.size) {
+                return &kept;
+            }
+        }
+        return nullptr;
     }
 
     /// The newest kept upload of `memory` the back has not run yet that covers the QMD at
