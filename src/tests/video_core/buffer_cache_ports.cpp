@@ -388,6 +388,16 @@ struct BufferCacheTestAccess {
     static size_t ReadDownloads(Cache& cache) {
         return cache.read_downloads.size();
     }
+    /// The early download limits (EDEN_NX2_EARLY_* or their defaults).
+    static u32 MaxUnreadWrites() {
+        return Cache::Early().max_unread_writes;
+    }
+    static u32 MaxPendingEarlyDownloads() {
+        return Cache::Early().max_pending;
+    }
+    static u64 EarlyBytesPerFrame() {
+        return Cache::Early().bytes_per_frame;
+    }
     /// Every read download compared with a synchronous flush (EDEN_NX2_READ_CHECK=1).
     static void CheckEveryRead(Cache& cache) {
         cache.read_check.every = 1;
@@ -1193,11 +1203,14 @@ TEST_CASE("Uniform keep verify counts guest writes the delta did not report",
     REQUIRE(f.Counts().verified == 2);
     REQUIRE(f.Counts().mismatches == 1);
     REQUIRE(f.Counts().kept == 0);
-    // It also counts a size the keep would refuse (another pipeline's) as a mismatch.
+    // A size the keep refuses (another pipeline's) is not kept, so there is nothing to verify:
+    // the exact-range check (KeptUniformMatches) refuses it first. The keep audit counts such
+    // refusals (EDEN_NX2_DRAWX_KEEP_AUDIT).
     Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo,
                      KeepFixture::UboSize / 2);
-    REQUIRE(f.Counts().verified == 3);
-    REQUIRE(f.Counts().mismatches == 2);
+    REQUIRE(f.Counts().verified == 2);
+    REQUIRE(f.Counts().mismatches == 1);
+    REQUIRE(f.Counts().kept == 0);
 }
 
 TEST_CASE("Uniform keep audit counts only bound keeps whose bytes changed as mismatches",
@@ -1905,16 +1918,17 @@ TEST_CASE("Early downloads keep CPU writes, and stop for pages no longer read", 
     REQUIRE(f.bytes[0x10020] == 0xee);
     REQUIRE(f.bytes[0x1002f] == 0xee);
     REQUIRE(f.bytes[0x10030] == 3);
-    // Not read any more: a few more writes get early downloads, then none.
+    // Not read any more: MaxUnreadWrites more writes get early downloads, then none.
     const u32 queued = f.runtime.queued_host_reads;
-    for (u8 frame = 4; frame < 12; ++frame) {
-        WriteByDispatch(f, id, 0x20000, 0x100, frame);
+    const u32 writes = Access::MaxUnreadWrites() + 4;
+    for (u32 write = 0; write < writes; ++write) {
+        WriteByDispatch(f, id, 0x20000, 0x100, static_cast<u8>(4 + write));
         f.runtime.Complete(f.runtime.submitted_tick);
     }
-    REQUIRE(f.runtime.queued_host_reads - queued == 4);
+    REQUIRE(f.runtime.queued_host_reads - queued == Access::MaxUnreadWrites());
     const auto area = ReadWord(f, 0x20010);
     REQUIRE_FALSE(area.preemtive);
-    REQUIRE(f.bytes[0x10010] == 11);
+    REQUIRE(f.bytes[0x10010] == static_cast<u8>(4 + writes - 1));
     REQUIRE(Access::ReadDownloads(*f.cache) == 0);
     REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x1000));
 }
@@ -2089,33 +2103,42 @@ TEST_CASE("Finished early downloads land a few draws later, or at the next dispa
     REQUIRE(ReadWord(f, 0x20010).preemtive);
 }
 
-TEST_CASE("Early downloads stop at 32 on their way", "[buffer_ports]") {
+TEST_CASE("Early downloads stop at MaxPendingEarlyDownloads on their way", "[buffer_ports]") {
     Fixture f;
     const Nx2TitleScope nx2_title;
     const auto id = Access::Add(*f.cache, 0x20000, 0x30000);
-    // 33 pages, each read after two writes.
+    // 9 pages, each read after two writes.
     for (u8 frame = 1; frame <= 2; ++frame) {
-        for (DAddr page = 0x20000; page < 0x41000; page += 0x1000) {
+        for (DAddr page = 0x20000; page < 0x29000; page += 0x1000) {
             WriteByDispatch(f, id, page, 0x100, frame);
             ReadWord(f, page);
         }
     }
-    // Their next writes before the host GPU ran any copy: the 33rd page's read flushes.
-    for (DAddr page = 0x20000; page < 0x41000; page += 0x1000) {
-        WriteByDispatch(f, id, page, 0x100, 3);
+    // Writes to the first 8 before the host GPU ran any copy, as many as may be on their way.
+    const u32 max_pending = Access::MaxPendingEarlyDownloads();
+    const u32 rounds = max_pending / 8;
+    REQUIRE(rounds * 8 == max_pending);
+    REQUIRE(rounds <= Access::MaxUnreadWrites());
+    REQUIRE(max_pending * u64{0x1000} < Access::EarlyBytesPerFrame());
+    for (u32 round = 0; round < rounds; ++round) {
+        for (DAddr page = 0x20000; page < 0x28000; page += 0x1000) {
+            WriteByDispatch(f, id, page, 0x100, static_cast<u8>(3 + round));
+        }
     }
-    REQUIRE(f.runtime.queued_host_reads == 32);
-    REQUIRE(Access::ReadDownloads(*f.cache) == 32);
-    const auto last = ReadWord(f, 0x40010);
+    // The 9th page's write gets none: its read flushes.
+    WriteByDispatch(f, id, 0x28000, 0x100, static_cast<u8>(3 + rounds));
+    REQUIRE(f.runtime.queued_host_reads == max_pending);
+    REQUIRE(Access::ReadDownloads(*f.cache) == max_pending);
+    const auto last = ReadWord(f, 0x28010);
     REQUIRE_FALSE(last.preemtive);
     REQUIRE_FALSE(last.in_flight);
-    REQUIRE(f.bytes[0x30010] == 3);
-    REQUIRE(f.bytes[0x10010] == 3);
+    REQUIRE(f.bytes[0x18010] == static_cast<u8>(3 + rounds));
+    REQUIRE(f.bytes[0x10010] == static_cast<u8>(3 + rounds - 1));
     REQUIRE(Access::ReadDownloads(*f.cache) == 0);
     REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x21000));
 }
 
-TEST_CASE("Early downloads stop at 1 MiB a frame", "[buffer_ports]") {
+TEST_CASE("Early downloads stop at EarlyBytesPerFrame a frame", "[buffer_ports]") {
     Fixture f;
     const Nx2TitleScope nx2_title;
     const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
@@ -2123,16 +2146,17 @@ TEST_CASE("Early downloads stop at 1 MiB a frame", "[buffer_ports]") {
         WriteByDispatch(f, id, 0x20000, 0x1000, frame);
         ReadWord(f, 0x20010);
     }
-    // A whole page each, read once the host GPU ran it: 256 make 1 MiB.
-    for (u32 write = 0; write < 256; ++write) {
+    // A whole page each, read once the host GPU ran it, up to the frame's bytes.
+    const u32 writes = static_cast<u32>(Access::EarlyBytesPerFrame() / 0x1000);
+    for (u32 write = 0; write < writes; ++write) {
         WriteByDispatch(f, id, 0x20000, 0x1000, static_cast<u8>(write));
         f.runtime.Complete(f.runtime.submitted_tick);
         REQUIRE(ReadWord(f, 0x20010).preemtive);
     }
-    REQUIRE(f.runtime.queued_host_reads == 256);
+    REQUIRE(f.runtime.queued_host_reads == writes);
     // The frame's later writes leave their reads to flush.
     WriteByDispatch(f, id, 0x20000, 0x1000, 0xab);
-    REQUIRE(f.runtime.queued_host_reads == 256);
+    REQUIRE(f.runtime.queued_host_reads == writes);
     const auto area = ReadWord(f, 0x20010);
     REQUIRE_FALSE(area.preemtive);
     REQUIRE_FALSE(area.in_flight);

@@ -2220,8 +2220,12 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
     {
         // Changed state writes in a row are one entry: the writes, their dirty flags and the
         // last one that ends fast draw reuse.
-        Fixture f;
-        VideoCommon::GpuSplit split;
+        // On the heap: fixtures and splits are large, and this test has two and three of them
+        // (Windows gives a thread 1 MiB of stack).
+        const auto fixture = std::make_unique<Fixture>();
+        Fixture& f = *fixture;
+        const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
+        VideoCommon::GpuSplit& split = *split_owner;
         Access::Initialize(split, f.system);
         auto& engine = f.fast;
         const u32 first = f.state_methods[10];
@@ -2250,7 +2254,8 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
     // as its own entry, each with its back: registers, shadow RAM, dirty
     // flags, draws and fast draw breaks agree. Macro 0 sends its three parameters to state
     // registers; instance loops leave deferred draws for state writes to issue.
-    Fixture f;
+    const auto fixture = std::make_unique<Fixture>();
+    Fixture& f = *fixture;
     const std::array<u32, 3> macro_registers{f.state_methods[30], f.state_methods[31],
                                              f.state_methods[200]};
     std::vector<u32> code;
@@ -2259,15 +2264,16 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
           FifoInstruction(macro_registers[2], true), Encode(Mme{})}) {
         code.insert(code.end(), instruction.begin(), instruction.end());
     }
-    std::array<VideoCommon::GpuSplit, 2> splits;
+    const std::array<std::unique_ptr<VideoCommon::GpuSplit>, 2> splits{
+        std::make_unique<VideoCommon::GpuSplit>(), std::make_unique<VideoCommon::GpuSplit>()};
     std::array<Maxwell3D*, 2> engines{&f.fast, &f.slow};
     for (size_t i = 0; i < 2; ++i) {
-        Access::Start(splits[i], f.system);
+        Access::Start(*splits[i], f.system);
         engines[i]->SetNativeTuringMacroMode(true);
     }
     SCOPE_EXIT {
-        for (auto& split : splits) {
-            split.Stop();
+        for (const auto& split : splits) {
+            split->Stop();
         }
     };
     struct Step {
@@ -2283,7 +2289,7 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
         u32 last_break;
     };
     const auto run = [&](size_t i, const std::vector<Step>& steps) {
-        auto& split = splits[i];
+        auto& split = *splits[i];
         auto& engine = *engines[i];
         const u64 serial = VideoCommon::Nx2FastDraw::Serial();
         for (const Step& step : steps) {
