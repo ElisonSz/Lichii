@@ -1384,11 +1384,6 @@ u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
 }
 
-u64 HostMemory::NanosecondsSinceMapChange() noexcept {
-    const u64 last = g_last_map_change_ns.load(std::memory_order_relaxed);
-    return last == 0 ? (std::numeric_limits<u64>::max)() : SteadyNowNs() - last;
-}
-
 u64 HostMemory::MappedBytes() noexcept {
     return g_mapped_bytes.load(std::memory_order_relaxed);
 }

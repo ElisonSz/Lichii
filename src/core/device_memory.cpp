@@ -66,7 +66,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             return;
         }
         // Busy: over 32 MiB mapped, unmapped or protected in the last half second. At most 10
-        // waits (5 s), then the pass runs unless the guest mapped or unmapped lately (below).
+        // waits (5 s), then the pass runs anyway.
         for (int wait = 0; wait < 10; ++wait) {
             const u64 before = Common::HostMemory::MappedBytes();
             {
@@ -79,18 +79,6 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             if (Common::HostMemory::MappedBytes() - before < (u64{32} << 20)) {
                 break;
             }
-        }
-        // A guest streaming memory in or out goes first (Ocarina of Time's route start maps and
-        // unmaps ~800 MiB in ~12 s): a pass holds the kernel's working-set lock, which each of its
-        // maps and unmaps needs, for most of a second. Look again after the same interval.
-        constexpr u64 QuietNs = 5'000'000'000ULL;
-        // TEST: EDEN_NX2_ZERO_TRIM_QUIET=0 leaves out this wait (only the bulk mapping one above).
-        static const bool quiet_wait = [] {
-            const char* const value = std::getenv("EDEN_NX2_ZERO_TRIM_QUIET");
-            return value == nullptr || value[0] != '0';
-        }();
-        if (quiet_wait && Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
-            continue;
         }
         const auto start = std::chrono::steady_clock::now();
         std::pair<size_t, size_t> result;
@@ -115,9 +103,6 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         if (Common::Nx2MapStats::Enabled()) {
             LOG_INFO(HW_Memory, "Zero trim pass: {} MiB of {} MiB resident in {} ms",
                      trimmed >> 20, resident >> 20, ms);
-        }
-        if (quiet_wait && Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
-            continue; // the pass gave way: no backing off
         }
         if (trimmed < Busy) {
             interval = (std::min)(interval * 2, std::chrono::seconds{300});
