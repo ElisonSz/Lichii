@@ -1330,11 +1330,9 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
-bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
-                                              std::span<const GPUVAddr> handle_addresses,
-                                              std::span<ImageViewInOut> views,
-                                              std::span<SamplerId> samplers,
-                                              bool* kept_over_deletions) {
+bool TextureCache<P>::TextureMemoStillHolds(const SampledTextureMemo& memo,
+                                            std::span<const GPUVAddr> handle_addresses,
+                                            bool* lost_view) const {
     const auto& image_table = channel_state->graphics_image_table;
     const auto& sampler_table = channel_state->graphics_sampler_table;
     const bool via_header_index =
@@ -1347,8 +1345,7 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
     if (!memo.valid || memo.memory != gpu_memory || memo.image_table != &image_table ||
         !tables_hold || memo.sampler_changes != sampler_table.changes ||
         memo.via_header_index != via_header_index ||
-        memo.entries.size() != handle_addresses.size() || views.size() != handle_addresses.size() ||
-        samplers.size() != handle_addresses.size() ||
+        memo.entries.size() != handle_addresses.size() ||
         memo.host_serial != gpu_memory->HostPointerSerial()) {
         return false;
     }
@@ -1363,21 +1360,41 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
             return false;
         }
     }
-    if (Cfg::g_tic) {
-        if (memo.view_deaths != view_deaths.Clock()) {
-            // The full resolve gives each entry's header the view it gave before while that view
-            // lives (the same bytes, the same page table by host_serial: see ReadImageEntry). A
-            // null view may be a failed creation, which the full resolve tries again.
-            for (const SampledTextureMemo::Entry& entry : memo.entries) {
-                if (entry.view == NULL_IMAGE_VIEW_ID ||
-                    ViewDiedAfter(entry.view, memo.view_deaths)) {
-                    Cfg::Count(Cfg::Counter::MemoDropped);
-                    memo.valid = false;
-                    return false;
+    if (Cfg::g_tic && memo.view_deaths != view_deaths.Clock()) {
+        // The full resolve gives each entry's header the view it gave before while that view
+        // lives (the same bytes, the same page table by host_serial: see ReadImageEntry). A
+        // null view may be a failed creation, which the full resolve tries again.
+        for (const SampledTextureMemo::Entry& entry : memo.entries) {
+            if (entry.view == NULL_IMAGE_VIEW_ID || ViewDiedAfter(entry.view, memo.view_deaths)) {
+                if (lost_view != nullptr) {
+                    *lost_view = true;
                 }
+                return false;
             }
-            memo.view_deaths = view_deaths.Clock();
         }
+    }
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
+                                              std::span<const GPUVAddr> handle_addresses,
+                                              std::span<ImageViewInOut> views,
+                                              std::span<SamplerId> samplers,
+                                              bool* kept_over_deletions) {
+    bool lost_view = false;
+    if (views.size() != handle_addresses.size() || samplers.size() != handle_addresses.size() ||
+        !TextureMemoStillHolds(memo, handle_addresses, &lost_view)) {
+        if (lost_view) {
+            Cfg::Count(Cfg::Counter::MemoDropped);
+            memo.valid = false;
+        }
+        return false;
+    }
+    if (Cfg::g_tic) {
+        // Its views all live: the next draw checks only the deletions after this one.
+        memo.view_deaths = view_deaths.Clock();
+        const auto& image_table = channel_state->graphics_image_table;
         if (memo.image_changes != image_table.changes) {
             // Where the base's memo misses (and is made again with the new count).
             memo.image_changes = image_table.changes;

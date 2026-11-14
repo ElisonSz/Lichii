@@ -1,20 +1,503 @@
 version: 2.1
 
-# Placeholder until the build jobs land: a cheap job so the CircleCI check passes on every
-# pipeline. The real build-check mirror replaces it.
+# The build-check jobs of .github/workflows/build-check.yml on CircleCI, plus Linux aarch64 and an
+# opt-in macOS build. The release workflow stays on GitHub.
+#
+# Which events start a pipeline is a project setting: "Only build pull requests" (GitHub OAuth)
+# or the trigger "PR opened or pushed to, default branch and tag pushes" (GitHub App) gives pull
+# requests and pushes to nx2. Tag pushes start no workflow because no job has a tag filter.
+#
+# Linux runs on every pull request and nx2 push, from the open-source allowance (400,000 credits
+# a month). Windows and macOS draw from the free plan's 30,000. A warm Windows run takes about 11
+# minutes at 40 credits a minute (~460 credits), so the pool covers about 65 a month, and a cold
+# Windows build needs two runs (~3,500 credits). So Windows runs only on pushes to nx2; GitHub
+# Actions builds it on pull requests. macOS (200 credits a minute) runs only when a pipeline is
+# triggered with macos: true.
+#
+# Each job saves its cache after every build that stopped early, so a cold build continues where
+# it stopped, and after every complete build that compiled over 100 objects, such as after an nx2
+# change. Other complete builds save once a day. Caches live three days. Every run restores the
+# newest one; ccache keys objects by content, so a cache from another branch still helps. A cache
+# is about 220 MiB, so storage reaches roughly 4 GB, an estimated 840 credits a month beyond the
+# free 2 GB at 420 credits per GB-month.
+
+parameters:
+  macos:
+    type: boolean
+    default: false
+
+commands:
+  skip-docs-only:
+    steps:
+      - run:
+          name: Skip builds for documentation-only changes
+          shell: bash
+          command: |
+            if [ "$CIRCLE_BRANCH" = nx2 ] || ! git fetch --quiet --no-tags origin nx2; then
+              exit 0
+            fi
+            if ! git diff --name-only FETCH_HEAD...HEAD | grep -qvE '^(docs/.*|.*\.md)$'; then
+              echo "Only documentation changed since nx2; skipping the build."
+              circleci-agent step halt
+            fi
+
+  restore-objects:
+    parameters:
+      cache:
+        type: string
+    steps:
+      - run:
+          name: Pick the cache key
+          shell: bash
+          command: |
+            date -u +%F > .circleci-cache-day
+            echo "partial $(date -u +%s)" > .circleci-build-state
+      - restore_cache:
+          name: Restore dependencies and compiler objects
+          keys:
+            - << parameters.cache >>-
+
+  save-objects:
+    parameters:
+      cache:
+        type: string
+    steps:
+      - save_cache:
+          name: Save dependencies and compiler objects
+          when: always
+          key: << parameters.cache >>-{{ checksum ".circleci-cache-day" }}-{{ checksum ".circleci-build-state" }}
+          paths:
+            - .cache/cpm
+            - .ccache
 
 jobs:
-  config-check:
-    docker:
-      - image: cimg/base:current
-    resource_class: small
+  linux-gcc:
+    parameters:
+      arch:
+        type: string
+      resource_class:
+        type: string
+      qt_host:
+        type: string
+      qt_arch:
+        type: string
+      catch2_exclude:
+        type: string
+        default: ""
+    machine:
+      image: ubuntu-2404:current
+    resource_class: << parameters.resource_class >>
+    retention:
+      caches: 3d
+    environment:
+      CCACHE_DIR: /home/circleci/project/.ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
     steps:
       - checkout
+      - skip-docs-only
+
       - run:
-          name: Check the CircleCI config is in place
-          command: test -s .circleci/config.yml
+          name: Install Linux dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev \
+              libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+              mesa-common-dev nasm ninja-build qt6-base-private-dev \
+              qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+              libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+              spirv-tools spirv-headers libusb-1.0-0-dev \
+              libboost-dev libboost-fiber-dev libboost-context-dev \
+              libopus-dev libasound2-dev ccache pipx \
+              libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+              libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+            pipx install cmake==4.4.4
+            pipx install aqtinstall==3.3.0
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$BASH_ENV"
+
+      - run:
+          name: Install Qt
+          command: |
+            aqt install-qt << parameters.qt_host >> desktop 6.8.3 << parameters.qt_arch >> -m qtcharts --outputdir "$HOME/Qt"
+            qt_root=$(echo "$HOME"/Qt/6.8.3/gcc_*)
+            test -x "$qt_root/bin/qmake"
+            echo "export QT_ROOT_DIR=$qt_root" >> "$BASH_ENV"
+
+      - restore-objects:
+          cache: gcc13-qt683-<< parameters.arch >>-v1
+
+      - run:
+          name: Configure production and tests
+          command: |
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=gcc-13 \
+              -DCMAKE_CXX_COMPILER=g++-13 \
+              -DENABLE_WERROR=ON \
+              -DBUILD_TESTING=ON \
+              -DLICHII_TESTS=ON \
+              -DENABLE_QT=ON \
+              -DENABLE_QT_TRANSLATION=ON \
+              -DLICHII_CMD=ON \
+              -DLICHII_ROOM=OFF \
+              -DLICHII_ROOM_STANDALONE=OFF \
+              -DLICHII_USE_BUNDLED_QT=OFF \
+              "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+              -DLICHII_USE_BUNDLED_SDL3=ON \
+              -DVulkanHeaders_FORCE_BUNDLED=ON \
+              -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+              -DENABLE_UPDATE_CHECKER=ON \
+              -DUSE_DISCORD_PRESENCE=OFF \
+              -DUSE_CCACHE=ON
+
+      # Free plan jobs stop at one hour. A cold cache can take longer on four cores, so the build
+      # stops first and the objects it compiled are still saved for the next run.
+      - run:
+          name: Build production and tests
+          no_output_timeout: 20m
+          command: |
+            ccache --zero-stats
+            timeout 48m cmake --build build --parallel "$(nproc)"
+            misses=$(ccache --print-stats | awk '$1 == "cache_miss" { print $2 }')
+            if [ "${misses:-0}" -gt 100 ]; then
+              echo "complete $(date -u +%s)" > .circleci-build-state
+            else
+              echo complete > .circleci-build-state
+            fi
+            ccache --show-stats
+
+      - save-objects:
+          cache: gcc13-qt683-<< parameters.arch >>-v1
+
+      - when:
+          condition:
+            equal: ["", << parameters.catch2_exclude >>]
+          steps:
+            - run:
+                name: Run tests
+                command: ctest --test-dir build --output-on-failure --no-tests=error --parallel "$(nproc)"
+      - when:
+          condition:
+            not:
+              equal: ["", << parameters.catch2_exclude >>]
+          steps:
+            - run:
+                name: Run tests
+                command: |
+                  ctest --test-dir build --output-on-failure --no-tests=error --parallel "$(nproc)" -E '^tests$'
+                  build/bin/tests '~<< parameters.catch2_exclude >>'
+
+      - run:
+          name: Test debug adapter
+          command: python3 tools/nx2/test_debug_mcp.py
+
+      - run:
+          name: Test cache metrics and bench
+          command: |
+            python3 tools/nx2/test_cache_metrics.py
+            python3 tools/nx2/test_cache_bench.py
+
+      - run:
+          name: Test ThreadWorker wake-ups
+          command: |
+            python3 tools/nx2/test_thread_worker_wake.py
+            python3 -I tools/nx2/thread_worker_wake.py --cxx g++-13
+
+      - run:
+          name: Test offline RADV shader checks
+          command: python3 tools/nx2/radv_offline/test_checks.py
+
+      - run:
+          name: Test Linux switch discovery
+          command: CXX=g++-13 python3 tools/nx2/test_switches.py
+
+  windows-clang-cl:
+    machine:
+      image: windows-server-2022-gui:current
+      shell: bash.exe
+    resource_class: windows.medium
+    retention:
+      caches: 3d
+    # ccache rather than sccache: sccache has no direct mode for clang-cl, so every hit still ran the
+    # preprocessor and a 99% hit build took 8.5 minutes.
+    environment:
+      CCACHE_DIR: C:\Users\circleci\project\.ccache
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - checkout
+      - skip-docs-only
+
+      # The install scripts are shared with the GitHub jobs and report what they set through
+      # GITHUB_ENV and GITHUB_PATH, so those point at files that a later step turns into env.sh.
+      # CMake is the windows-2022 runner's 3.31: CMake 4 passes clang-cl its depfile options as
+      # -clang:-MD, which ccache refuses, so no object would be cached.
+      - run:
+          name: Install LLVM, the Vulkan SDK, ccache, CMake, Ninja and Qt
+          shell: powershell.exe -ExecutionPolicy Bypass
+          command: |
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            New-Item -ItemType Directory -Force C:\ci | Out-Null
+            $env:RUNNER_TEMP = 'C:\ci'
+            $env:GITHUB_ENV = 'C:\ci\github-env'
+            $env:GITHUB_PATH = 'C:\ci\github-path'
+            $env:GITHUB_ACTIONS = 'true'
+            ./tools/windows/install-llvm.ps1
+            ./tools/windows/install-vulkan-sdk.ps1
+            $zip = 'C:\ci\ccache.zip'
+            Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+            if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+                throw 'ccache checksum mismatch'
+            }
+            Expand-Archive $zip -DestinationPath C:\ci
+            'C:\ci\ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+            python --version
+            python -m pip install --quiet --disable-pip-version-check cmake==3.31.6 ninja==1.13.0 aqtinstall==3.3.0
+            if ($LASTEXITCODE) { throw 'pip install failed' }
+            python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+            python -m aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -m qtcharts --outputdir C:\Qt
+            if ($LASTEXITCODE) { throw 'Qt install failed' }
+            'C:\Qt\6.8.3\msvc2022_64\bin' | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+            'QT_ROOT_DIR=C:/Qt/6.8.3/msvc2022_64' | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+            'QT_PLUGIN_PATH=C:/Qt/6.8.3/msvc2022_64/plugins' | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+            # tests.exe and lichii.exe import wlanapi.dll from the Wireless LAN Service. GitHub's image
+            # installs that feature; here it needs a reboot, so the DLL is copied from WinSxS.
+            $wlan = Get-ChildItem C:\Windows\WinSxS -Directory -Filter 'amd64_microsoft-windows-onecoreuap-wlansvc_*' |
+                ForEach-Object { Get-ChildItem $_.FullName -Filter wlanapi.dll } | Sort-Object LastWriteTime | Select-Object -Last 1
+            if (-not $wlan) { throw 'No wlanapi.dll in WinSxS' }
+            New-Item -ItemType Directory -Force C:\ci\wlan | Out-Null
+            Copy-Item $wlan.FullName C:\ci\wlan
+            'C:\ci\wlan' | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+
+      # What ilammy/msvc-dev-cmd does on GitHub: keep the variables vcvars64.bat adds or changes.
+      # The image also carries VS 18 Build Tools, whose MSVC 14.51 STL the source does not build
+      # with yet, so this takes VS 2022 like GitHub's windows-2022 runner.
+      - run:
+          name: Set up MSVC
+          shell: powershell.exe -ExecutionPolicy Bypass
+          command: |
+            $ErrorActionPreference = 'Stop'
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vs = & $vswhere -latest -version '[17.0,18.0)' -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $vs) { throw 'No Visual Studio 2022 with the x64 C++ tools' }
+            "Visual Studio: $vs"
+            $before = @{}
+            cmd /c set | ForEach-Object { $k, $v = $_ -split '=', 2; $before[$k] = $v }
+            cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+                $k, $v = $_ -split '=', 2
+                if ($before[$k] -ne $v) { "$k=$v" }
+            } | Out-File -Encoding ascii C:\ci\vcvars
+            if (-not (Select-String -Quiet -Pattern '^VCToolsInstallDir=' C:\ci\vcvars)) { throw 'vcvars64.bat set nothing' }
+
+      - run:
+          name: Write the build environment
+          command: |
+            set -eo pipefail
+            {
+              sed 's/^\xEF\xBB\xBF//; s/\r$//' /c/ci/vcvars /c/ci/github-env | while IFS='=' read -r name value; do
+                [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+                if [ "${name^^}" = PATH ]; then
+                  printf 'export PATH=%q\n' "$(cygpath -p "$value")"
+                else
+                  printf 'export %s=%q\n' "$name" "$value"
+                fi
+              done
+              sed 's/^\xEF\xBB\xBF//; s/\r$//' /c/ci/github-path | while read -r dir; do
+                printf 'export PATH=%q:"$PATH"\n' "$(cygpath -u "$dir")"
+              done
+            } > /c/ci/env.sh
+            . /c/ci/env.sh
+            "$LLVM_ROOT/bin/clang-cl.exe" --version
+            cmake --version
+            ninja --version
+            ccache --version | head -1
+            command -v cl.exe link.exe rc.exe
+
+      - restore-objects:
+          cache: clang-cl-ccache-qt683-windows-v2
+
+      - run:
+          name: Configure production and tests
+          command: |
+            set -eo pipefail
+            . /c/ci/env.sh
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+              "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+              "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+              "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+              "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX" \
+              "-DCMAKE_CXX_FLAGS=-DWIN32 -D_WINDOWS -EHsc -DNOMINMAX" \
+              "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+              -DENABLE_WERROR=ON \
+              -DBUILD_TESTING=ON \
+              -DLICHII_TESTS=ON \
+              -DENABLE_QT=ON \
+              -DENABLE_QT_TRANSLATION=ON \
+              -DLICHII_CMD=ON \
+              -DLICHII_ROOM=OFF \
+              -DLICHII_ROOM_STANDALONE=OFF \
+              -DLICHII_USE_BUNDLED_QT=OFF \
+              -DLICHII_USE_BUNDLED_SDL3=ON \
+              -DENABLE_UPDATE_CHECKER=ON \
+              -DUSE_DISCORD_PRESENCE=OFF \
+              -DUSE_CCACHE=ON
+
+      # The install script pins clang-cl by checksum, so it identifies the compiler without hashing
+      # the binary on every call.
+      - run:
+          name: Build production and tests
+          no_output_timeout: 20m
+          command: |
+            set -eo pipefail
+            . /c/ci/env.sh
+            export CCACHE_COMPILERCHECK="string:$(sha256sum tools/windows/install-llvm.ps1 | cut -c1-64)"
+            ccache --zero-stats
+            /usr/bin/timeout 48m cmake --build build --parallel
+            misses=$(ccache --print-stats | awk '$1 == "cache_miss" { print $2 }')
+            if [ "${misses:-0}" -gt 100 ]; then
+              echo "complete $(date -u +%s)" > .circleci-build-state
+            else
+              echo complete > .circleci-build-state
+            fi
+            ccache --show-stats -v
+
+      - save-objects:
+          cache: clang-cl-ccache-qt683-windows-v2
+
+      # nxformat is linked statically: lichii.exe must not need an nxformat.dll, which Windows
+      # may refuse to load (Smart App Control, code integrity policies) or that may be missing.
+      - run:
+          name: Check lichii.exe does not import nxformat.dll
+          command: |
+            set -eo pipefail
+            . /c/ci/env.sh
+            imports=$("$LLVM_ROOT/bin/llvm-readobj" --coff-imports build/bin/lichii.exe |
+              awk '/^(Import|DelayImport) {/ { kind = $1 } /^  Name:/ { print kind, $2 }')
+            echo "$imports"
+            if grep -qi ' nxformat.dll$' \<<< "$imports"; then
+              echo "lichii.exe imports nxformat.dll; nxformat must be linked statically"
+              exit 1
+            fi
+
+      # Antivirus heuristics count an unsigned program without file metadata against it.
+      - run:
+          name: Check the shipped programs carry a version resource
+          command: |
+            set -eo pipefail
+            . /c/ci/env.sh
+            for exe in lichii eden-cli lichii-updater; do
+              if ! grep -q 'Type: VERSIONINFO' \<<< "$("$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe")"; then
+                echo "$exe.exe has no version resource"
+                exit 1
+              fi
+            done
+
+      - run:
+          name: Run tests
+          command: |
+            set -eo pipefail
+            . /c/ci/env.sh
+            ctest --test-dir build --output-on-failure --no-tests=error --parallel "$NUMBER_OF_PROCESSORS"
+
+  macos-clang:
+    macos:
+      xcode: "26.6"
+    resource_class: m4pro.medium
+    retention:
+      caches: 3d
+    environment:
+      CCACHE_DIR: /Users/distiller/project/.ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - checkout
+      - skip-docs-only
+
+      # The packages the release workflow installs for macOS.
+      - run:
+          name: Install macOS dependencies
+          command: |
+            brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja \
+              nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
+              vulkan-loader spirv-tools vulkan-utility-libraries ccache coreutils
+
+      - restore-objects:
+          cache: clang-qt6-macos-arm64-v1
+
+      - run:
+          name: Configure production and tests
+          command: |
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DENABLE_WERROR=ON \
+              -DBUILD_TESTING=ON \
+              -DLICHII_TESTS=ON \
+              -DENABLE_QT=ON \
+              -DENABLE_QT_TRANSLATION=ON \
+              -DLICHII_CMD=ON \
+              -DLICHII_ROOM=OFF \
+              -DLICHII_ROOM_STANDALONE=OFF \
+              -DLICHII_USE_BUNDLED_QT=OFF \
+              "-DCMAKE_PREFIX_PATH=$(brew --prefix qt@6);$(brew --prefix zlib)" \
+              "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
+              -DVulkanHeaders_FORCE_BUNDLED=ON \
+              -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+              -DENABLE_UPDATE_CHECKER=ON \
+              -DUSE_DISCORD_PRESENCE=OFF \
+              -DUSE_CCACHE=ON
+
+      - run:
+          name: Build production and tests
+          no_output_timeout: 20m
+          command: |
+            ccache --zero-stats
+            gtimeout 48m cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+            misses=$(ccache --print-stats | awk '$1 == "cache_miss" { print $2 }')
+            if [ "${misses:-0}" -gt 100 ]; then
+              echo "complete $(date -u +%s)" > .circleci-build-state
+            else
+              echo complete > .circleci-build-state
+            fi
+            ccache --show-stats
+
+      - save-objects:
+          cache: clang-qt6-macos-arm64-v1
+
+      # The arm64 backend aborts on some of the random blocks this test compares (ZOR-274).
+      - run:
+          name: Run tests
+          command: |
+            ctest --test-dir build --output-on-failure --no-tests=error --parallel "$(sysctl -n hw.ncpu)" -E '^tests$'
+            build/bin/tests '~[jit_codegen_options]'
 
 workflows:
   build-check:
     jobs:
-      - config-check
+      - linux-gcc:
+          name: linux-gcc13-x86_64
+          arch: x86_64
+          resource_class: large
+          qt_host: linux
+          qt_arch: linux_gcc_64
+      - linux-gcc:
+          name: linux-gcc13-aarch64
+          arch: aarch64
+          resource_class: arm.large.gen2
+          qt_host: linux_arm64
+          qt_arch: linux_gcc_arm64
+          # The arm64 backend aborts on some of the random blocks this test compares (ZOR-274).
+          catch2_exclude: "[jit_codegen_options]"
+      - windows-clang-cl:
+          filters:
+            branches:
+              only: nx2
+
+  macos:
+    when: << pipeline.parameters.macos >>
+    jobs:
+      - macos-clang
