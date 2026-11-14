@@ -997,6 +997,9 @@ constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
 /// goes bad does so within its first few evaluations), and fail to be dropped.
 constexpr u32 DLSS_NETWORK_GOOD_CHECKS = 30;
 constexpr u32 DLSS_NETWORK_BAD_CHECKS = 10;
+/// Drops for mismatched output after which the network stays dropped: one that keeps going bad
+/// would switch between it and the replacement upscale.
+constexpr u32 DLSS_NETWORK_MAX_DROPS = 3;
 /// A check fails when more than this percentage of its blocks is mismatched (working networks:
 /// at most 0.2% on Fortune's Weave's title and Kunlun Base; frozen ones: 6-10%), or when any output
 /// sample is NaN or infinite.
@@ -1031,13 +1034,19 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.spatial_only) {
         return false;
     }
+    const auto blocker = GameDlssBlocker();
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
-                             GameDlssBlocker() != VideoCore::GameDlssReason::None;
+                             blocker != VideoCore::GameDlssReason::None;
+    // While the network recovers from mismatched output, its output pass runs, so the recheck in
+    // FinishDlssEvaluation (after the dispatch) sees this frame's network output; the replacement
+    // upscale then draws over it.
+    const bool recheck_after_dispatch =
+        dlss_chain.failure == VideoCore::GameDlssReason::OutputMismatch &&
+        blocker == VideoCore::GameDlssReason::None && !DlssNetworkDroppedForGood();
     if (dlss_chain.output_pass) {
-        return replacement && FinishDlssEvaluation();
+        return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           !passes->IsPrepass(native_key) &&
+    return DlssNetworkDroppedForGood() && !passes->IsPrepass(native_key) &&
            dlss_chain.programs.contains(native_key);
 }
 
@@ -1073,10 +1082,21 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
+bool KeplerCompute::DlssNetworkDroppedForGood() const {
+    using VideoCore::GameDlssReason;
+    return dlss_chain.failure != GameDlssReason::None &&
+           (dlss_chain.failure != GameDlssReason::OutputMismatch ||
+            dlss_chain.drops >= DLSS_NETWORK_MAX_DROPS);
+}
+
 // Checks the network's output against its input (on the GPU; the result arrives a few frames
-// later) and drops the network for the session after DLSS_NETWORK_BAD_CHECKS failed checks in a
-// row: a network that produces NaN, freezes on an old image or draws garbage would otherwise stay
-// on screen.
+// later) and drops the network after DLSS_NETWORK_BAD_CHECKS failed checks in a row: a network
+// that produces NaN, freezes on an old image or draws garbage would otherwise stay on screen.
+// Output with NaN drops it for the session. Mismatched output can be a moment the check misjudges
+// or the network gets over (The Duskbloods' was dropped minutes into play, and the replacement
+// upscale drew the rest of the session): the network keeps running behind the replacement upscale
+// and is shown again once DLSS_NETWORK_GOOD_CHECKS checks in a row pass, until it has been dropped
+// DLSS_NETWORK_MAX_DROPS times.
 void KeplerCompute::CheckDlssNetwork() {
     dlss_chain.checked = rasterizer->CanProbeGameDlssOutput();
     if (!dlss_chain.checked) {
@@ -1133,28 +1153,63 @@ void KeplerCompute::CheckDlssNetwork() {
     if (!input || !output) {
         return;
     }
-    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output);
+    // A dynamic resolution network renders a region of its input and upscales that region to the
+    // whole output: compare only the region (all of the input would mismatch the output wherever
+    // the region leaves stale pixels, and drop a working network).
+    std::optional<std::array<u32, 2>> input_region;
+    if (dlss_chain.render_region) {
+        using namespace VideoCommon::FireEmblemUpscale;
+        if (cbuf.size.Value() < RenderLastColumnOffset + 4 ||
+            !memory_manager.IsFullyMappedRange(cbuf_address, RenderLastColumnOffset + 4)) {
+            return;
+        }
+        const u32 width = memory_manager.Read<u32>(cbuf_address + RenderLastColumnOffset) + 1;
+        const u32 height = memory_manager.Read<u32>(cbuf_address + RenderLastRowOffset) + 1;
+        if (width == 0 || height == 0 || width > input->width || height > input->height) {
+            return;
+        }
+        input_region = std::array{width, height};
+    }
+    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output, input_region);
     if (!probe) {
         return;
     }
     const bool invalid = probe->invalid_samples != 0;
     const bool mismatched = probe->mismatched * 100 > probe->blocks * DLSS_CHECK_MISMATCH_PERCENT;
+    using VideoCore::GameDlssReason;
     if (!invalid && !mismatched) {
         ++dlss_chain.good_checks;
         dlss_chain.bad_checks = 0;
+        if (dlss_chain.failure == GameDlssReason::OutputMismatch &&
+            dlss_chain.good_checks >= DLSS_NETWORK_GOOD_CHECKS) {
+            dlss_chain.failure = GameDlssReason::None;
+            LOG_INFO(HW_GPU, "Game DLSS network: its output checks out again in {} checks in a row",
+                     dlss_chain.good_checks);
+        }
         return;
     }
     dlss_chain.good_checks = 0;
     if (++dlss_chain.bad_checks < DLSS_NETWORK_BAD_CHECKS) {
         return;
     }
-    dlss_chain.failure = invalid ? VideoCore::GameDlssReason::InvalidOutput
-                                 : VideoCore::GameDlssReason::OutputMismatch;
+    if (dlss_chain.failure == GameDlssReason::OutputMismatch && !invalid) {
+        // Still mismatched while it runs behind the replacement upscale.
+        return;
+    }
+    dlss_chain.failure =
+        invalid ? GameDlssReason::InvalidOutput : GameDlssReason::OutputMismatch;
+    if (!invalid) {
+        ++dlss_chain.drops;
+    }
     LOG_WARNING(HW_GPU,
                 "Game DLSS network: {} in {} checks in a row (last: {}/{} blocks mismatched, worst "
-                "{:.3f}, {} invalid samples); the replacement upscale draws the output from now on",
+                "{:.3f}, gain {:.3f}, {} invalid samples); the replacement upscale draws the output "
+                "{}",
                 VideoCore::GameDlssReasonText(dlss_chain.failure), dlss_chain.bad_checks,
-                probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
+                probe->mismatched, probe->blocks, probe->worst, probe->gain,
+                probe->invalid_samples,
+                DlssNetworkDroppedForGood() ? "from now on"
+                                            : "until the network's output checks out again");
 }
 
 // Logs what draws the game's DLSS evaluation, when that changes.
@@ -1219,9 +1274,12 @@ bool KeplerCompute::FinishDlssEvaluation() {
     const GameDlssReason blocker = GameDlssBlocker();
     const bool can_show =
         blocker == GameDlssReason::None && dlss_chain.failure == GameDlssReason::None;
-    // Checked before the replacement upscale draws over the output. Checks start over whenever
-    // the network can't run.
-    if (complete && can_show) {
+    // Checked before the replacement upscale draws over the output, also while the network runs
+    // behind it after mismatched output. Checks start over whenever the network can't run.
+    const bool recheck = blocker == GameDlssReason::None &&
+                         dlss_chain.failure == GameDlssReason::OutputMismatch &&
+                         !DlssNetworkDroppedForGood();
+    if (complete && (can_show || recheck)) {
         CheckDlssNetwork();
     } else {
         dlss_chain.good_checks = 0;
