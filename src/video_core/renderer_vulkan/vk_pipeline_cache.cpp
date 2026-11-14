@@ -54,6 +54,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/nx2_tested.h"
 #include "video_core/oot_whiteout_trace.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -506,25 +507,24 @@ struct DeferredStages {
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 };
 
-/// TEST: EDEN_NX2_PREBUILD_STAGES=<n> runs at most n Background shader stages (prebuild, precache)
-/// at once; 0 or unset: no limit.
+/// EDEN_NX2_PREBUILD_STAGES=<n> runs at most n Background shader stages (prebuild, precache) at
+/// once; 0 or unset: no limit.
 size_t BackgroundShaderStages() {
-    static const size_t stages = [] {
-        const char* const value = std::getenv("EDEN_NX2_PREBUILD_STAGES");
-        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
-    }();
-    return stages;
+    const char* const value = std::getenv("EDEN_NX2_PREBUILD_STAGES");
+    return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
 }
 
-/// TEST: EDEN_NX2_PREBUILD_MAX=<n> admits at most n skipped cached pipelines to the background
-/// prebuild (0: none); unset: as many as the kept limit leaves.
+/// Skipped cached graphics pipelines the background prebuild may take. None in Ocarina of Time:
+/// building its ~17,600 skipped ones on every worker held Castle Town at 19-25 ms a frame until
+/// they were done (94 s to past 150 s after boot); a draw took 0-2 of them a run, each still
+/// building (up to 309 ms); and with one background stage at a time (EDEN_NX2_PREBUILD_STAGES=1)
+/// each run still had a 68-72 ms frame in the route's first 10 s. Elsewhere as many as the kept
+/// limit leaves. EDEN_NX2_PREBUILD_MAX=<n> sets it in any title.
 size_t PrebuildMax() {
-    static const size_t max = [] {
-        const char* const value = std::getenv("EDEN_NX2_PREBUILD_MAX");
-        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
-                                : std::numeric_limits<size_t>::max();
-    }();
-    return max;
+    if (const char* const value = std::getenv("EDEN_NX2_PREBUILD_MAX")) {
+        return static_cast<size_t>(std::strtoull(value, nullptr, 10));
+    }
+    return VideoCommon::Nx2Tested::TestedTitle() ? 0 : std::numeric_limits<size_t>::max();
 }
 
 size_t GetTotalPipelineWorkers() {
