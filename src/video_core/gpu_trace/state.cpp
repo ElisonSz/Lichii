@@ -135,6 +135,17 @@ bool GetRegs(Cursor& cursor, Regs& regs) {
 }
 } // Anonymous namespace
 
+AddressSpaceRecord StateAccess::AddressSpace(const Tegra::MemoryManager& memory_manager) {
+    return {static_cast<u32>(memory_manager.GetID()),
+            static_cast<u32>(memory_manager.address_space_bits), memory_manager.split_address,
+            static_cast<u32>(memory_manager.big_page_bits),
+            static_cast<u32>(memory_manager.page_bits)};
+}
+
+std::vector<MapLog::Entry> StateAccess::Maps(const Tegra::MemoryManager& memory_manager) {
+    return memory_manager.trace_maps.Entries();
+}
+
 void StateAccess::Settle(ChannelState& channel) {
     auto& payload = *channel.payload;
     if (payload.maxwell_3d.front_macros) {

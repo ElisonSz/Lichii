@@ -23,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_stats.h"
@@ -267,6 +268,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (VideoCommon::SyncSuspend::enabled) [[unlikely]] {
                 VideoCommon::SyncSuspend::queued_commands.fetch_sub(1, std::memory_order_relaxed);
             }
+            if (VideoCommon::GpuTrace::g_requested.load(std::memory_order_relaxed) ||
+                VideoCommon::GpuTrace::g_file_trigger) {
+                const auto* const submit = std::get_if<SubmitListCommand>(&next.data);
+                VideoCommon::GpuTrace::OnCommand(
+                    system, scheduler.HasPendingChannels(), submit ? &submit->entries : nullptr,
+                    submit ? submit->channel : -1, std::holds_alternative<GPUTickCommand>(next.data));
+            }
             if (split.Active()) {
                 split.PublishSoon();
                 VideoCommon::FrontQmdView::Get().MaybeTakeOver(
@@ -326,6 +334,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 last_progress = std::chrono::steady_clock::now();
                 continue;
             }
+            // Match split Call boundaries before callbacks, flushes and invalidations, and
+            // conservatively end reuse at each submitted list, including channel changes.
+            VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
             if (!std::holds_alternative<SubmitListCommand>(next.data)) {
                 Tegra::DmaPusher::WaitForSnapshotCopies();
             }

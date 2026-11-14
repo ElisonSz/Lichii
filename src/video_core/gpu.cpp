@@ -34,6 +34,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/pending_maps.h"
@@ -312,6 +313,8 @@ struct GPU::Impl {
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
         VideoCommon::GpuSplit::Get().SetTickHook(nullptr, nullptr);
+        // Ends a recording while guest memory and the SMMU it holds references in still exist.
+        VideoCommon::GpuTrace::OnGpuShutdown();
         {
             // The GPU threads stopped: no sync operation runs anymore. Guest threads still run
             // until the kernel suspends them, and one waiting for a read's flush (OnCPURead)
@@ -422,6 +425,7 @@ struct GPU::Impl {
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
+        VideoCommon::GpuTrace::NoteDeviceWrite(addr, size);
         if (preserve_gpu_writes) {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
@@ -447,6 +451,7 @@ struct GPU::Impl {
     }
 
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
+        VideoCommon::GpuTrace::NotePresent(layers, fences);
         const size_t num_fences{fences.size()};
         size_t current_request_counter{};
         if (num_fences != 0) {
@@ -575,6 +580,15 @@ std::shared_ptr<Control::ChannelState> GPU::AllocateChannel() {
 
 void GPU::InitChannel(Control::ChannelState& to_init, u64 program_id) {
     impl->InitChannel(to_init, program_id);
+}
+
+std::vector<std::shared_ptr<Control::ChannelState>> GPU::Channels() const {
+    std::vector<std::shared_ptr<Control::ChannelState>> channels;
+    for (const auto& [id, channel] : impl->channels) {
+        channels.push_back(channel);
+    }
+    std::ranges::sort(channels, {}, [](const auto& channel) { return channel->bind_id; });
+    return channels;
 }
 
 void GPU::BindChannel(s32 channel_id) {

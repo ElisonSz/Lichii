@@ -313,6 +313,7 @@ public:
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    bool BypassOotBaseNetwork();
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.

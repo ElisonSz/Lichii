@@ -83,6 +83,10 @@ struct GpuSplitTestAccess {
         return split.hook_requested.load();
     }
 
+    static void SetBackRunning(GpuSplit& split, bool running) {
+        split.back_running.store(running, std::memory_order_release);
+    }
+
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
     }
@@ -2363,4 +2367,49 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
             }
         }
     }
+}
+
+TEST_CASE("Unsplit draw reuse requires the sole GPU scheduler owner",
+          "[video_core][fast_draw][unsplit_fast_draw]") {
+    using Split = VideoCommon::GpuSplit;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    auto& global = Split::Get();
+    REQUIRE_FALSE(global.BackRunning());
+    std::array<bool, 4> allowed{};
+    // Fresh thread-local state, so the test does not mark Catch's thread as a GPU owner.
+    std::jthread owner([&] {
+        allowed[0] = Split::CanReuseDrawState();
+        Split::MarkGpuThread();
+        allowed[1] = Split::CanReuseDrawState();
+        Access::SetBackRunning(global, true);
+        SCOPE_EXIT { Access::SetBackRunning(global, false); };
+        allowed[2] = Split::CanReuseDrawState();
+        Access::SetBackRunning(global, false);
+        allowed[3] = Split::CanReuseDrawState();
+    });
+    owner.join();
+    REQUIRE_FALSE(allowed[0]); // Unmarked service thread.
+    REQUIRE(allowed[1]);       // Sole GPU scheduler owner.
+    REQUIRE_FALSE(allowed[2]); // Front while a back thread owns the scheduler.
+    REQUIRE(allowed[3]);       // Sole GPU owner again after the back stops.
+    REQUIRE_FALSE(Split::CanReuseDrawState()); // No ownership leaked to this thread.
+}
+
+TEST_CASE("Draw reuse remains eligible on the actual split worker",
+          "[video_core][fast_draw][unsplit_fast_draw]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    bool on_back{};
+    bool allowed{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    split.Defer([back = &on_back, result = &allowed] {
+        *back = VideoCommon::GpuSplit::OnBackThread();
+        *result = VideoCommon::GpuSplit::CanReuseDrawState();
+    });
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(on_back);
+    REQUIRE(allowed);
 }

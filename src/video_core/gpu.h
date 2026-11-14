@@ -157,6 +157,9 @@ public:
 
     std::shared_ptr<Control::ChannelState> AllocateChannel();
 
+    /// Every channel allocated so far.
+    [[nodiscard]] std::vector<std::shared_ptr<Control::ChannelState>> Channels() const;
+
     void InitChannel(Control::ChannelState& to_init, u64 program_id);
 
     void BindChannel(s32 channel_id);

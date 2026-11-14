@@ -286,15 +286,54 @@ TEST_CASE("sysmix plays the Sports Resort Q15 movie ring including wrap and gain
     REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
 }
 
-TEST_CASE("sysmix advertises only implemented stereo PCM formats", "[sysmix]") {
-    REQUIRE(SysmixOutput::IsFormatSupported(2, 2, 48000));
-    REQUIRE(SysmixOutput::IsFormatSupported(5, 2, 48000));
-    for (const u32 format : {0U, 1U, 3U, 4U, 6U, 258U, 261U}) {
-        REQUIRE_FALSE(SysmixOutput::IsFormatSupported(format, 2, 48000));
+TEST_CASE("sysmix advertises only implemented stereo and 5.1 PCM formats", "[sysmix]") {
+    for (const u32 channels : {2U, 6U}) {
+        REQUIRE(SysmixOutput::IsFormatSupported(2, channels, 48000));
+        REQUIRE(SysmixOutput::IsFormatSupported(5, channels, 48000));
+        for (const u32 format : {0U, 1U, 3U, 4U, 6U, 258U, 261U}) {
+            REQUIRE_FALSE(SysmixOutput::IsFormatSupported(format, channels, 48000));
+        }
+        REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, channels, 44100));
     }
-    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 1, 48000));
-    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 6, 48000));
-    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 2, 44100));
+    for (const u32 channels : {0U, 1U, 3U, 4U, 5U, 8U}) {
+        REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, channels, 48000));
+    }
+}
+
+TEST_CASE("sysmix plays the Orbitals 5.1 F32 ring on stereo and 5.1 hosts", "[sysmix]") {
+    for (const u32 host_channels : {2U, 6U}) {
+        Context context;
+        context.sink.host_channels = host_channels;
+        Cursor(context, 0, 2);
+        const std::array<f32, 12> frames{0.5f, -0.25f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                         0.0f, 0.0f,  0.5f, 0.0f, 0.0f, 0.0f};
+        REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, frames.data(),
+                                            sizeof(frames)));
+        SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                            Context::Size, 0x24};
+        REQUIRE(stream.Open(5, 6, 48000, 480, 0, 0).IsSuccess());
+        REQUIRE(stream.SetEngaged(true).IsSuccess());
+        stream.Pump();
+        REQUIRE(ReadCursor(context) == 2);
+        REQUIRE(stream.GetCounters().accepted_frames == 2);
+        REQUIRE(stream.GetCounters().nonzero_frames == 2);
+        std::vector<s16> output(240 * host_channels);
+        context.sink.last->ProcessAudioOutAndRender(output, 240);
+        if (host_channels == 6) {
+            REQUIRE(output[0] == 16384);
+            REQUIRE(output[1] == -8192);
+            REQUIRE(output[6 + 2] == 16384);
+            REQUIRE(std::ranges::count(std::span{output}.first(12), s16{0}) == 9);
+        } else {
+            const auto center = static_cast<s16>(16384.0f * 0.596f);
+            REQUIRE(output[0] == 16384);
+            REQUIRE(output[1] == -8192);
+            REQUIRE(output[2] == center);
+            REQUIRE(output[3] == center);
+        }
+        REQUIRE(std::ranges::all_of(std::span{output}.subspan(2 * host_channels),
+                                    [](s16 value) { return value == 0; }));
+    }
 }
 
 TEST_CASE("sysmix mode2 event uses actual free frames even before engagement", "[sysmix]") {
@@ -688,5 +727,25 @@ TEST_CASE("sysmix null output preserves PCM cadence and notification timing", "[
         // after three 5 ms ticks, just as when the original pump admitted one block per tick.
         REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()) == (tick >= 3));
         REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
+    }
+}
+
+TEST_CASE("sysmix null output drains a 5.1 ring one block per pump", "[sysmix]") {
+    Context context;
+    AudioCore::Sink::NullSink sink{"auto"};
+    Cursor(context, 0, 480);
+    std::vector<float> pcm(480 * 6, 0.25f);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, pcm.data(),
+                                        pcm.size() * sizeof(float)));
+    SysmixOutput stream{context.system, *context.process, sink, 1,
+                        Context::Base,  Context::Size,    0x24};
+    REQUIRE(stream.Open(5, 6, 48000, 480, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    for (u32 tick = 1; tick <= 2; ++tick) {
+        CAPTURE(tick);
+        stream.Pump();
+        REQUIRE(ReadCursor(context) == tick * 240);
+        REQUIRE(stream.GetCounters().admitted_blocks == tick);
+        REQUIRE(stream.GetCounters().nonzero_frames == tick * 240);
     }
 }

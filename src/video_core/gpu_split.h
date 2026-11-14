@@ -25,6 +25,7 @@
 #include "common/container/unordered_map.h"
 #include "common/thread.h"
 #include "video_core/nx2_call_sites.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_fast_wake.h"
 #include "video_core/nx2_runahead.h"
 #include "video_core/nx2_sem_recorder.h"
@@ -215,6 +216,10 @@ public:
     /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
     [[nodiscard]] static bool OwnsScheduler() {
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
+    }
+    /// Draw state belongs to the split back thread, or the sole GPU scheduler owner.
+    [[nodiscard]] static bool CanReuseDrawState() {
+        return OnBackThread() || OwnsScheduler();
     }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
@@ -409,6 +414,9 @@ public:
     template <typename Func>
     void Run(const Func& func, DrainSite site = DrainSite::Other) {
         if (on_back_thread || !active) {
+            if (!on_back_thread) {
+                Nx2FastDraw::BreakUnsplit(Nx2FastDraw::Reason::Call);
+            }
             func();
             return;
         }

@@ -18,6 +18,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/memory_manager.h"
 #include "video_core/memtrack_translation.h"
 #include "video_core/nx2.h"
@@ -262,15 +263,26 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 }
 
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
-    if (is_big_pages)
-        return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
-    return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+    const GPUVAddr result = is_big_pages
+                                ? BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped)
+                                : PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+    const VideoCommon::GpuTrace::MapLog::Entry entry{
+        gpu_addr, gpu_addr + size, dev_addr, static_cast<u32>(kind), is_big_pages, false};
+    trace_maps.Map(entry);
+    VideoCommon::GpuTrace::NoteGmmuMap(*this, entry);
+    return result;
 }
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
-    if (is_big_pages)
-        return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
-    return PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+    const GPUVAddr result =
+        is_big_pages
+            ? BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved)
+            : PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+    const VideoCommon::GpuTrace::MapLog::Entry entry{
+        gpu_addr, gpu_addr + size, 0, static_cast<u32>(PTEKind::INVALID), is_big_pages, true};
+    trace_maps.Map(entry);
+    VideoCommon::GpuTrace::NoteGmmuMap(*this, entry);
+    return result;
 }
 
 void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
@@ -286,6 +298,8 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
 
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
+    trace_maps.Unmap(gpu_addr, gpu_addr + size);
+    VideoCommon::GpuTrace::NoteGmmuUnmap(*this, gpu_addr, size);
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {

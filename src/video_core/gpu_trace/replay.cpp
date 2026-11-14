@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <limits>
+#include <thread>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -26,6 +28,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu_trace/replay.h"
 #include "video_core/gpu_trace/state.h"
 #include "video_core/gpu_trace/trace_file.h"
@@ -427,8 +430,11 @@ void Replayer::InvalidateDevice(u64 physical, u64 size) {
 }
 
 void Replayer::WriteMemory(const MemoryRecord& record, const std::vector<u8>& bytes) {
-    std::memcpy(system.DeviceMemory().buffer.BackingBasePointer() + record.physical_address,
-                bytes.data(), bytes.size());
+    u8* const pointer =
+        system.DeviceMemory().buffer.BackingBasePointer() + record.physical_address;
+    std::memcpy(pointer, bytes.data(), bytes.size());
+    // The replay writes for the guest CPU: a recording of the replay sees it as one.
+    NoteCpuWrite(pointer, bytes.size());
     InvalidateDevice(record.physical_address, record.size);
 }
 
@@ -448,8 +454,10 @@ bool Replayer::Submit(const Record& record, std::string& error) {
     const auto prefetch = Array<u32>(record, offset, header.prefetch_count);
     const auto offsets = Array<u32>(record, offset, header.offset_count);
     const auto words = Array<u32>(record, offset, header.word_count);
+    const auto deferred = Array<u32>(record, offset, header.deferred_count);
     if (entries.size() != header.entry_count || prefetch.size() != header.prefetch_count ||
-        offsets.size() != header.offset_count || words.size() != header.word_count) {
+        offsets.size() != header.offset_count || words.size() != header.word_count ||
+        deferred.size() != header.deferred_count) {
         error = "short submit record";
         return false;
     }
@@ -465,6 +473,7 @@ bool Replayer::Submit(const Record& record, std::string& error) {
     for (const u32 word : words) {
         list.submitted_words.push_back(Tegra::CommandHeader{word});
     }
+    list.deferred_entries.assign(deferred.begin(), deferred.end());
     system.GPU().PushGPUEntries(it->second->bind_id, std::move(list));
     return true;
 }
@@ -505,6 +514,14 @@ bool Replayer::Present(const Record& record, std::string& error) {
         return true;
     }
 
+    if (!options.record.empty() && presents == options.record_from) {
+        RecordOptions record{options.record, options.record_presents != 0
+                                                 ? options.record_presents
+                                                 : std::numeric_limits<u32>::max()};
+        if (!RequestRecording(record, error)) {
+            return false;
+        }
+    }
     // A composite runs at the GPU thread's next tick, which can come before commands still
     // queued: let those finish first, as they had when the present was recorded.
     std::promise<void> drained;
@@ -656,6 +673,18 @@ bool Replayer::Stream(std::string& error) {
         }
     }
     gpu.WaitForIdle();
+    if (!options.record.empty()) {
+        // The recorder ends at the GPU thread's next command.
+        StopRecording();
+        while (GetRecorderStatus().requested) {
+            gpu.WaitForIdle();
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        if (const auto status = GetRecorderStatus(); !status.last_error.empty()) {
+            error = "recording: " + status.last_error;
+            return false;
+        }
+    }
     return true;
 }
 

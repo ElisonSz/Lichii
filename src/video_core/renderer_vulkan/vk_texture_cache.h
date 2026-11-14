@@ -274,6 +274,11 @@ public:
         return memory_allocator.FailedImages();
     }
 
+    /// Device-local bytes placed in host memory since the last call (see MemoryAllocator).
+    u64 TakeSpilledBytes() const noexcept {
+        return memory_allocator.TakeSpilledBytes();
+    }
+
     void LogMemoryStatistics() const;
 
     /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).

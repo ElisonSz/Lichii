@@ -5,11 +5,13 @@
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
@@ -480,4 +482,28 @@ TEST_CASE("Fast draw breaks skip the add only on the drawing thread, after its f
     CHECK(again == read + 3);
     FastDraw::Break(FastDraw::Reason::Register, 4);
     CHECK(current() == again + 1);
+}
+
+TEST_CASE("Unsplit callbacks end draw reuse before they execute", "[fast_draw][unsplit_fast_draw]") {
+    const bool previous_reads_serial = FastDraw::t_reads_serial;
+    const bool previous_serial_bumped = FastDraw::t_serial_bumped;
+    SCOPE_EXIT {
+        FastDraw::t_reads_serial = previous_reads_serial;
+        FastDraw::t_serial_bumped = previous_serial_bumped;
+    };
+    FastDrawFixture f;
+    VideoCommon::GpuSplit split;
+    REQUIRE_FALSE(split.Active());
+    f.DrawArrays(0, 3);
+    const u64 before = f.rasterizer.draws.back();
+    u64 inside{};
+    u32 calls{};
+    split.Run([&] {
+        ++calls;
+        inside = FastDraw::Serial();
+    });
+    f.DrawArrays(3, 3);
+    REQUIRE(calls == 1);
+    REQUIRE(inside != before);
+    REQUIRE_FALSE(f.Reusable());
 }

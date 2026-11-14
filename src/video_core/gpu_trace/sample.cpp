@@ -115,7 +115,7 @@ void Submit(Writer& writer, u64 offset, const Commands& commands) {
     Tegra::CommandListHeader entry{};
     entry.addr.Assign(GpuBase + offset);
     entry.size.Assign(commands.words.size());
-    const SubmitRecord header{Channel, 1, 0, 0, 0};
+    const SubmitRecord header{Channel, 1, 0, 0, 0, 0};
     const std::array<std::span<const u8>, 2> parts{
         std::span<const u8>{reinterpret_cast<const u8*>(&header), sizeof(header)},
         std::span<const u8>{reinterpret_cast<const u8*>(&entry.raw), sizeof(entry.raw)}};

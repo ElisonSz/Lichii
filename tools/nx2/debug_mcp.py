@@ -269,6 +269,32 @@ TOOLS = [
                        "on or off; read it with log_tail. Returns the previous and current state.",
         "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
     },
+    {
+        "name": "trace_record",
+        "description": "Records a GPU trace (docs/nx2/gpu-trace.md): from the next GPU command "
+                       "boundary, a snapshot then every submit, CPU memory write, map and present "
+                       "for the given seconds (60 presents a second) or presents. Writes to path, "
+                       "else the dump directory. Poll trace_status for the file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "minimum": 0.1, "maximum": 60},
+                "presents": {"type": "integer", "minimum": 1, "maximum": 3600},
+                "path": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "trace_stop",
+        "description": "Ends the GPU trace recording at the next GPU command (keeps what it has).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "trace_status",
+        "description": "GPU trace recorder state: requested, recording, presents so far and "
+                       "wanted, the path, the last trace written and the last error.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}

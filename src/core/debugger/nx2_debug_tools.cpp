@@ -33,6 +33,7 @@
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_base.h"
 
@@ -79,6 +80,7 @@ struct ToolState {
     u64 captures{};
     u64 screenshots{};
     u64 samples{};
+    u64 traces{};
     u64 gpu_reads{};
     std::atomic<bool> stopping{};
 };
@@ -513,6 +515,37 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json TraceStatus(ToolState&, const json&) {
+    const auto status = VideoCommon::GpuTrace::GetRecorderStatus();
+    return {{"requested", status.requested},       {"recording", status.recording},
+            {"presents", status.presents},         {"presents_wanted", status.presents_wanted},
+            {"bytes_uncompressed", status.bytes},  {"path", status.path},
+            {"last_trace", status.last_trace},     {"last_error", status.last_error}};
+}
+
+json TraceRecord(ToolState& state, const json& params) {
+    VideoCommon::GpuTrace::RecordOptions options;
+    const double seconds = Param<double>(params, "seconds", 3.0, 0.1, 60.0);
+    options.presents = Param<u32>(params, "presents", static_cast<u32>(seconds * 60.0), 1, 3600);
+    if (params.contains("path")) {
+        options.path = params["path"].get<std::string>();
+    } else {
+        std::filesystem::create_directories(state.dump_directory);
+        options.path = state.dump_directory /
+                       fmt::format("trace-{}-{:03}.lxtrace", state.session, ++state.traces);
+    }
+    std::string error;
+    if (!VideoCommon::GpuTrace::RequestRecording(options, error)) {
+        throw std::runtime_error{error};
+    }
+    return TraceStatus(state, params);
+}
+
+json TraceStop(ToolState& state, const json& params) {
+    VideoCommon::GpuTrace::StopRecording();
+    return TraceStatus(state, params);
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -738,6 +771,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_bundle", handler(CaptureBundle)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
+        {"trace_record", handler(TraceRecord)},
+        {"trace_stop", handler(TraceStop)},
+        {"trace_status", handler(TraceStatus)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},
         {"read_memory", handler(ReadMemory)},

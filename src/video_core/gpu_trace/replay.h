@@ -20,6 +20,11 @@ struct ReplayOptions {
     std::filesystem::path out;
     /// Stop after this many presents, 0 for all.
     u32 max_frames = 0;
+    /// Records a new trace of this replay from present record_from on, for record_presents
+    /// presents (0: to the end). A replay of it must give the same frames.
+    std::filesystem::path record;
+    u32 record_from = 0;
+    u32 record_presents = 0;
 };
 
 /// Replays a GPU trace without a window: restores the snapshot, feeds the recorded records

@@ -50,6 +50,7 @@ struct HostTranslateInfo {
     /// array of the table's entries (not OpenGL: its pipelines bind at most 64 textures; Vulkan
     /// only with nonuniform sampled image array indexing)
     bool support_handle_table_arrays{};
+    bool needs_lrz_disable{}; ///< True when fragment shaders must write depth to turn off LRZ
 
     /// The properties that change which values translation reads from the environment, a bit
     /// each: those deciding a pass that reads values, or a pass that changes the program before

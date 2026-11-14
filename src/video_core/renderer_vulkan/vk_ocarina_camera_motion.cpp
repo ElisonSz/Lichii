@@ -19,6 +19,7 @@
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -878,7 +879,7 @@ void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 
     auto& state = *impl;
     if (!state.effects_base_pass) {
         state.effects_base_pass = std::make_unique<OcarinaEffectsPass<1>>(
-            state.device, state.scheduler, state.pool, OCARINA_DLSS_COLOR_COMP_SPV);
+            state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_BASE_COMP_SPV);
         state.effects_mark_pass = std::make_unique<OcarinaEffectsPass<2>>(
             state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_COMP_SPV);
         state.effects_bias_pass = std::make_unique<OcarinaEffectsPass<3>>(

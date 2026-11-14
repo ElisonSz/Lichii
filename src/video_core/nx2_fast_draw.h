@@ -554,6 +554,11 @@ inline void Break(Reason reason, u32 method = 0) {
     }
 }
 
+/// Unsplit counterparts of commands whose split entries already end draw reuse.
+inline void BreakUnsplit(Reason reason) {
+    Break(reason);
+}
+
 /// The thread that draws: what it compares fast draws with (and from then on its next break
 /// bumps the serial again).
 inline u64 Serial() {
@@ -597,7 +602,7 @@ private:
 };
 
 /// Light changes since the last draw that can reach texture handles. Written and read on the
-/// thread that runs the 3D engine and the rasterizer (the split's back).
+/// thread that runs the 3D engine and the rasterizer (the back, or sole GPU thread).
 struct Delta {
     static constexpr size_t MaxWrites = 16;
 

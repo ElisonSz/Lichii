@@ -206,6 +206,7 @@ void OnBack(const Func& func,
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer(func, flags, writes);
     } else {
+        VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
         func();
     }
 }

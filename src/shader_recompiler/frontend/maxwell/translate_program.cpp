@@ -521,6 +521,17 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::VerificationPass(program);
     }
     Optimization::CollectShaderInfoPass(env, program);
+    // Adreno's proprietary driver culls 8x8 low-resolution-Z tiles with stale data in Ocarina
+    // (checkerboard holes in depth, sky showing through near geometry and water). Writing
+    // FragDepth = FragCoord.z from every fragment shader makes the driver turn LRZ off.
+    if (host_info.needs_lrz_disable && program.stage == Stage::Fragment &&
+        !program.info.stores_frag_depth && !program.blocks.empty()) {
+        IR::Block& entry{*program.blocks.front()};
+        IR::IREmitter ir{entry, entry.begin()};
+        ir.SetFragDepth(ir.GetAttribute(IR::Attribute::PositionZ));
+        program.info.stores_frag_depth = true;
+        program.info.loads.Set(IR::Attribute::PositionZ, true);
+    }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {

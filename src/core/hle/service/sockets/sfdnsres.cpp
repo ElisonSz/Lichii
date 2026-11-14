@@ -13,6 +13,7 @@
 #include "core/core.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/sockets/nextendo_redirect.h"
+#include "core/hle/service/sockets/numeric_name_info.h"
 #include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/sockets/sockets.h"
 #include "core/hle/service/sockets/sockets_translate.h"
@@ -37,7 +38,7 @@ SFDNSRES::SFDNSRES(Core::System& system_) : ServiceFramework{system_, "sfdnsres"
         {10, &SFDNSRES::GetHostByNameRequestWithOptions, "GetHostByNameRequestWithOptions"},
         {11, nullptr, "GetHostByAddrRequestWithOptions"},
         {12, &SFDNSRES::GetAddrInfoRequestWithOptions, "GetAddrInfoRequestWithOptions"},
-        {13, nullptr, "GetNameInfoRequestWithOptions"},
+        {13, &SFDNSRES::GetNameInfoRequestWithOptions, "GetNameInfoRequestWithOptions"},
         {14, &SFDNSRES::ResolverSetOptionRequest, "ResolverSetOptionRequest"},
         {15, nullptr, "ResolverGetOptionRequest"},
     };
@@ -428,6 +429,43 @@ void SFDNSRES::GetAddrInfoRequestWithOptions(HLERequestContext& ctx) {
         .netdb_error = GetAddrInfoErrorToNetDbError(emu_gai_err),
         .bsd_errno = GetAddrInfoErrorToErrno(emu_gai_err),
     });
+}
+
+void SFDNSRES::GetNameInfoRequestWithOptions(HLERequestContext& ctx) {
+    NumericNameInfoResult result{GetAddrInfoError::FAIL, {}, {}};
+    const auto parameters = GetNumericNameInfoParameters(
+        {ctx.CommandBuffer(), IPC::COMMAND_BUFFER_LENGTH}, ctx.GetDataPayloadOffset());
+    const auto& inputs = ctx.BufferDescriptorA();
+    const auto& pointers = ctx.BufferDescriptorX();
+    const auto& outputs = ctx.BufferDescriptorB();
+
+    // SDK13: A0 sockaddr, B0 host, B1 service; options are A1 OR X0, not X1.
+    // Reject unsupported options by metadata before reading any of their contents.
+    if (!parameters.empty() && !inputs.empty() && inputs.size() <= 2 && pointers.size() <= 1 &&
+        outputs.size() == 2 && ctx.BufferDescriptorC().empty() && inputs[0].Size() >= 16 &&
+        inputs[0].Size() <= 256 && inputs[0].Address() != 0 &&
+        (inputs.size() < 2 || inputs[1].Size() == 0) &&
+        (pointers.empty() || pointers[0].Size() == 0) &&
+        (outputs[0].Size() == 0 || outputs[0].Address() != 0) &&
+        (outputs[1].Size() == 0 || outputs[1].Address() != 0)) {
+        result = ResolveNumericNameInfoRequest(parameters, ctx.ReadBufferA(0), {},
+                                               outputs[0].Size(), outputs[1].Size());
+    }
+
+    if (result.error == GetAddrInfoError::SUCCESS) {
+        if (!result.host.empty()) {
+            ctx.WriteBufferB(result.host.data(), result.host.size(), 0);
+        }
+        if (!result.service.empty()) {
+            ctx.WriteBufferB(result.service.data(), result.service.size(), 1);
+        }
+    }
+
+    // This SDK caller ignores IPC Result. Resolver failures must be nonzero in
+    // the normal ret/EAI field, never a zero-filled success or IPC-only error.
+    IPC::ResponseBuilder rb{ctx, 5};
+    rb.Push(ResultSuccess);
+    rb.PushRaw(MakeNumericNameInfoResponse(result.error));
 }
 
 void SFDNSRES::ResolverSetOptionRequest(HLERequestContext& ctx) {

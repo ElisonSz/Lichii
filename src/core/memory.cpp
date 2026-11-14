@@ -37,6 +37,7 @@
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_async_readback.h"
@@ -375,6 +376,7 @@ struct Memory::Impl {
                 }
                 RecordCpuStore(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
                 std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
             });
     }
 
@@ -395,6 +397,7 @@ struct Memory::Impl {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
                 RecordCpuStore(ptr, nullptr, copy_amount);
                 std::memset(ptr, 0, copy_amount);
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
             });
     }
 
@@ -976,16 +979,23 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
+        bool rasterizer_write = false;
         if (auto const ptr = GetPointerImpl(
                 addr,
                 [addr, data]() {
                     LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8,
                               addr, u64(data));
                 },
-                [&]() { HandleRasterizerWrite(addr, sizeof(T)); });
-            ptr) {
+                [&]() {
+                    HandleRasterizerWrite(addr, sizeof(T));
+                    rasterizer_write = true;
+                });
+            ptr) [[likely]] {
             RecordCpuStore(ptr, &data, sizeof(T));
             std::memcpy(ptr, &data, sizeof(T));
+            if (rasterizer_write) [[unlikely]] {
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
+            }
         }
     }
 
@@ -1004,6 +1014,7 @@ struct Memory::Impl {
             if (stored) {
                 RecordCpuStore(ptr, &data, sizeof(T));
             }
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
             return stored;
         }
         return true;
@@ -1023,6 +1034,7 @@ struct Memory::Impl {
             if (stored) {
                 RecordCpuStore(ptr, &data, sizeof(data));
             }
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(u128));
             return stored;
         }
         return true;

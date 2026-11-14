@@ -773,6 +773,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_byte_addressed_r16 = true,
         // The arrays are indexed per invocation, which needs nonuniform indexing to be defined.
         .support_handle_table_arrays = device.IsSampledImageArrayNonUniformIndexingSupported(),
+        .needs_lrz_disable = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
     };
     host_info.ApplyDescriptorLimitPolicy();
 

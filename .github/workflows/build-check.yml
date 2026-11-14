@@ -67,7 +67,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev ccache pipx \
+            libopus-dev libasound2-dev ccache pipx mesa-vulkan-drivers \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
           pipx install cmake==4.4.4
@@ -129,6 +129,13 @@ jobs:
 
       - name: Test debug adapter
         run: python3 tools/nx2/test_debug_mcp.py
+
+      # docs/nx2/gpu-trace.md: the corpus replays headless on Mesa's CPU Vulkan driver.
+      - name: Replay GPU traces on lavapipe
+        run: |
+          python3 tools/nx2/test_trace_replay.py
+          python3 -I tools/nx2/trace_replay.py check --cli build/bin/eden-cli \
+            --corpus tests/gpu_traces/corpus.json
 
       - name: Test cache metrics and bench
         run: |

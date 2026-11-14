@@ -21,6 +21,7 @@
 #include "common/sparse_large_vector.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/cache_types.h"
+#include "video_core/gpu_trace/map_log.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pte_kind.h"
 
@@ -32,9 +33,15 @@ namespace Core {
 class System;
 } // namespace Core
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 
 class MemoryManager final {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,
@@ -315,6 +322,8 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    /// What this address space maps, for a GPU trace that starts later (gpu_trace/recorder.h).
+    VideoCommon::GpuTrace::MapLog trace_maps;
     mutable std::mutex guard;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};

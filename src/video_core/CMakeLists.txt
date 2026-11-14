@@ -67,6 +67,7 @@ add_library(video_core STATIC
     fsr.cpp
     fsr.h
     fsr4_support.h
+    ocarina_camera.h
     game_dlss_status.cpp
     game_dlss_status.h
     host1x/codecs/decoder.cpp
@@ -110,6 +111,9 @@ add_library(video_core STATIC
     gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
+    gpu_trace/map_log.h
+    gpu_trace/recorder.cpp
+    gpu_trace/recorder.h
     gpu_trace/replay.cpp
     gpu_trace/replay.h
     gpu_trace/sample.cpp

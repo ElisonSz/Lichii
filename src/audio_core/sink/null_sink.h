@@ -25,7 +25,8 @@ public:
     void AppendBuffer(SinkBuffer&, std::span<s16>) override {}
     bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) override {
         return buffer.frames == TargetSampleCount && buffer.frames_played == 0 &&
-               !buffer.consumed && samples.size() == TargetSampleCount * 2;
+               !buffer.consumed &&
+               (samples.size() == TargetSampleCount * 2 || samples.size() == TargetSampleCount * 6);
     }
     /// Preserve guest PCM pacing without host callbacks: one block per 5 ms pump.
     u32 SysmixQueueLimit() const override {
