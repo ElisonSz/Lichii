@@ -506,6 +506,27 @@ struct DeferredStages {
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 };
 
+/// TEST: EDEN_NX2_PREBUILD_STAGES=<n> runs at most n Background shader stages (prebuild, precache)
+/// at once; 0 or unset: no limit.
+size_t BackgroundShaderStages() {
+    static const size_t stages = [] {
+        const char* const value = std::getenv("EDEN_NX2_PREBUILD_STAGES");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
+    }();
+    return stages;
+}
+
+/// TEST: EDEN_NX2_PREBUILD_MAX=<n> admits at most n skipped cached pipelines to the background
+/// prebuild (0: none); unset: as many as the kept limit leaves.
+size_t PrebuildMax() {
+    static const size_t max = [] {
+        const char* const value = std::getenv("EDEN_NX2_PREBUILD_MAX");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : std::numeric_limits<size_t>::max();
+    }();
+    return max;
+}
+
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
@@ -840,6 +861,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
         .cpu_threads = cpu_threads,
         .driver_threads = driver_threads,
+        .max_background_stages = BackgroundShaderStages(),
         .name = "VkShader",
     });
 }
@@ -1770,8 +1792,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         std::vector<u8> payload;
     };
     std::vector<PrebuildRecord> prebuild;
-    for (const auto& [index, key] : NewestFirst(std::move(skipped_graphics),
-                                                PrebuildLimit(kept_pipelines, queued_graphics))) {
+    for (const auto& [index, key] :
+         NewestFirst(std::move(skipped_graphics),
+                     std::min(PrebuildLimit(kept_pipelines, queued_graphics), PrebuildMax()))) {
         const CacheV2::LogRecord& record = *records[index];
         prebuild.push_back({
             .key = key,

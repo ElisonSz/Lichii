@@ -84,7 +84,12 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         // unmaps ~800 MiB in ~12 s): a pass holds the kernel's working-set lock, which each of its
         // maps and unmaps needs, for most of a second. Look again after the same interval.
         constexpr u64 QuietNs = 5'000'000'000ULL;
-        if (Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
+        // TEST: EDEN_NX2_ZERO_TRIM_QUIET=0 leaves out this wait (only the bulk mapping one above).
+        static const bool quiet_wait = [] {
+            const char* const value = std::getenv("EDEN_NX2_ZERO_TRIM_QUIET");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (quiet_wait && Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
             continue;
         }
         const auto start = std::chrono::steady_clock::now();
@@ -111,7 +116,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             LOG_INFO(HW_Memory, "Zero trim pass: {} MiB of {} MiB resident in {} ms",
                      trimmed >> 20, resident >> 20, ms);
         }
-        if (Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
+        if (quiet_wait && Common::HostMemory::NanosecondsSinceMapChange() < QuietNs) {
             continue; // the pass gave way: no backing off
         }
         if (trimmed < Busy) {
