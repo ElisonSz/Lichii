@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <memory>
 #include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -492,7 +493,9 @@ TEST_CASE("Unsplit callbacks end draw reuse before they execute", "[fast_draw][u
         FastDraw::t_serial_bumped = previous_serial_bumped;
     };
     FastDrawFixture f;
-    VideoCommon::GpuSplit split;
+    // On the heap: a split is ~330 KiB, and Windows gives a thread 1 MiB of stack.
+    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_owner;
     REQUIRE_FALSE(split.Active());
     f.DrawArrays(0, 3);
     const u64 before = f.rasterizer.draws.back();

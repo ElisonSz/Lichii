@@ -2398,9 +2398,12 @@ TEST_CASE("Unsplit draw reuse requires the sole GPU scheduler owner",
 TEST_CASE("Draw reuse remains eligible on the actual split worker",
           "[video_core][fast_draw][unsplit_fast_draw]") {
     using Access = VideoCommon::GpuSplitTestAccess;
-    Fixture f;
+    // On the heap: a fixture and a split don't fit Windows' 1 MiB of stack together.
+    const auto fixture = std::make_unique<Fixture>();
+    Fixture& f = *fixture;
     f.system.Initialize();
-    VideoCommon::GpuSplit split;
+    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
+    VideoCommon::GpuSplit& split = *split_owner;
     bool on_back{};
     bool allowed{};
     Access::Start(split, f.system);
