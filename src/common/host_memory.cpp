@@ -1484,15 +1484,29 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
         }
     };
+    // One VirtualUnlock holds the working set's lock over its whole range, and a guest that cleared
+    // its heap leaves runs of zero pages gigabytes long: every map, unmap, protection and page
+    // fault of the process waits for such a run (a 4.4 GiB pass at Ocarina of Time's Castle Town
+    // route start came with a 337 ms frame). Runs go in pieces of at most UnlockPieceBytes, and the
+    // pass gives way between them to a guest that maps or unmaps.
+    constexpr uintptr_t UnlockPieceBytes = uintptr_t{16} << 20;
+    size_t unlocked_bytes = 0;
     for (size_t i = 0; i < trim.size();) {
         size_t j = i + 1;
-        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
+        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment &&
+               trim[j] - trim[i] < UnlockPieceBytes) {
             ++j;
         }
         unlock(trim[i], trim[j - 1] + PageAlignment);
+        unlocked_bytes += (j - i) * PageAlignment;
         i = j;
+        if (i < trim.size() && mapping_started()) {
+            break;
+        }
     }
-    return {resident, zero_bytes};
+    // The pages taken out include backing pages the scan read; a pass that gave way took out at
+    // most what it unlocked.
+    return {resident, (std::min)(zero_bytes, unlocked_bytes)};
 #else
     return {0, 0};
 #endif
