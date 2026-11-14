@@ -91,6 +91,8 @@ private:
     const PlayTime::PlayTimeManager& play_time_manager;
 
     QStringList watch_list;
+    /// Loose dumps found by this scan, sized after the list is shown.
+    std::vector<std::string> loose_dumps;
 
     std::mutex lock;
     std::condition_variable cv;

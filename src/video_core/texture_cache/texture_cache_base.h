@@ -208,6 +208,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
+    /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
+    /// an unmap or a join. Read and reset by DeleteImage.
+    const char* trace_delete_reason = "other";
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use

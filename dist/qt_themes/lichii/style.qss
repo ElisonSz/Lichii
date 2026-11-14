@@ -941,6 +941,11 @@ QPushButton#button_reset_defaults {
 
 /* Controller applet, input pages and software keyboard (from qdarkstyle) ----- */
 
+/* Set by the Configure dialog on a page that is wider than the screen. */
+QWidget[compactPage="true"] QPushButton {
+    padding: 0 6px;
+}
+
 QSpinBox#spinboxLStickRange,
 QSpinBox#spinboxRStickRange,
 QSpinBox#vibrationSpinPlayer1,

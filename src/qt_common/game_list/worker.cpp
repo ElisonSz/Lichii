@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -171,6 +172,58 @@ bool HasSupportedFileExtension(const std::string& file_name) {
 
 bool IsExtractedNCAMain(const std::string& file_name) {
     return QFileInfo(QString::fromStdString(file_name)).fileName() == QStringLiteral("main");
+}
+
+// The folder a loose dump's row stands for: the one that holds its exefs (the game folder, or
+// base/ or updates/<id> when the game keeps several). A `main` outside an exefs folder stands for
+// its own folder.
+std::filesystem::path LooseDumpContentDir(const std::string& physical_name) {
+    const auto main_dir = std::filesystem::path(Common::FS::ToU8String(physical_name)).parent_path();
+    const QString dir_name =
+        QString::fromStdString(Common::FS::PathToUTF8String(main_dir.filename()));
+    if (dir_name.compare(QStringLiteral("exefs"), Qt::CaseInsensitive) == 0) {
+        return main_dir.parent_path();
+    }
+    return main_dir;
+}
+
+// Total size of the files in a loose dump's folder. Update folders directly inside it are left
+// out: they have rows of their own. Returns nothing when cancelled or when the folder can't be
+// read.
+std::optional<u64> LooseDumpFolderSize(const std::string& physical_name,
+                                       const std::atomic_bool& stop_requested) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(LooseDumpContentDir(physical_name),
+                                        fs::directory_options::skip_permission_denied, ec);
+    u64 total = 0;
+    for (; !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
+        if (stop_requested) {
+            return std::nullopt;
+        }
+        std::error_code entry_ec;
+        if (it->is_directory(entry_ec)) {
+            if (it.depth() == 0) {
+                const QString name =
+                    QString::fromStdString(Common::FS::PathToUTF8String(it->path().filename()));
+                if (name.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0 ||
+                    name.compare(QStringLiteral("updates"), Qt::CaseInsensitive) == 0) {
+                    it.disable_recursion_pending();
+                }
+            }
+            continue;
+        }
+        if (it->is_regular_file(entry_ec)) {
+            const auto size = it->file_size(entry_ec);
+            if (!entry_ec) {
+                total += size;
+            }
+        }
+    }
+    if (ec) {
+        return std::nullopt;
+    }
+    return total;
 }
 
 QString FormatGameName(const std::string& physical_name) {
@@ -537,9 +590,13 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                                                play_time_manager, patch);
 
                 if (loose_dump) {
-                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Not scanned"));
+                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Calculating..."));
                     entry[GameListModel::COLUMN_SIZE]->setToolTip(
-                        tr("Folder size is not calculated during game discovery."));
+                        tr("The folder size is calculated after the game list is shown."));
+                    if (std::find(loose_dumps.begin(), loose_dumps.end(), physical_name) ==
+                        loose_dumps.end()) {
+                        loose_dumps.push_back(physical_name);
+                    }
                 }
                 auto pending = std::make_shared<PendingRow>(std::move(entry));
                 RecordEvent([=](GameListModel* model) {
@@ -585,6 +642,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();
+    loose_dumps.clear();
     provider->ClearAllEntries();
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
@@ -646,5 +704,31 @@ void GameListWorker::run() {
                  std::chrono::steady_clock::now() - started).count(),
              watch_list.size(), stop_requested.load());
     RecordEvent([this](GameListModel* model) { model->DonePopulating(watch_list); });
+
+    // Loose dump folders are sized once the list is shown: walking their RomFS during discovery
+    // made the list slow to appear. A reload stops this through stop_requested.
+    const auto sizing_started = std::chrono::steady_clock::now();
+    std::size_t sized = 0;
+    for (const auto& physical_name : loose_dumps) {
+        if (stop_requested) {
+            break;
+        }
+        const auto size = LooseDumpFolderSize(physical_name, stop_requested);
+        if (!size) {
+            continue;
+        }
+        ++sized;
+        const QString game_path = FormatGameName(physical_name);
+        RecordEvent([game_path, bytes = *size](GameListModel* model) {
+            model->SetFolderSize(game_path, bytes);
+        });
+    }
+    if (!loose_dumps.empty()) {
+        LOG_INFO(Frontend, "Loose dump sizes: sized={} of {} elapsed_ms={} cancelled={}", sized,
+                 loose_dumps.size(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - sizing_started).count(),
+                 stop_requested.load());
+    }
     processing_completed.Set();
 }
