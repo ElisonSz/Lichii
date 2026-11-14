@@ -6,6 +6,8 @@
 #include <version>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
+#include <optional>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #endif
@@ -226,9 +228,9 @@ bool IsGPUFenceBehaviorAccurate() {
 }
 
 bool IsFastmemEnabled() {
-    if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
+    if (EffectiveCpuAccuracy() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
-    else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
+    else if (EffectiveCpuAccuracy() == CpuAccuracy::Unsafe)
         return bool(values.cpuopt_unsafe_host_mmu);
 #if defined(__linux__) && defined(ARCHITECTURE_arm64)
     // Only 4kb systems support host MMU right now
@@ -278,7 +280,42 @@ void SetCurrentProgramIsSwitch2(bool is_switch2) {
 }
 
 bool ReactiveFlushing() {
-    return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
+    // EDEN_NX2_REACTIVE_FLUSHING=0|1 (comparisons): use_reactive_flushing without changing the
+    // configuration. A title that forces reactive flushing keeps it.
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_REACTIVE_FLUSHING");
+        if (value == nullptr || (value[0] != '0' && value[0] != '1')) {
+            return -1;
+        }
+        LOG_INFO(Common, "EDEN_NX2_REACTIVE_FLUSHING: reactive flushing {}",
+                 value[0] == '1' ? "on" : "off");
+        return value[0] == '1' ? 1 : 0;
+    }();
+    const bool setting = forced < 0 ? values.use_reactive_flushing.GetValue() : forced == 1;
+    return setting || values.force_reactive_flushing;
+}
+
+CpuAccuracy EffectiveCpuAccuracy() {
+    static const std::optional<CpuAccuracy> forced = []() -> std::optional<CpuAccuracy> {
+        const char* value = std::getenv("EDEN_NX2_CPU_ACCURACY");
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        const std::string_view text{value};
+        std::optional<CpuAccuracy> accuracy;
+        if (text == "auto") {
+            accuracy = CpuAccuracy::Auto;
+        } else if (text == "accurate") {
+            accuracy = CpuAccuracy::Accurate;
+        } else if (text == "unsafe") {
+            accuracy = CpuAccuracy::Unsafe;
+        }
+        if (accuracy) {
+            LOG_INFO(Common, "EDEN_NX2_CPU_ACCURACY: CPU accuracy {}", text);
+        }
+        return accuracy;
+    }();
+    return forced.value_or(values.cpu_accuracy.GetValue());
 }
 
 bool CurrentProgramIsSwitch2() {

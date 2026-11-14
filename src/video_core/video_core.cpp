@@ -12,22 +12,42 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/front_qmd.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/memtrack_translation.h"
+#include "video_core/nx2_acquire_stats.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_backx.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_fast_wake.h"
+#include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_macro.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_protect.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/nx2_sync_suspend.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_null/renderer_null.h"
+#include "video_core/stream_stats.h"
+#include "video_core/wait_stats.h"
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
+#include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/texture_cache/image_join.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/video_core.h"
 
 namespace {
@@ -54,18 +74,57 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
 
 namespace VideoCore {
 
+void WaitForAsyncTeardown() {
+    Vulkan::AsyncTeardown::Get().Wait();
+}
+
 /// @brief Creates an emulated GPU instance using the given system context.
-void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
+void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window,
+               Core::System& system) {
     Settings::UpdateRescalingInfo();
+    VideoCommon::FastWake::ReadSwitch();
+    VideoCommon::SyncSuspend::ReadSwitch();
+    VideoCommon::RunAhead::ReadSwitch();
+    VideoCommon::SyncTrace::ReadSwitch();
+    VideoCommon::StreamStats::ReadSwitch();
+    VideoCommon::WaitStats::ReadSwitch();
     VideoCommon::Nx2Profile::ReadSwitch();
+    VideoCommon::ReadQmdViewSwitch();
+    VideoCommon::Nx2AcquireStats::ReadSwitch();
+    VideoCommon::Nx2AcquireDetails::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
     VideoCommon::ListMacroTrace::ReadSwitch();
     VideoCore::AsyncReadback::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
-    VideoCommon::BackX::ReadSwitch();
+    VideoCommon::MemTrack::ReadSwitch();
+    if (VideoCommon::MemTrack::g_word) {
+        LOG_INFO(HW_GPU, "Nx2MemTrack single-page CPU marks enabled");
+    }
+    if (VideoCommon::MemTrack::g_translate) {
+        LOG_INFO(HW_GPU, "Nx2MemTrack translation cache enabled: entries={} verify={} stats={}",
+                 VideoCommon::MemTrack::TranslationCache::NumEntries,
+                 VideoCommon::MemTrack::g_verify, VideoCommon::MemTrack::g_stats);
+    }
+    Tegra::Nx2ListIndirect::ReadSwitch();
+    VideoCommon::Nx2DrainCheck::ReadSwitch();
+    Tegra::Nx2ListIndirect::Stats::ReadSwitch();
+    VideoCommon::GpuSplit::ReadTickSwitch();
+    VideoCommon::ReadUniformStreamReuseSwitch();
+    VideoCommon::Nx2FastDraw::ReadDrawCostStatsSwitch();
+    VideoCommon::Nx2FastDraw::ReadDrawDeltaSwitch();
+    VideoCommon::Nx2FastDraw::ReadDrawReuseSwitches();
+    VideoCommon::Nx2FastDraw::ReadDrawXSwitches();
+    VideoCommon::StaleTargets::ReadSwitch();
+    VideoCommon::ImageJoin::ReadSwitches();
+    VideoCommon::Nx2Protect::ReadSwitch();
+    // Every EDEN_NX2_BACKX_* switch, EDEN_NX2_BACKX_VERIFY included (nx2's ReadSwitch read that
+    // one alone): read once, so the BackX line is logged once.
+    VideoCommon::BackX::ReadSwitches();
     Core::GPUDirtyMemoryManager::count_collects = VideoCommon::BackX::g_verify;
+    VideoCommon::Nx2Macro::ReadSwitches();
+    VideoCommon::Cfg::ReadSwitches();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;

@@ -25,6 +25,8 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/texture_cache/util.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 // Zero-filled space after each buffer on MoltenVK. Shaders declare every constant buffer at its
@@ -502,22 +504,32 @@ bool BufferCacheRuntime::IsFree(u64 tick) {
 }
 
 void BufferCacheRuntime::Wait(u64 tick) {
-    scheduler.Wait(tick);
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Wait(tick); });
 }
 
 void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{
+        VideoCommon::WaitStats::Reason::GpuWrittenList};
     auto& master = scheduler.GetMasterSemaphore();
     if (master.IsFree(tick)) {
         return;
     }
+    // The split's front waits for the GPU: the back runs meanwhile what the front sent, also the
+    // entries since the front's last publish, which it does not see yet (fewer than 256 words).
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool front = !VideoCommon::GpuSplit::OnBackThread() && split.Active();
+    if (front) {
+        split.Publish();
+    }
     // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
-    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread()) {
+    if (!scheduler.IsSubmitted(tick) && front) {
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
         if (!scheduler.WaitSubmitted(tick)) {
-            scheduler.Wait(tick);
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::GpuWrittenList,
+                                               [&] { scheduler.Wait(tick); });
             return;
         }
     }
@@ -526,32 +538,38 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
 }
 
 void BufferCacheRuntime::Finish() {
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 }
 
 void BufferCacheRuntime::FinishForHostRead() {
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record(HostReadBarrier);
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::HostRead,
+                                       [&] { scheduler.Finish(); });
 }
 
 u64 BufferCacheRuntime::SubmitForHostRead() {
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record(HostReadBarrier);
-    return scheduler.Flush();
+    return VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::HostRead,
+                                              [&] { return scheduler.Flush(); });
 }
 
 u64 BufferCacheRuntime::QueueForHostRead() {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::HostRead};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record(HostReadBarrier);
     const u64 tick = scheduler.CurrentTick();
     if (!scheduler.DeferFlush()) {
-        scheduler.Flush();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::HostRead,
+                                           [&] { scheduler.Flush(); });
     }
     return tick;
 }
 
 void BufferCacheRuntime::WaitForHostRead(u64 tick) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::HostRead};
     if (scheduler.IsFree(tick)) {
         return;
     }
@@ -562,7 +580,8 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
         scheduler.GetMasterSemaphore().Wait(tick);
         return;
     }
-    scheduler.Wait(tick);
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::HostRead,
+                                       [&] { scheduler.Wait(tick); });
 }
 
 bool BufferCacheRuntime::IsFreeNow(u64 tick) {

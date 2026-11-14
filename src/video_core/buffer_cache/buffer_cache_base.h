@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -38,6 +39,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -46,6 +48,8 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
@@ -252,8 +256,20 @@ public:
                                std::span<const MultiRangeSegment> pool,
                                u64 write_mark_limit = ~u64{0});
 
+    /// EDEN_NX2_CFG_SSBO: a range VirtualRangeCache::Query found in fewer than two segments, in
+    /// which address space and at which VirtualRangeCache::Generation (after the Query).
+    struct SingleRangeMemo {
+        const void* memory{};
+        GPUVAddr gpu_addr{};
+        u64 generation{};
+        u32 size{};
+        bool valid{};
+    };
+
+    /// `single`: EDEN_NX2_CFG_SSBO's memo of the binding's slot, or null.
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
-                                  std::vector<MultiRangeSegment>& pool);
+                                  std::vector<MultiRangeSegment>& pool,
+                                  SingleRangeMemo* single = nullptr);
 
     void RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& pool);
 
@@ -264,6 +280,24 @@ public:
     /// constant buffer data, MemoryManager::FlushCaching), not the guest CPU.
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true,
                      bool engine_write = false);
+
+    /// The pages one InnerInvalidation call uploaded in place so far (WriteGpuMemoryInPlace).
+    struct InPlaceBatch {
+        DAddr begin{};
+        DAddr end{};
+    };
+
+    /// EDEN_NX2_PROTECT_INLINE, for the GPU thread's own writes to guest memory, applied at
+    /// FlushCaching (RasterizerVulkan::InnerInvalidation), `mutex` held: when every page under
+    /// [device_addr, device_addr + size) is tracked (protected) by the buffer cache, holds no
+    /// GPU-written data and lies in one buffer, uploads those pages from guest memory into the
+    /// buffer now and leaves them tracked, instead of WriteMemory's CPU-modified mark: the mark
+    /// unprotected the pages and the next upload scan protected them again. Makes WriteMemory's
+    /// other notes. Returns false when it did nothing: the caller calls WriteMemory then.
+    /// `render_pass_active`: an upload that cannot go to the upload command buffer is left to
+    /// the next scan as before, rather than ending the render pass here.
+    bool WriteGpuMemoryInPlace(DAddr device_addr, u64 size, bool render_pass_active,
+                               InPlaceBatch& batch);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -325,17 +359,15 @@ public:
     /// it keeps the result, which FinishReport then ends.
     [[nodiscard]] bool NoteReportPending(DAddr device_addr, u64 size);
 
+    /// Without `mutex`: false when the page under device_addr can't be one the guest reads back
+    /// (NoteReportPending would return false): outside the first and last read-back page, or,
+    /// with EDEN_NX2_BACKX_REPORT, not in read_back_filter (a page is marked there before it
+    /// becomes one and stays marked while it is one). Seeing the bounds before a page joins them
+    /// is the same as looking before that read took the lock.
+    [[nodiscard]] bool MayBeReadBackPage(DAddr device_addr) const noexcept;
+
     /// The query cache wrote a result NoteReportPending kept to guest memory, or dropped it.
     void FinishReport(DAddr device_addr, u64 size);
-
-    /// Without `mutex`: false when the page under device_addr can't be one the guest reads back
-    /// (NoteReportPending would return false). Seeing the bounds before a page joins them is
-    /// the same as looking before that read took the lock.
-    [[nodiscard]] bool MayBeReadBackPage(DAddr device_addr) const noexcept {
-        const DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-        return page >= read_back_first.load(std::memory_order_acquire) &&
-               page <= read_back_last.load(std::memory_order_acquire);
-    }
 
     /// The GPU thread recorded a draw or dispatch (`mutex` held). After a dispatch, the downloads
     /// of the pages written since that the guest reads after each write go right behind it
@@ -456,21 +488,23 @@ public:
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
-    /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
-    /// written by no GPU work since), else Copied with `out` filled from the copy of its last
-    /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
-    /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
-    /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
-    /// With `pending_tick`, a copy the GPU has not finished returns Pending and sets the tick
-    /// instead of waiting for it.
+    /// Front thread: Synced when guest memory holds the bytes [device_addr, device_addr +
+    /// out.size()) of their page: no GPU work wrote them since the page was flushed, or the host
+    /// wrote them since. Else Copied with `out` filled once the GPU is done with the copy of the
+    /// page's last write: from the copy where GPU work wrote, from guest memory elsewhere once
+    /// the page was flushed. Unknown otherwise: the caller drains and flushes. Pages draws write
+    /// are only Synced or Unknown, and NeedsSync until `past_sync`: the split's back ran the work
+    /// before the last host-level wait (GpuSplit::WaitForSync). With `pending_tick`, a copy the
+    /// GPU has not finished returns Pending and sets the tick instead of waiting for it.
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
                                 u64* pending_tick = nullptr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 
     void Nx2FlushListPages(std::span<const DAddr> pages);
-    /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
-    /// no longer holds the page.
+    /// CPU, inline and copy engine writes of bytes guest memory holds: they reach guest memory,
+    /// so a synced page stays synced and the words they cover are guest memory's again, but the
+    /// page's copy no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
 
     /// Return true when a CPU region is modified from the GPU
@@ -545,6 +579,38 @@ public:
     /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
     [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
+    /// EDEN_NX2_DRAW_REUSE: the GPU and device range graphics storage binding `index` of `stage`
+    /// was last bound to (aligned down as bound), or nothing when it isn't one range there.
+    struct StorageRange {
+        GPUVAddr gpu_begin{};
+        GPUVAddr gpu_end{};
+        DAddr device_begin{};
+        DAddr device_end{};
+    };
+    [[nodiscard]] std::optional<StorageRange> GraphicsStorageRange(size_t stage,
+                                                                   u32 index) const noexcept;
+
+    /// EDEN_NX2_DRAW_REUSE: the device ranges the caches were told were written (CPU writes,
+    /// copies, GPU writes; NoteUniformWrite) since the previous draw began preparing, and whether
+    /// more were written than the list holds.
+    [[nodiscard]] std::span<const std::pair<DAddr, DAddr>> NotedWrites() const noexcept {
+        return {uniform_keep.memory_writes.data(), uniform_keep.memory_writes.size()};
+    }
+    [[nodiscard]] bool NotedWritesLost() const noexcept {
+        return uniform_keep.memory_writes_lost;
+    }
+    /// EDEN_NX2_DRAWX_CALLS2: guest memory written behind the caches' back (query results written
+    /// out), noted as the caches note a CPU write (NoteUniformWrite) without changing what they
+    /// hold. The caller holds `mutex`.
+    void NoteWrittenBehind(DAddr device_addr, u64 size) {
+        NoteUniformWrite(device_addr, size);
+    }
+    /// EDEN_NX2_DRAWX_UNIFORMS statistics: uniform buffers kept and streamed so far (the counts
+    /// TickFrame reports and resets).
+    [[nodiscard]] std::pair<u64, u64> UniformKeepCounts() const noexcept {
+        return {uniform_keep.kept, uniform_keep.streamed_binds};
+    }
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {
@@ -555,14 +621,19 @@ public:
 
     /// Called before each graphics draw binds its buffers (uniform keeps). `delta`: the constant
     /// buffer binds and data since the previous call, or nullptr when they aren't known (then
-    /// nothing is kept).
-    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
+    /// nothing is kept). `source`: the kind of draw keeping them (EDEN_NX2_DRAWX_KEEP_AUDIT's
+    /// counts).
+    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta,
+                               Nx2FastDraw::KeepSource source = Nx2FastDraw::KeepSource::Delta);
 
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// TEST: EDEN_NX2_CFG_BANK_STATS: the bytes each bank's last re-upload read.
+    std::unordered_map<DAddr, std::vector<u8>> bank_upload_shadows;
+    void NoteBankUpload(DAddr device_addr, u64 size);
 
 private:
     template <typename Mask, typename Func>
@@ -839,11 +910,49 @@ private:
         keep.memory_writes.emplace_back(device_addr, device_addr + size);
     }
     /// EDEN_NX2_UBO_KEEP_VERIFY=1: binds what a keep would skip the original way and logs where
-    /// guest memory changed.
+    /// guest memory changed. EDEN_NX2_DRAWX_VERIFY=1 and EDEN_NX2_DRAWX_KEEP_AUDIT=1 turn it on
+    /// too.
     const bool ubo_keep_verify = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBO_KEEP_VERIFY");
-        return value != nullptr && value[0] == '1';
+        const auto on = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        return on("EDEN_NX2_UBO_KEEP_VERIFY") || on("EDEN_NX2_DRAWX_VERIFY") ||
+               on("EDEN_NX2_DRAWX_KEEP_AUDIT");
     }();
+    /// EDEN_NX2_DRAWX_KEEP_AUDIT=1 or EDEN_NX2_DRAWX_VERIFY=1: the verify above counts exactly
+    /// what RebindKeptUniform would do (AuditKeptUniform) with every keep candidate, by keep
+    /// source, and only bytes that changed under a bound keep count as mismatches.
+    /// EDEN_NX2_UBO_KEEP_VERIFY=1 alone verifies only the ranges RebindKeptUniform would bind
+    /// (KeptUniformMatches).
+    const bool ubo_keep_audit = [] {
+        const auto on = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        return on("EDEN_NX2_DRAWX_VERIFY") || on("EDEN_NX2_DRAWX_KEEP_AUDIT");
+    }();
+    void AuditKeptUniform(size_t stage, u32 index, DAddr device_addr, u32 size);
+    void NoteAuditedStream(size_t stage, u32 index, DAddr device_addr, u32 size);
+    /// TEST: EDEN_NX2_UBO_STATS=1 times the streamed uniform binds and logs them every 600
+    /// frames, without EDEN_NX2_GPU_PROFILE (which selects the slower method path).
+    /// EDEN_NX2_UBO_STATS=2 also switches the compare in place on and off between windows, so
+    /// one run in one place measures both.
+    const bool ubo_stats = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_STATS");
+        return value != nullptr && (value[0] == '1' || value[0] == '2');
+    }();
+    const bool ubo_stats_alternate = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_STATS");
+        return value != nullptr && value[0] == '2';
+    }();
+    struct UniformBindStats {
+        u64 binds{};
+        u64 bytes{};
+        u64 ticks{};
+        u64 window_ns{};    ///< Nx2Profile::Now() when the window began
+        u64 window_ticks{}; ///< Nx2Profile::Ticks() when the window began
+    } uniform_bind_stats;
     struct UniformKeep {
         /// Slots whose last stream allocation still holds what guest memory has at `ranges`.
         std::array<u32, NUM_STAGES> clean{};
@@ -861,6 +970,37 @@ private:
         u64 streamed_binds{};
         u64 verified{};
         u64 mismatches{};
+        Nx2FastDraw::KeepSource source{}; ///< Of the draw binding now
+        /// EDEN_NX2_DRAWX_KEEP_AUDIT: per window, what each keep candidate is
+        /// (VideoCommon::KeptUniform) by keep source, and what the memory tracker says about the
+        /// stale ones. Per slot: when it was streamed and what its pages were then.
+        struct Audit {
+            static constexpr size_t NumSources =
+                static_cast<size_t>(Nx2FastDraw::KeepSource::Count);
+            static constexpr size_t NumResults =
+                static_cast<size_t>(VideoCommon::KeptUniform::Count);
+            static constexpr size_t NumSlots = 18;
+            std::array<std::array<u64, NumResults>, NumSources> results{};
+            /// Candidates over bytes the GPU wrote (gpu_modified_ranges, exact), which guest
+            /// memory does not show, so the compare cannot clear them. Every GPU write mark notes
+            /// its range, so a write since the previous draw leaves no candidate: only GPU bytes
+            /// older than the previous draw's stream (which read guest memory too) can be here.
+            std::array<u64, NumSources> gpu_written{};
+            /// Candidates the original path no longer streams: [over GPU-written bytes, only on
+            /// GPU-modified pages (the tracker's page granularity) or no longer small enough].
+            std::array<std::array<u64, 2>, NumSources> not_streamed{};
+            /// Held keeps by the slot's pages when streamed: [CPU-modified (unprotected),
+            /// protected]
+            std::array<std::array<u64, 2>, NumSources> held_by_pages{};
+            /// Changed ones (bound or refused for the tick) by what the trackers say: streamed
+            /// while CPU-modified, CPU-modified now, GPU-modified pages now, GPU-written bytes
+            /// now, none of these.
+            std::array<u64, 5> stale_by_pages{};
+            u64 logged{};
+            std::array<u32, NUM_STAGES> unprotected{}; ///< Slot pages CPU-modified when streamed
+            std::array<std::array<u64, NumSlots>, NUM_STAGES> stream_ns{};
+            std::array<std::array<u64, NumSlots>, NUM_STAGES> stream_serial{};
+        } audit;
     } uniform_keep;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
@@ -1103,23 +1243,66 @@ private:
     struct ReadBackPage {
         DAddr page{};
         u64 last_read{};     ///< read_back_reads at its last read of a write (eviction)
-        u16 reads{};         ///< Writes in a row the guest read, up to EarlyAfterReads
+        u16 reads{};         ///< Writes in a row the guest read, up to Early().after_reads
         u16 unread_writes{}; ///< GPU writes since its last read
         bool written{};      ///< A GPU write since its last read
     };
-    /// Reads of a page's writes in a row before its writes get early downloads.
-    static constexpr u16 EarlyAfterReads = 2;
-    /// Writes in a row without a read that stop them.
-    static constexpr u16 MaxUnreadWrites = 4;
-    static constexpr size_t MaxReadBackPages = 64;
-    /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
-    /// flush on demand.
-    static constexpr u64 EarlyBytesPerFrame = 1_MiB;
-    static constexpr u32 MaxPendingEarlyDownloads = 32;
+    struct EarlyLimits {
+        /// Reads of a page's writes in a row before its writes get early downloads.
+        u16 after_reads;
+        /// Writes in a row without a read that stop them. A page the guest reads every few
+        /// frames keeps them: Ocarina of Time reads each of its read-back pages every 5 to 40
+        /// frames, and several dispatches write it in between.
+        u16 max_unread_writes;
+        /// Learned pages; the one read longest ago makes room. Ocarina of Time reads back
+        /// ~220 pages over a few seconds.
+        size_t max_pages;
+        /// Early download bytes a frame, and early downloads not yet in guest memory: past them,
+        /// reads flush on demand.
+        u64 bytes_per_frame;
+        u32 max_pending;
+    };
+    /// The limits above: 2 reads, 256 unread writes, 512 pages, 8 MiB a frame and 512 pending, or
+    /// EDEN_NX2_EARLY_AFTER_READS, _UNREAD, _PAGES, _KIB and _PENDING (comparisons; read at first
+    /// use, after the frontend loaded its switches). They only decide which downloads are
+    /// recorded early, never what a read finds: a read that no early download covers flushes.
+    [[nodiscard]] static const EarlyLimits& Early() {
+        static const EarlyLimits limits = [] {
+            const auto read = [](const char* name, u64 fallback, u64 max) -> u64 {
+                const char* const value = std::getenv(name);
+                if (value == nullptr || value[0] == '\0') {
+                    return fallback;
+                }
+                char* end = nullptr;
+                const u64 parsed = std::strtoull(value, &end, 10);
+                if (end == value || parsed == 0) {
+                    return fallback;
+                }
+                return (std::min)(parsed, max);
+            };
+            const EarlyLimits result{
+                .after_reads = static_cast<u16>(read("EDEN_NX2_EARLY_AFTER_READS", 2, 1000)),
+                .max_unread_writes = static_cast<u16>(read("EDEN_NX2_EARLY_UNREAD", 256, 60000)),
+                .max_pages = static_cast<size_t>(read("EDEN_NX2_EARLY_PAGES", 512, 65536)),
+                .bytes_per_frame = read("EDEN_NX2_EARLY_KIB", 8192, 1ULL << 20) * 1024,
+                .max_pending = static_cast<u32>(read("EDEN_NX2_EARLY_PENDING", 512, 4096)),
+            };
+            LOG_INFO(HW_GPU,
+                     "Early read-back downloads: after {} reads, up to {} unread writes, {} pages, "
+                     "{} KiB a frame, {} pending",
+                     result.after_reads, result.max_unread_writes, result.max_pages,
+                     result.bytes_per_frame / 1024, result.max_pending);
+            return result;
+        }();
+        return limits;
+    }
     std::vector<ReadBackPage> read_back_pages; ///< Sorted by page
     /// The first and last page of read_back_pages (MayBeReadBackPage), set under `mutex`.
     std::atomic<DAddr> read_back_first{~DAddr{0}};
     std::atomic<DAddr> read_back_last{0};
+    /// EDEN_NX2_BACKX_REPORT: the pages of read_back_pages, changed under `mutex` (a page marked
+    /// before it enters, rebuilt after one leaves), read without it (MayBeReadBackPage).
+    VideoCommon::BackX::PageSetFilter read_back_filter;
     /// NoteReportPending's results not yet written, oldest first.
     struct PendingReport {
         DAddr addr;
@@ -1150,6 +1333,17 @@ private:
     VirtualRangeCache virtual_ranges;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
+    /// EDEN_NX2_CFG_SSBO: per graphics stage and storage slot (the first 16), the range the slot's
+    /// last Query found in one piece.
+    static constexpr u32 NUM_SINGLE_RANGE_MEMOS = 16;
+    std::array<std::array<SingleRangeMemo, NUM_SINGLE_RANGE_MEMOS>, NUM_STAGES>
+        storage_single_ranges{};
+    /// EDEN_NX2_CFG_VERTEX: each vertex stream's and the index buffer's last translation.
+    std::array<Cfg::TranslationMemo, NUM_VERTEX_BUFFERS> vertex_translations{};
+    Cfg::TranslationMemo index_translation{};
+    /// EDEN_NX2_CFG_CBUF: each graphics uniform buffer slot's last bind translation.
+    std::array<std::array<Cfg::TranslationMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_translations{};
     u64 frame_tick = 0;
     /// Buffers created since the last TickFrame; ResolveOverlaps does not cut these
     std::vector<BufferId> frame_created_buffers;
@@ -1170,8 +1364,9 @@ private:
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    static constexpr size_t Nx2ListPageWords = (size_t{1} << Tegra::Nx2WrittenPageBits) / 4;
     struct Nx2ListPage {
-        u64 writes{};      ///< GPU writes noted to the page
+        u64 writes{};      ///< GPU and host writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
         /// `writes` when the front last flushed the page: guest memory holds it while equal
@@ -1184,8 +1379,25 @@ private:
         /// the page's lists read guest memory once the back ran the work before the last such
         /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
+        /// The page's 4-byte words GPU work wrote that guest memory does not hold: set by the GPU
+        /// writes noted to the page (the whole range a dispatch or copy may write), cleared for
+        /// the words the host writes whole and for every word once the front flushed the page.
+        /// Once it did (`flushed`), guest memory holds the other words, so a list on none of
+        /// these reads it directly. Before, GPU work may have written the page before it became
+        /// a command list page, unnoted.
+        std::bitset<Nx2ListPageWords> gpu_words;
+        bool flushed{};
         std::optional<Nx2Staging> copy;
     };
+    /// Sets (`set`) or clears the words of `entry.gpu_words` within [begin, end) bytes of its
+    /// page: every word the bytes touch when setting, only the words they cover when clearing.
+    static void Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set);
+    /// Whether GPU work wrote any word of [begin, end) bytes of the page guest memory lacks.
+    [[nodiscard]] static bool Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end);
+    /// Fills `out` with the page's bytes from `offset` (`device_addr`) on: the words of
+    /// `entry.gpu_words` from its copy, the others from guest memory.
+    void Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
+                          std::span<u8> out);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.

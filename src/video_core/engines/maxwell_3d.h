@@ -3313,6 +3313,92 @@ public:
 private:
     void InitializeRegisterDefaults();
 
+    const VideoCommon::Nx2FastDraw::Experiments& draw_experiments =
+        VideoCommon::Nx2FastDraw::ExperimentSettings();
+
+    /// Only these writes may use the experimental delta path. The rasterizer still checks the
+    /// pipeline and reapplies vertex input; query methods still execute their side effects.
+    bool NoteFastDrawState(u32 method) {
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        // EDEN_NX2_DRAWX_NEUTRAL / _PIPESTATE: registers no resolve reads, and fixed-function
+        // state the next draw checks by looking its pipeline up again.
+        if (FastDraw::g_drawx_registers) [[unlikely]] {
+            switch (FastDraw::DrawXRegisterClass(method)) {
+            case FastDraw::DrawXRegister::Neutral:
+            case FastDraw::DrawXRegister::DynamicState:
+            case FastDraw::DrawXRegister::Clear:
+            case FastDraw::DrawXRegister::Clip:
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
+            case FastDraw::DrawXRegister::PipelineState:
+            case FastDraw::DrawXRegister::DynamicPipeline:
+                FastDraw::g_delta.pipeline_state = true;
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
+            case FastDraw::DrawXRegister::Shader:
+                FastDraw::g_delta.pipeline_state = true;
+                FastDraw::g_delta.shader_state = true;
+                FastDraw::g_delta.drawx_skipped = true;
+                return true;
+            case FastDraw::DrawXRegister::Breaks:
+                break;
+            }
+        }
+        if (FastDraw::g_draw_delta) {
+            constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
+            constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
+            // These registers configure query handlers, never graphics pipeline configuration.
+            // The handlers still run; actual submits, pass endings and fence releases break reuse.
+            if ((method >= report &&
+                 method < report + sizeof(Regs::ReportSemaphore) / sizeof(u32)) ||
+                (method >= condition &&
+                 method < condition + sizeof(Regs::RenderEnable) / sizeof(u32)) ||
+                method == MAXWELL3D_REG_INDEX(render_enable_override) ||
+                method == MAXWELL3D_REG_INDEX(clear_report_value)) {
+                FastDraw::g_delta.queries = true;
+                return true;
+            }
+        }
+        if (method == MAXWELL3D_REG_INDEX(vertex_id_base)) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 1U;
+            }
+            if (FastDraw::g_draw_delta || FastDraw::ExperimentActive(draw_experiments.vertex_id)) {
+                FastDraw::g_delta.vertex_id = true;
+                return true;
+            }
+        }
+        constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+        constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+        const bool layout =
+            (method >= streams && method < streams + Regs::NumVertexArrays * 4 &&
+             (method - streams) % 4 == 0) ||
+            (method >= attributes && method < attributes + Regs::NumVertexAttributes);
+        if (layout) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 2U;
+            }
+            if (FastDraw::g_draw_delta ||
+                FastDraw::ExperimentActive(draw_experiments.vertex_layout)) {
+                FastDraw::g_delta.vertex_layout = true;
+                return true;
+            }
+        }
+        constexpr u32 condition = MAXWELL3D_REG_INDEX(render_enable);
+        if (method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+            (method >= condition &&
+             method < condition + sizeof(Regs::RenderEnable) / sizeof(u32))) {
+            if (FastDraw::DrawCostStatsEnabled()) {
+                FastDraw::g_delta.match_cases |= 4U;
+            }
+            if (FastDraw::ExperimentActive(draw_experiments.queries)) {
+                FastDraw::g_delta.queries = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
     /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
@@ -3330,6 +3416,18 @@ private:
         return argument;
     }
 
+    /// Count effective shader-slot writes, after shadow replay, including writes skipped as
+    /// identical. Called once: by ProcessDirtyRegisters, or at the skip site.
+    void NoteShaderWrite(u32 method, u32 argument) {
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        constexpr u32 first = MAXWELL3D_REG_INDEX(pipelines);
+        if (FastDraw::DrawCostStatsEnabled() && method >= first &&
+            method < first + sizeof(Regs::Pipeline) * Regs::MaxShaderProgram / sizeof(u32)) {
+            const size_t changed = regs.reg_array[method] != argument ? 1 : 0;
+            FastDraw::g_shader_writes[changed].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
     void ProcessDirtyRegisters(u32 method, u32 argument) {
         // The instances after the first are drawn together once their loop ends, and they must see
@@ -3338,9 +3436,10 @@ private:
         if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
             draw_manager.DrawDeferred(*this, true);
         }
+        NoteShaderWrite(method, argument);
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method)) {
+            !IsFastDrawParameter(method) && !NoteFastDrawState(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         regs.reg_array[method] = argument;
@@ -3355,6 +3454,8 @@ private:
         const u32 argument = ProcessShadowRam(method, method_argument);
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
             ProcessDirtyRegisters(method, argument);
+        } else {
+            NoteShaderWrite(method, argument);
         }
     }
 
@@ -3506,6 +3607,10 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// EDEN_NX2_MACRO_BATCH: the writes a macro call buffered, (method, value) pairs in order.
+    /// `check`: plain writes go to FrontWrite too, which must do what the loop would have done.
+    void FrontWriteBatch(VideoCommon::GpuSplit& split, FrontState& state,
+                         std::span<const u32> writes, bool check);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

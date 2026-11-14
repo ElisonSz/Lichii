@@ -14,6 +14,7 @@
 #include "common/windows/timer_resolution.h"
 #endif
 #include "core/frontend/emu_window.h"
+#include "video_core/nx2_present_stats.h"
 #include "video_core/nx2_profile.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
@@ -27,6 +28,8 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
+
+#include "video_core/wait_stats.h"
 
 namespace Vulkan {
 
@@ -427,6 +430,7 @@ void PresentManager::WaitPresent() {
 
 void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
+    const VideoCommon::WaitStats::ThreadScope wait_thread{VideoCommon::WaitStats::Thread::Present};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
     while (!token.stop_requested()) {
@@ -775,6 +779,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 #endif
     swapchain.Present(render_semaphore);
+    VideoCommon::Nx2PresentStats::NotePresent();
 #ifdef EGLANTINE_STREAMLINE
     if (frame->frame_gen) {
         Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);

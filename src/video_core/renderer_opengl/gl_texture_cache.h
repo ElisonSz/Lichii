@@ -191,7 +191,7 @@ public:
     Image& operator=(const Image&) = delete;
 
     Image(Image&&) = default;
-    Image& operator=(Image&&) = default;
+    Image& operator=(Image&&) = delete;
 
     void UploadMemory(GLuint buffer_handle, size_t buffer_offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);

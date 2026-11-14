@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -17,16 +18,30 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "shader_recompiler/shader_info.h"
+#include "shader_recompiler/strict_handles.h"
 #include "video_core/memory_manager.h"
+#include "video_core/textures/texture.h"
 
 namespace VideoCommon {
+
+/// A texture handle no table holds: the texture cache binds its null view and sampler.
+inline constexpr std::pair<u32, u32> NULL_TEXTURE_HANDLE{~0U, ~0U};
+
+/// Preserve evaluator failure separately from handle zero, which can name a real texture.
+[[nodiscard]] inline std::pair<u32, u32> TexturePairOrNull(std::optional<u32> raw,
+                                                           bool via_header_index) {
+    if (!raw) {
+        return NULL_TEXTURE_HANDLE;
+    }
+    return Tegra::Texture::TexturePair(*raw, via_header_index);
+}
 
 /// The address of storage buffer `binding` of a shader as its descriptor in a constant buffer gives
 /// it; 0 when it has none. storage_alignment is the host storage buffer offset alignment: storage
 /// offsets in a handle program are relative to the buffer address aligned down to it
 /// (StorageOffset), which is also where the buffer cache binds the buffer.
-template <typename Memory, typename CbufAddress>
-GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_memory,
+template <typename Info, typename Memory, typename CbufAddress>
+GPUVAddr StorageBufferBase(const Info& info, u32 binding, Memory& gpu_memory,
                            CbufAddress& cbuf_address, u64 storage_alignment) {
     if (binding >= info.storage_buffers_descriptors.size()) {
         return 0;
@@ -50,35 +65,56 @@ GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_me
 /// bound constant buffer's address, 0 when none is bound. storage_alignment is as for
 /// StorageBufferBase. element is the descriptor array element, for a program computing one handle
 /// per element.
-template <typename Memory, typename CbufAddress>
-u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_memory,
-                          CbufAddress&& cbuf_address, u64 storage_alignment, u32 element = 0) {
-    return Shader::EvaluateHandleProgram(
-               info.handle_programs[program],
-               [&](u32 index, u32 offset) -> u32 {
-                   const GPUVAddr base{cbuf_address(index)};
-                   return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
-               },
-               [&](u32 binding, u32 offset) -> u32 {
-                   const GPUVAddr base{StorageBufferBase(info, binding, gpu_memory, cbuf_address,
-                                                         storage_alignment)};
-                   return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
-               },
-               element)
-        .value_or(0U);
+template <typename Info, typename Memory, typename CbufAddress>
+std::optional<u32> EvaluateTextureHandle(const Info& info, u32 program, Memory& gpu_memory,
+                                         CbufAddress&& cbuf_address, u64 storage_alignment,
+                                         u32 element = 0) {
+    if (program >= info.handle_programs.size()) {
+        return std::nullopt;
+    }
+    const auto result = Shader::EvaluateHandleProgram(
+        info.handle_programs[program],
+        [&](u32 index, u32 offset) -> std::optional<u32> {
+            const GPUVAddr base{cbuf_address(index)};
+            if (base == 0) {
+                return Shader::StrictHandles ? std::nullopt : std::optional<u32>{0U};
+            }
+            return gpu_memory.template Read<u32>(base + offset);
+        },
+        [&](u32 binding, u32 offset) -> std::optional<u32> {
+            const GPUVAddr base{
+                StorageBufferBase(info, binding, gpu_memory, cbuf_address, storage_alignment)};
+            if (base == 0) {
+                return Shader::StrictHandles ? std::nullopt : std::optional<u32>{0U};
+            }
+            return gpu_memory.template Read<u32>(base + offset);
+        },
+        element);
+    if (Shader::StrictHandles && !result) {
+        Shader::WarnStrictHandles(info.handle_shader_hash,
+                                  "selected handle read failed; binding a null texture");
+    }
+    return Shader::StrictHandles ? result : std::optional<u32>{result.value_or(0U)};
 }
 
 /// The handles of elements 0 to count - 1 of a descriptor array of handle program results, as
 /// EvaluateTextureHandle computes each, passed to output(element, handle). The constant buffer
 /// words and storage buffer addresses the program reads are read once for all the elements.
-template <typename Memory, typename CbufAddress, typename Output>
-void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_memory,
+template <typename Info, typename Memory, typename CbufAddress, typename Output>
+void EvaluateTextureHandles(const Info& info, u32 program, Memory& gpu_memory,
                             CbufAddress&& cbuf_address, u64 storage_alignment, u32 count,
                             Output&& output) {
+    if (program >= info.handle_programs.size()) {
+        for (u32 element = 0; element < count; ++element) {
+            output(element, std::optional<u32>{});
+        }
+        return;
+    }
     struct CbufWord {
         u32 index;
         u32 offset;
         u32 value;
+        bool valid;
     };
     std::array<CbufWord, 16> words;
     size_t num_words{};
@@ -87,34 +123,43 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
     // (Ocarina of Time binds 37), so the mask needs all 64 bits.
     static_assert(Shader::Info::MAX_SSBOS <= 64);
     u64 known_bases{};
-    const auto read_cbuf = [&](u32 index, u32 offset) -> u32 {
+    const auto read_cbuf = [&](u32 index, u32 offset) -> std::optional<u32> {
         for (size_t word = 0; word < num_words; ++word) {
             if (words[word].index == index && words[word].offset == offset) {
-                return words[word].value;
+                return words[word].valid || !Shader::StrictHandles
+                           ? std::optional<u32>{words[word].value}
+                           : std::nullopt;
             }
         }
         const GPUVAddr base{cbuf_address(index)};
         const u32 value{base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U};
         if (num_words < words.size()) {
-            words[num_words++] = {index, offset, value};
+            words[num_words++] = {index, offset, value, base != 0};
         }
-        return value;
+        return base != 0 || !Shader::StrictHandles ? std::optional<u32>{value} : std::nullopt;
     };
-    const auto read_storage = [&](u32 binding, u32 offset) -> u32 {
+    const auto read_storage = [&](u32 binding, u32 offset) -> std::optional<u32> {
         if (binding >= bases.size()) {
-            return 0U;
+            return Shader::StrictHandles ? std::nullopt : std::optional<u32>{0U};
         }
         if ((known_bases & (u64{1} << binding)) == 0) {
             bases[binding] =
                 StorageBufferBase(info, binding, gpu_memory, cbuf_address, storage_alignment);
             known_bases |= u64{1} << binding;
         }
-        return bases[binding] != 0 ? gpu_memory.template Read<u32>(bases[binding] + offset) : 0U;
+        if (bases[binding] == 0) {
+            return Shader::StrictHandles ? std::nullopt : std::optional<u32>{0U};
+        }
+        return gpu_memory.template Read<u32>(bases[binding] + offset);
     };
     for (u32 element = 0; element < count; ++element) {
-        output(element, Shader::EvaluateHandleProgram(info.handle_programs[program], read_cbuf,
-                                                      read_storage, element)
-                            .value_or(0U));
+        const auto result = Shader::EvaluateHandleProgram(info.handle_programs[program], read_cbuf,
+                                                          read_storage, element);
+        if (Shader::StrictHandles && !result) {
+            Shader::WarnStrictHandles(info.handle_shader_hash,
+                                      "selected handle read failed; binding a null texture");
+        }
+        output(element, Shader::StrictHandles ? result : std::optional<u32>{result.value_or(0U)});
     }
 }
 
@@ -173,9 +218,8 @@ private:
 /// read in a clustered light loop, Ocarina of Time's waterfall). Its low bits then name an
 /// unrelated texture, a different one whenever the game moves the buffer: every frame for a
 /// double-buffered one, so the surface flickers. Bind no texture for it instead.
-template <typename Descriptor>
-[[nodiscard]] bool HandleIsStoragePointer(const Shader::Info& info, const Descriptor& desc,
-                                          u32 index) {
+template <typename Info, typename Descriptor>
+[[nodiscard]] bool HandleIsStoragePointer(const Info& info, const Descriptor& desc, u32 index) {
     if (desc.handle_program != ~0U) {
         return false;
     }
@@ -196,7 +240,12 @@ template <typename Descriptor>
     });
 }
 
-/// A texture handle no table holds: the texture cache binds its null view and sampler.
-inline constexpr std::pair<u32, u32> NULL_TEXTURE_HANDLE{~0U, ~0U};
+/// Whether texture descriptor `desc` binds the null texture for element `index`: a handle the
+/// translation could not compute (bind_null), or a word that is a storage pointer
+/// (HandleIsStoragePointer).
+template <typename Info, typename Descriptor>
+[[nodiscard]] bool HandleMustBeNull(const Info& info, const Descriptor& desc, u32 index) {
+    return desc.bind_null || HandleIsStoragePointer(info, desc, index);
+}
 
 } // namespace VideoCommon

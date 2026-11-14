@@ -1001,7 +1001,31 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     InitializeGPULogging();
 }
 
+void Device::DrainRetiredPipelines() {
+    PipelineDestroyStats destroy_stats;
+    for (auto& retired : retired_pipelines) {
+        DestroyPipelineHandles(retired.handles, retired.time);
+        destroy_stats.Add(retired.origin, retired.time);
+    }
+    if (!retired_pipelines.empty()) {
+        destroy_stats.Report();
+        LOG_INFO(Render_Vulkan, "Async Vulkan teardown: destroyed {} deferred pipelines",
+                 retired_pipelines.size());
+    }
+    const char* check = std::getenv("EDEN_NX2_PIPELINE_TEARDOWN_CHECK");
+    if (!retired_pipelines.empty() && check != nullptr && check[0] == '1') {
+        size_t destroyed = 0;
+        for (const auto& group : destroy_stats.groups) {
+            destroyed += group.count;
+        }
+        ASSERT(destroyed == retired_pipelines.size());
+        LOG_INFO(Render_Vulkan, "Async teardown check: deferred == destroyed ({})", destroyed);
+    }
+    retired_pipelines.clear();
+}
+
 Device::~Device() {
+    DrainRetiredPipelines();
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_attached) {
         Streamline::Stop();
@@ -1058,7 +1082,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::RenderTargets ? RenderTargetPoolBlockSize
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -2226,7 +2251,9 @@ u64 Device::GetDeviceMemoryUsage() const {
     }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        // Match the live slack deduction to VMA's allocation/free-adjusted driver estimate.
+        const u64 usage = allocator != nullptr ? heap_budgets[heap].usage : budget.heapUsage[heap];
+        result += AllocatedUsage(usage, heap_budgets[heap]);
     }
     return result;
 }
@@ -2274,7 +2301,8 @@ u64 Device::GetDeviceHeapMemoryBudget() const {
     }
     for (const size_t heap : valid_heap_memory) {
         if (heap != main_heap) {
-            result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+            const u64 usage = allocator != nullptr ? heap_budgets[heap].usage : budget.heapUsage[heap];
+            result += AllocatedUsage(usage, heap_budgets[heap]);
         }
     }
     return result;
@@ -2328,6 +2356,13 @@ void Device::CollectPhysicalMemoryInfo() {
             continue;
         }
         device_access_memory += heap_size;
+    }
+    for (u32 type_index = 0; type_index < mem_properties.memoryTypeCount; ++type_index) {
+        const u32 heap_index = mem_properties.memoryTypes[type_index].heapIndex;
+        if ((mem_properties.memoryHeaps[heap_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 &&
+            std::ranges::find(valid_heap_memory, heap_index) != valid_heap_memory.end()) {
+            counted_local_memory_types |= u32{1} << type_index;
+        }
     }
     main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
     if (is_integrated) {

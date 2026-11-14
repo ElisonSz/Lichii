@@ -219,6 +219,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
+    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
     PFN_vkCmdCopyImage vkCmdCopyImage{};
@@ -752,6 +753,7 @@ public:
         u64 block;
         u64 block_size;
         u64 size;
+        u32 memory_type{};
     };
     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
 
@@ -848,6 +850,8 @@ public:
     MemoryLocation Location() const noexcept {
         return location;
     }
+
+    [[nodiscard]] u64 AllocationSize() const noexcept;
 
 private:
     void Release() const noexcept;
@@ -1383,6 +1387,12 @@ public:
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
                          Span<VkImageSubresourceRange> ranges) {
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
+    }
+
+    void ClearDepthStencilImage(VkImage image, VkImageLayout layout, VkClearDepthStencilValue value,
+                                Span<VkImageSubresourceRange> ranges) {
+        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
+                                         ranges.data());
     }
 
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,

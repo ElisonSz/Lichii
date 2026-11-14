@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/device_memory_manager.h"
+#include "video_core/nx2_backx.h"
 
 namespace Core {
 
@@ -27,6 +28,16 @@ public:
     static inline bool count_collects{};
 
     void Collect(PAddr address, size_t size) {
+        // EDEN_NX2_BACKX_GATHER with _VERIFY: odd while a Collect runs (CollectEpoch).
+        const EpochScope epoch_scope{VideoCommon::BackX::g_gather_epochs ? &collect_epoch
+                                                                         : nullptr};
+        if (VideoCommon::BackX::g_stats || VideoCommon::BackX::g_verify) [[unlikely]] {
+            if ((address & page_mask) + size > page_size) {
+                // The BackX line's "crossing writes" (EDEN_NX2_BACKX_COLLECT_SPLIT's split below
+                // is always on now).
+                VideoCommon::BackX::Count(VideoCommon::BackX::Counter::CrossingWrites);
+            }
+        }
         // A transform covers one page: a write past its page goes in a page at a time. Its mask
         // was otherwise built with shifts of 32 or more, which could leave it empty and lose the
         // write (with an older one left in back_buffer and `current` showing nothing).
@@ -83,10 +94,18 @@ public:
     /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
     /// in `current` (by compare-exchange, or by exchange after pushing the one before to
     /// back_buffer under `guard`), and only Gather, which takes back_buffer too, empties `current`
-    /// again. An empty transform has no mask bits. Without the locks: a Collect it misses is one
-    /// the caller may order after itself.
+    /// again. An empty transform has no mask bits; Collect builds none, as a write crossing a page
+    /// goes in a page at a time. Without the locks: a Collect it misses is one the caller may
+    /// order after itself.
     [[nodiscard]] bool MayHavePending() const {
         return current.load(std::memory_order_acquire).mask != 0;
+    }
+
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: counts Collect calls twice, on entry and on return
+    /// (odd while one runs). Equal even values before a MayHavePending check and after a gather
+    /// mean no Collect ran in between.
+    [[nodiscard]] u64 CollectEpoch() const {
+        return collect_epoch.load(std::memory_order_seq_cst);
     }
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
@@ -211,6 +230,27 @@ private:
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
+    std::atomic<u64> collect_epoch{};
+
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: collect_epoch around one Collect.
+    class EpochScope {
+    public:
+        explicit EpochScope(std::atomic<u64>* epoch_) noexcept : epoch{epoch_} {
+            if (epoch != nullptr) [[unlikely]] {
+                epoch->fetch_add(1, std::memory_order_seq_cst);
+            }
+        }
+        ~EpochScope() {
+            if (epoch != nullptr) [[unlikely]] {
+                epoch->fetch_add(1, std::memory_order_seq_cst);
+            }
+        }
+        EpochScope(const EpochScope&) = delete;
+        EpochScope& operator=(const EpochScope&) = delete;
+
+    private:
+        std::atomic<u64>* epoch;
+    };
 };
 
 } // namespace Core

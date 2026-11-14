@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/vulkan_pipeline_destroy.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -244,6 +245,19 @@ public:
     explicit Device(VkInstance instance, vk::PhysicalDevice physical, VkSurfaceKHR surface,
                     const vk::InstanceDispatch& dld);
     ~Device();
+    void DrainRetiredPipelines();
+
+    struct RetiredPipeline {
+        PipelineHandles handles;
+        PipelineDestroyTime time;
+        PipelineOrigin origin;
+    };
+
+    /// The renderer hands over only after shader jobs stop and the GPU is idle.
+    void RetirePipeline(PipelineHandles handles, PipelineDestroyTime time,
+                        PipelineOrigin origin) const {
+        retired_pipelines.push_back({std::move(handles), time, origin});
+    }
 
     /**
      * Returns a format supported by the device for the passed requirements.
@@ -286,8 +300,13 @@ public:
     enum class SeparatePool : u32 {
         SparsePages,
         DeviceBuffers,
+        /// Large single-level images: render targets, made and deleted by the dozen a frame.
+        /// The default blocks are 16 MiB and give anything over 8 MiB memory of its own, a
+        /// driver allocation for each such image and a release when it goes.
+        RenderTargets,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize RenderTargetPoolBlockSize = 64ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -1120,6 +1139,12 @@ FN_MAX_LIMIT_LIST
 
     u64 GetDeviceMemoryUsage() const;
 
+    /// Actual allocation types in device-local heaps included in the usage query.
+    bool IsCountedDeviceLocalMemory(u32 memory_type) const noexcept {
+        return memory_type < VK_MAX_MEMORY_TYPES &&
+               (counted_local_memory_types & (u32{1} << memory_type)) != 0;
+    }
+
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not
@@ -1340,7 +1365,7 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
@@ -1455,6 +1480,7 @@ private:
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
+    u32 counted_local_memory_types{};
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
     u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
@@ -1464,6 +1490,7 @@ private:
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
+    mutable std::vector<RetiredPipeline> retired_pipelines;
 };
 
 } // namespace Vulkan

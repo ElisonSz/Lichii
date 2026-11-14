@@ -127,8 +127,7 @@ public:
     /// With jobs, `emit` is the CPU stage that runs before `task`
     PipelineBuild(const PipelineBuildQueue& queue, std::function<void()> task,
                   std::function<void()> emit = {})
-        : state{std::make_shared<State>(std::move(task))}, jobs{queue.jobs},
-          owner_builds{queue.owner_builds} {
+        : state{std::move(task)}, jobs{queue.jobs}, owner_builds{queue.owner_builds} {
         if (jobs) {
             VideoCommon::ShaderJob job{
                 .priority = VideoCommon::ShaderJobPriority::Soon,
@@ -136,56 +135,62 @@ public:
                 .driver_bytes = queue.driver_bytes,
             };
             if (emit) {
-                job.cpu = [state = state, emit = std::move(emit)](
-                              VideoCommon::ShaderJobContext&) mutable -> VideoCommon::ShaderDriverStage {
+                job.cpu =
+                    [this, emit = std::move(emit)](
+                        VideoCommon::ShaderJobContext&) mutable -> VideoCommon::ShaderDriverStage {
                     try {
                         emit();
                     } catch (const std::exception& exception) {
                         LOG_ERROR(Render_Vulkan, "Graphics pipeline emission failed: {}",
                                   exception.what());
-                        state->Fail();
+                        state.Fail();
                         return {};
                     } catch (...) {
                         LOG_ERROR(Render_Vulkan, "Graphics pipeline emission failed");
-                        state->Fail();
+                        state.Fail();
                         return {};
                     }
-                    return [state] { state->Run(); };
+                    return [this] { state.Run(); };
                 };
             } else {
-                job.driver = [state = state] { state->Run(); };
+                job.driver = [this] { state.Run(); };
             }
             handle = jobs->Submit(std::move(job));
         } else if (!owner_builds) {
-            state->Run();
+            state.Run();
         }
     }
 
     ~PipelineBuild() {
+        // The job closures refer to State by this; join even if the build completed before the
+        // worker published its final handle status.
         if (jobs) {
-            // Nothing needs a pipeline that goes: a build still queued is dropped.
-            jobs->Cancel(handle);
-            handle.Wait();
+            // Nothing needs a pipeline that goes: a build still queued is dropped. A final job
+            // needs neither the scheduler lock nor the waiter's lock during bulk destruction.
+            if (!handle.Ready()) {
+                jobs->Cancel(handle);
+                handle.Wait();
+            }
         } else if (!owner_builds) {
             Wait(true);
         }
     }
 
     bool IsBuilt() const {
-        return state->complete.load(std::memory_order_acquire);
+        return state.complete.load(std::memory_order_acquire);
     }
 
     bool Failed() const {
-        return IsBuilt() && state->failed;
+        return IsBuilt() && state.failed;
     }
 
     /// Builds it on this thread (owner_builds)
     void Build() const {
-        state->Run();
+        state.Run();
     }
 
     void Wait(bool may_build = false) const {
-        const auto shared = state;
+        auto* const shared = &state;
         if (jobs) {
             if (IsBuilt()) {
                 return;
@@ -213,7 +218,7 @@ public:
     /// `complete` under the mutex before notifying, so the wakeup cannot be lost.
     /// @return True when the pipeline is built.
     bool WaitFor(std::chrono::microseconds timeout) const {
-        const auto shared = state;
+        auto* const shared = &state;
         if (jobs && !IsBuilt()) {
             jobs->Promote(handle, VideoCommon::ShaderJobPriority::NeedNow);
         }
@@ -227,7 +232,9 @@ public:
     PipelineBuild& operator=(const PipelineBuild&) = delete;
 
 private:
-    std::shared_ptr<State> state;
+    // The build cannot move, and destruction joins the scheduler job before this state dies.
+    // Keeping it inline avoids a control block and a separate state allocation per pipeline.
+    mutable State state;
     VideoCommon::ShaderJobScheduler* jobs{};
     VideoCommon::ShaderJobHandle handle;
     bool owner_builds{};

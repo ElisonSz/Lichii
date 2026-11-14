@@ -1,11 +1,42 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <iterator>
 #include <map>
+#include <memory>
 #include <random>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "common/slot_vector.h"
+
+namespace {
+struct ConstructOnly {
+    explicit ConstructOnly(u32 value_) : value{std::make_unique<u32>(value_)} {}
+    ConstructOnly(ConstructOnly&&) noexcept = default;
+    ConstructOnly& operator=(ConstructOnly&&) = delete;
+    std::unique_ptr<u32> value;
+};
+static_assert(std::is_nothrow_move_constructible_v<ConstructOnly>);
+static_assert(!std::is_move_assignable_v<ConstructOnly>);
+} // namespace
+
+TEST_CASE("SlotVector relocates nonassignable owners without losing ownership", "[common]") {
+    Common::SlotVector<ConstructOnly> slots;
+    std::vector<Common::SlotId> ids;
+    for (u32 value = 0; value < 513; ++value) {
+        ids.push_back(slots.insert(value));
+    }
+    for (u32 value = 0; value < 513; ++value) {
+        REQUIRE(*slots[ids[value]].value == value);
+    }
+    slots.erase(ids[17]);
+    const auto replacement = slots.insert(u32{900});
+    REQUIRE(replacement == ids[17]);
+    REQUIRE(*slots[replacement].value == 900);
+    REQUIRE(slots.size() == 513);
+}
 
 TEST_CASE("SlotVector begins at the first live entry after empty bitmap words", "[common]") {
     Common::SlotVector<u32> slots;

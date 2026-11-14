@@ -36,6 +36,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -116,10 +117,17 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        namespace BackX = VideoCommon::BackX;
         // ~900 calls a frame, most with nothing collected: gather (applying_writes_mutex and two
         // locks per core's manager) only when a manager shows a write. One collected after this
         // check is gathered by the next call, as one collected just after the gather would be.
+        // (EDEN_NX2_BACKX_GATHER's skip, which nx2 takes always.)
         const auto managers = system.GetGPUDirtyMemoryManager();
+        if (BackX::g_gather_epochs) [[unlikely]] {
+            // EDEN_NX2_BACKX_GATHER with _VERIFY: its own verify, counted in the BackX line.
+            BackXVerifyInvalidateGPUCache(managers);
+            return;
+        }
         const auto collects = [&managers] {
             u64 sum = 0;
             for (const Core::GPUDirtyMemoryManager& manager : managers) {
@@ -127,17 +135,20 @@ struct GPU::Impl {
             }
             return sum;
         };
-        const u64 collects_before = VideoCommon::BackX::g_verify ? collects() : 0;
+        const u64 collects_before = BackX::g_verify ? collects() : 0;
         if (std::ranges::none_of(managers, &Core::GPUDirtyMemoryManager::MayHavePending)) {
-            if (VideoCommon::BackX::g_verify) {
+            BackX::Count(BackX::Counter::GatherSkipped);
+            if (BackX::g_verify) {
                 const auto first_write = ApplyCollectedWrites();
-                VideoCommon::BackX::SkippedGather(first_write.has_value(),
-                                                  collects() != collects_before,
-                                                  first_write.value_or(std::pair<DAddr, u64>{}));
+                BackX::SkippedGather(first_write.has_value(), collects() != collects_before,
+                                     first_write.value_or(std::pair<DAddr, u64>{}));
             }
             return;
         }
-        ApplyCollectedWrites();
+        BackX::Count(BackX::Counter::GatherRun);
+        if (!ApplyCollectedWrites()) {
+            BackX::Count(BackX::Counter::GatherEmpty);
+        }
     }
 
     /// Gathers the CPU writes collected into GPU-written pages and applies them to the caches.
@@ -167,6 +178,45 @@ struct GPU::Impl {
         return writes.front();
     }
 
+    /// EDEN_NX2_BACKX_GATHER with _VERIFY: the same decision, then the base's gather whatever it
+    /// was. Writes found after a skip are a race when a Collect ran between the check and the
+    /// gather (CollectEpoch odd before, or changed), as the base's gather taken first misses them;
+    /// otherwise the check missed writes there before it (a mismatch).
+    void BackXVerifyInvalidateGPUCache(std::span<Core::GPUDirtyMemoryManager> managers) {
+        namespace BackX = VideoCommon::BackX;
+        std::vector<u64> epochs;
+        epochs.reserve(managers.size());
+        for (const Core::GPUDirtyMemoryManager& manager : managers) {
+            epochs.push_back(manager.CollectEpoch());
+        }
+        const bool pending =
+            std::ranges::any_of(managers, [](const Core::GPUDirtyMemoryManager& manager) {
+                return manager.MayHavePending();
+            });
+        BackX::Count(pending ? BackX::Counter::GatherRun : BackX::Counter::GatherSkipped);
+        const bool found = ApplyCollectedWrites().has_value();
+        if (pending) {
+            if (!found) {
+                BackX::Count(BackX::Counter::GatherEmpty);
+            }
+            return;
+        }
+        if (!found) {
+            return;
+        }
+        bool collect_ran = false;
+        for (size_t i = 0; i < managers.size(); ++i) {
+            collect_ran =
+                collect_ran || (epochs[i] & 1) != 0 || managers[i].CollectEpoch() != epochs[i];
+        }
+        if (collect_ran) {
+            BackX::Count(BackX::Counter::GatherRaces);
+        } else {
+            BackX::Mismatch(BackX::Check::Gather, "collected CPU write while no manager showed one",
+                            0, 0);
+        }
+    }
+
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
         std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
@@ -189,8 +239,9 @@ struct GPU::Impl {
     template <typename Func>
     [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
         std::unique_lock lck{sync_request_mutex};
-        const u64 fence = ++last_sync_fence;
+        const u64 fence = last_sync_fence.load(std::memory_order_relaxed) + 1;
         sync_requests.emplace_back(std::forward<Func>(action));
+        last_sync_fence.store(fence, std::memory_order_release);
         return fence;
     }
 
@@ -216,6 +267,12 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        // Most ticks follow a draw with no requests pending. A request queued meanwhile is
+        // served by a later draw or by the tick its caller queues after publishing the fence.
+        if (current_sync_fence.load(std::memory_order_acquire) ==
+            last_sync_fence.load(std::memory_order_acquire)) {
+            return;
+        }
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
@@ -248,11 +305,14 @@ struct GPU::Impl {
     /// core timing events.
     void Start() {
         Settings::UpdateGPUAccuracy();
+        VideoCommon::GpuSplit::Get().SetTickHook(
+            [](void* argument) { static_cast<Impl*>(argument)->TickWork(); }, this);
         gpu_thread.StartThread(*renderer, renderer->Context(), scheduler);
     }
 
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
+        VideoCommon::GpuSplit::Get().SetTickHook(nullptr, nullptr);
         // Ends a recording while guest memory and the SMMU it holds references in still exist.
         VideoCommon::GpuTrace::OnGpuShutdown();
         {
@@ -342,6 +402,10 @@ struct GPU::Impl {
                 AsyncReadback::Add(AsyncReadback::g_counters.flush_ns,
                                    AsyncReadback::Now() - start);
             });
+            // The guest synchronized with the GPU work it reads before reading it. Ask the
+            // back to submit the downloads at its next entry boundary, even if the front is busy.
+            // Keep the queued tick for a disabled, stopped or restarting split.
+            VideoCommon::GpuSplit::Get().RequestTick();
             gpu_thread.TickGPU(is_async);
             WaitForSyncOperation(fence);
         }
@@ -477,7 +541,7 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<AmpereAnchor> ampere_anchor{};
-    u64 last_sync_fence{};
+    std::atomic<u64> last_sync_fence{}; ///< Last request published, written under the mutex
 
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;

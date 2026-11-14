@@ -365,6 +365,19 @@ u64 GenericEnvironment::CalculateHash() const {
     return Common::CityHash64(data.get(), size);
 }
 
+u64 GenericEnvironment::ShaderHash() const {
+    if (HasNativeInstructions())
+        return NativeShaderHash(code);
+    return CalculateHash();
+}
+
+u64 FileEnvironment::ShaderHash() const {
+    if (HasNativeInstructions())
+        return NativeShaderHash(code);
+    return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                              code.size() * sizeof(u64));
+}
+
 void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }

@@ -17,6 +17,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/compute_write_grid.h
     buffer_cache/indirect_buffer.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
@@ -102,6 +103,7 @@ add_library(video_core STATIC
     macro_turing.h
     fence_manager.h
     frame_gen_choice.h
+    front_qmd.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -122,6 +124,7 @@ add_library(video_core STATIC
     gpu_trace/trace_file.h
     guest_memory.h
     invalidation_accumulator.h
+    memtrack_translation.h
     memory_manager.cpp
     memory_manager.h
     page_filter.h
@@ -130,6 +133,10 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_acquire_stats.h
+    nx2_sync_suspend.h
+    nx2_call_sites.cpp
+    nx2_call_sites.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
     nx2_list_macro_trace.cpp
@@ -137,14 +144,23 @@ add_library(video_core STATIC
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_drain_check.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
+    nx2_list_indirect.h
+    nx2_list_indirect_stats.h
     nx2_profile.h
+    nx2_protect.cpp
+    nx2_protect.h
+    nx2_tested.cpp
+    nx2_tested.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
     nx2_async_readback.h
     nx2_backx.h
+    nx2_cfg.h
+    nx2_macro.h
     nx2_download_trace.h
     pending_maps.h
     present.h
@@ -198,6 +214,8 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/nx2_list_slots.cpp
+    renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h
@@ -205,6 +223,11 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_eviction_policy.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
+    renderer_vulkan/async_teardown.h
+    renderer_vulkan/pipeline_destroy_timing.h
+    renderer_vulkan/pipeline_reaper.h
+    vulkan_common/vulkan_pipeline_destroy.h
+    vulkan_common/vulkan_pipeline_handles.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
@@ -242,8 +265,14 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_frame_dump.cpp
     renderer_vulkan/vk_frame_dump.h
+    renderer_vulkan/vk_oot_whiteout.cpp
+    renderer_vulkan/vk_oot_whiteout.h
+    oot_whiteout_pixels.h
+    oot_whiteout_trace.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
+    renderer_vulkan/graphics_stage_info.h
+    renderer_vulkan/drawx_twin.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
@@ -331,6 +360,7 @@ add_library(video_core STATIC
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
+    teardown_timing.h
     shader_notify.cpp
     shader_notify.h
     shader_stage_translation.cpp
@@ -347,6 +377,7 @@ add_library(video_core STATIC
     surface.h
     texture_cache/accelerated_swizzle.cpp
     texture_cache/accelerated_swizzle.h
+    texture_cache/cache_operations.h
     texture_cache/decode_bc.cpp
     texture_cache/decode_bc.h
     texture_cache/descriptor_table.h
@@ -368,6 +399,7 @@ add_library(video_core STATIC
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/stale_pages.h
+    texture_cache/stale_targets.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h
@@ -633,6 +665,7 @@ if (MSVC)
     target_compile_options(video_core PRIVATE
         /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
         /we4244 # 'conversion': conversion from 'type1' to 'type2', possible loss of data
+        /Z7 # TEST: full debug info so EDEN_NX2_SAMPLE names internal and inlined functions
     )
 else()
     if (APPLE)

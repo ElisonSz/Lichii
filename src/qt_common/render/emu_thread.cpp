@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <qdebug.h>
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -78,9 +79,15 @@ void EmuThread::run() {
         }
     }
 
+    // TEST: include the end of core shutdown and the return from the emulation thread.
+    const auto shutdown_begin = std::chrono::steady_clock::now();
     // Shutdown the main emulated process
     QtCommon::system->DetachDebugger();
     QtCommon::system->ShutdownMainProcess();
+    LOG_INFO(
+        Frontend, "Emulation thread exiting: shutdown took {:.1f} ms",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shutdown_begin)
+            .count());
 }
 
 void EmuThread::ReloadDiskShaderCache(u64 program_id) {

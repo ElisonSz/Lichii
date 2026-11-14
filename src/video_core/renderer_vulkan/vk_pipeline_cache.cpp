@@ -23,6 +23,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 #include "common/cityhash.h"
@@ -49,11 +50,15 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/nx2_tested.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
+#include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
@@ -502,6 +507,26 @@ struct DeferredStages {
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 };
 
+/// EDEN_NX2_PREBUILD_STAGES=<n> runs at most n Background shader stages (prebuild, precache) at
+/// once; 0 or unset: no limit.
+size_t BackgroundShaderStages() {
+    const char* const value = std::getenv("EDEN_NX2_PREBUILD_STAGES");
+    return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
+}
+
+/// Skipped cached graphics pipelines the background prebuild may take. None in Ocarina of Time:
+/// building its ~17,600 skipped ones on every worker held Castle Town at 19-25 ms a frame until
+/// they were done (94 s to past 150 s after boot); a draw took 0-2 of them a run, each still
+/// building (up to 309 ms); and with one background stage at a time (EDEN_NX2_PREBUILD_STAGES=1)
+/// each run still had a 68-72 ms frame in the route's first 10 s. Elsewhere as many as the kept
+/// limit leaves. EDEN_NX2_PREBUILD_MAX=<n> sets it in any title.
+size_t PrebuildMax() {
+    if (const char* const value = std::getenv("EDEN_NX2_PREBUILD_MAX")) {
+        return static_cast<size_t>(std::strtoull(value, nullptr, 10));
+    }
+    return VideoCommon::Nx2Tested::TestedTitle() ? 0 : std::numeric_limits<size_t>::max();
+}
+
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
@@ -752,11 +777,17 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     };
     host_info.ApplyDescriptorLimitPolicy();
 
-    LOG_INFO(Render_Vulkan,
-             "Bindless handle tables: sampled image arrays indexed per invocation {}, up to {} "
-             "sampled images per stage",
-             device.IsSampledImageArrayNonUniformIndexingSupported() ? "supported" : "unsupported",
-             device.GetMaxPerStageDescriptorSampledImages());
+    {
+        // The descriptor arrays of bindless handle tables (HandleTableSize in texture_pass.cpp).
+        const char* const table = std::getenv("LICHII_BINDLESS_TABLE");
+        LOG_INFO(Render_Vulkan,
+                 "Bindless handle tables: LICHII_BINDLESS_TABLE {}, sampled image arrays "
+                 "indexed per invocation {}, up to {} sampled images per stage",
+                 table != nullptr && table[0] != '\0' ? table : "default (64)",
+                 device.IsSampledImageArrayNonUniformIndexingSupported() ? "supported"
+                                                                         : "unsupported",
+                 device.GetMaxPerStageDescriptorSampledImages());
+    }
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
@@ -831,6 +862,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
         .cpu_threads = cpu_threads,
         .driver_threads = driver_threads,
+        .max_background_stages = BackgroundShaderStages(),
         .name = "VkShader",
     });
 }
@@ -895,21 +927,56 @@ size_t KeptPipelines() {
 #endif
 }
 
-/// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
-/// the frontend every few hundred that the teardown still moves: tens of thousands of them took
-/// longer than the frontend waited for the emulation thread.
-template <typename Container>
-void DestroyPipelinesWithProgress(Container& pipelines) {
+/// TEST: EDEN_NX2_PIPELINE_BUDGET=<pipelines> sets the built graphics pipelines kept, and unused
+/// ones go however recently they were used (least recently used first), so a short run evicts.
+/// 0 when unset.
+size_t ForcedPipelineBudget() {
+    static const size_t budget = []() -> size_t {
+        if (const char* const value = std::getenv("EDEN_NX2_PIPELINE_BUDGET")) {
+            if (const unsigned long long forced = std::strtoull(value, nullptr, 10); forced != 0) {
+                LOG_INFO(Render_Vulkan, "Pipeline budget set by EDEN_NX2_PIPELINE_BUDGET: {}",
+                         forced);
+                return static_cast<size_t>(forced);
+            }
+        }
+        return 0;
+    }();
+    return budget;
+}
+
+/// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs) through
+/// `retire` (PipelineCache::RetirePipeline: at once, on the reaper's worker or by the device's
+/// owner), telling the frontend every few hundred that the teardown still moves: tens of
+/// thousands of them took longer than the frontend waited for the emulation thread.
+template <typename Container, typename Retire>
+void DestroyPipelinesWithProgress(Container& pipelines, Retire&& retire) {
     constexpr size_t ProgressEvery = 256;
     size_t destroyed = 0;
     for (auto& entry : pipelines) {
-        entry.second.reset();
+        retire(std::move(entry.second));
         if (++destroyed % ProgressEvery == 0) {
             Common::NoteShutdownProgress();
         }
     }
     pipelines.clear();
     Common::NoteShutdownProgress();
+}
+
+/// Waits until `reaper` destroyed what it was handed, telling the frontend whenever its worker
+/// destroyed more since the last look: the teardown still moves (DestroyPipelinesWithProgress).
+template <typename Reaper>
+void DrainWithProgress(Reaper& reaper) {
+    auto [submitted, destroyed] = reaper.Counts();
+    size_t noted = destroyed;
+    while (destroyed < submitted) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        std::tie(submitted, destroyed) = reaper.Counts();
+        if (destroyed != noted) {
+            noted = destroyed;
+            Common::NoteShutdownProgress();
+        }
+    }
+    reaper.Drain();
 }
 
 /// Why a draw or dispatch built its pipeline at run time
@@ -929,27 +996,157 @@ void ReportRuntimePipeline(RuntimeBuild kind, std::chrono::steady_clock::duratio
 void LogRuntimePipelineTotals();
 } // Anonymous namespace
 
+void PipelineCache::RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline,
+                                   PipelineOrigin origin) {
+    if (!pipeline) {
+        return;
+    }
+    const char* const memory_check = std::getenv("EDEN_NX2_PIPELINE_MEMORY_CHECK");
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        cpu_memory[static_cast<size_t>(origin)].Add(pipeline->RetainedCpuMemory());
+    }
+    if (defer_destruction) {
+        const auto begin = PipelineDestroyTime::Clock::now();
+        auto handles = pipeline->TakeHandles();
+        pipeline.reset();
+        PipelineDestroyTime time;
+        time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+        device.RetirePipeline(std::move(handles), time, origin);
+        ++deferred_count;
+    } else {
+        pipeline->destroy_origin = origin;
+        pipeline_reaper.Retire(std::move(pipeline));
+    }
+}
+
 PipelineCache::~PipelineCache() {
+    // TEST: where shutdown spends its time (the frontend stops waiting after 10 s).
+    auto step_begin = std::chrono::steady_clock::now();
+    const auto step = [&step_begin](const char* name) {
+        const auto now = std::chrono::steady_clock::now();
+        LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} took {:.1f} ms", name,
+                 std::chrono::duration<double, std::milli>(now - step_begin).count());
+        step_begin = now;
+        // Each step tells the frontend that the teardown still moves (Common::ShutdownProgress)
+        Common::NoteShutdownProgress();
+    };
     serialization_stop.request_stop();
-    StopBackgroundJobs();
-    // The pipelines' builds end before the driver pipeline cache they build into goes.
+    // Cancel every queued build before waiting, including run-time misses. No worker may still
+    // hold a pipeline, its IR, or the cache when ownership moves to the destruction workers.
     shader_jobs->Shutdown();
-    Common::NoteShutdownProgress();
+    step("shader jobs (queued builds cancelled)");
+    const auto stage_memory = graphics_stage_pool.LiveStats();
+    LOG_INFO(Render_Vulkan,
+             "Pipeline CPU memory: object {} bytes, Shader::Info {} bytes, {} stage references, "
+             "{} shared records, {} record bytes, {} unshared compact bytes, largest {} bytes",
+             sizeof(GraphicsPipeline), sizeof(Shader::Info), stage_memory.copies,
+             stage_memory.records, stage_memory.bytes, stage_memory.unshared_bytes,
+             stage_memory.largest);
+    const char* const memory_check = std::getenv("EDEN_NX2_PIPELINE_MEMORY_CHECK");
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        ASSERT(stage_memory.bytes <= stage_memory.unshared_bytes);
+        LOG_INFO(Render_Vulkan, "Pipeline memory check: shared stage contents verified, {} records",
+                 stage_memory.records);
+    }
+    // Eight workers did not improve AMD's destruction throughput. Keep the one worker used
+    // during play and avoid multiplying driver contention at shutdown.
+    constexpr size_t destroy_workers = 1;
+    defer_destruction = AsyncTeardownEnabled();
+    if (defer_destruction) {
+        auto pending = pipeline_reaper.TakePending();
+        for (auto& pipeline : pending) {
+            const auto origin = pipeline->destroy_origin;
+            RetirePipeline(std::move(pipeline), origin);
+        }
+    }
+    DrainWithProgress(pipeline_reaper);
+    StopBackgroundJobs();
+    step("stopping background jobs");
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
     SaveUsedPipelines();
+    step("serialization and used pipelines");
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
-    Common::NoteShutdownProgress();
+    step("saving the driver pipeline cache");
     LogRuntimePipelineTotals();
-    // After the records the serialization thread queued: its writer drains on destruction
+    // Its writer must preserve the queued records, but neither disk I/O nor releasing the
+    // lowered program records depends on Vulkan destruction. Join before leaving this scope.
     shader_cache_v2 = nullptr;
-    cache_v2.reset();
-    Common::NoteShutdownProgress();
-    DestroyPipelinesWithProgress(graphics_cache);
-    DestroyPipelinesWithProgress(evicted_pipelines);
+    std::jthread cache_cleanup{[cache = std::move(cache_v2)]() mutable {
+        const auto begin = std::chrono::steady_clock::now();
+        cache.reset();
+        LOG_INFO(Render_Vulkan, "Pipeline cache teardown: shader cache v2 took {:.1f} ms",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                     .count());
+    }};
+    const size_t graphics_count = graphics_cache.size();
+    DestroyPipelinesWithProgress(
+        graphics_cache, [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+            RetirePipeline(std::move(pipeline), PipelineOrigin::GraphicsCache);
+        });
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} graphics pipelines", graphics_count);
+    step("queueing graphics pipelines");
+    const size_t evicted_count = evicted_pipelines.size();
+    DestroyPipelinesWithProgress(evicted_pipelines,
+                                 [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+                                     RetirePipeline(std::move(pipeline), PipelineOrigin::Evicted);
+                                 });
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} evicted pipelines", evicted_count);
+    step("queueing evicted pipelines");
+    DrainWithProgress(pipeline_reaper);
+    step("draining pipeline destruction");
+    destroy_stats.Report();
+    if (memory_check != nullptr && memory_check[0] == '1') {
+        constexpr std::array names{"evicted", "graphics cache", "unclaimed prebuild", "compute"};
+        for (size_t index = 0; index < cpu_memory.size(); ++index) {
+            const auto& memory = cpu_memory[index];
+            LOG_INFO(Render_Vulkan,
+                     "Pipeline retained CPU: {} count {}, object {} bytes, transitions {} bytes, "
+                     "descriptors {} bytes, allocator {} bytes, helper SPIR-V {} bytes",
+                     names[index], memory.count, memory.object, memory.transitions,
+                     memory.descriptors, memory.allocator, memory.helper_spirv);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} pipelines deferred to device owner",
+             deferred_count);
+    const auto [submitted, destroyed] = pipeline_reaper.Counts();
+    LOG_INFO(Render_Vulkan,
+             "Pipeline cache teardown: {} destruction workers, {} submitted, {} destroyed",
+             destroy_workers, submitted, destroyed);
+    const char* const check = std::getenv("EDEN_NX2_PIPELINE_TEARDOWN_CHECK");
+    if (check != nullptr && check[0] == '1') {
+        ASSERT(submitted == destroyed);
+        LOG_INFO(Render_Vulkan, "Pipeline teardown check: submitted == destroyed ({})", destroyed);
+    }
+    cache_cleanup.join();
+    step("joining shader cache v2 cleanup");
+    const size_t compute_count = compute_cache.size();
+    if (defer_destruction) {
+        const auto defer_compute = [this](std::unique_ptr<ComputePipeline>& pipeline) {
+            if (!pipeline) {
+                return;
+            }
+            const auto begin = PipelineDestroyTime::Clock::now();
+            auto handles = pipeline->TakeHandles();
+            pipeline.reset();
+            PipelineDestroyTime time;
+            time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+            device.RetirePipeline(std::move(handles), time, PipelineOrigin::Compute);
+        };
+        for (auto& [key, entry] : compute_cache) {
+            defer_compute(entry.pipeline);
+        }
+        for (auto& [tick, pipeline] : retired_compute_pipelines) {
+            defer_compute(pipeline);
+        }
+    }
+    compute_cache.clear();
+    retired_compute_pipelines.clear();
+    LOG_INFO(Render_Vulkan, "Pipeline cache teardown: {} compute pipelines", compute_count);
+    step("destroying compute pipelines");
     if (pipeline_binaries) {
         pipeline_binaries->LogCounts("at the end of the session");
         pipeline_binaries.reset();
@@ -1317,7 +1514,15 @@ void PipelineCache::ReturnPools(std::shared_ptr<ShaderPools> pools) {
 }
 
 void PipelineCache::StopBackgroundJobs() {
-    scheduled_prebuild.reset();
+    if (scheduled_prebuild) {
+        auto unclaimed = scheduled_prebuild->StopAndTake();
+        LOG_INFO(Render_Vulkan, "Pipeline cache: retiring {} unclaimed prebuilt pipelines",
+                 unclaimed.size());
+        for (auto& pipeline : unclaimed) {
+            RetirePipeline(std::move(pipeline), PipelineOrigin::UnclaimedPrebuild);
+        }
+        scheduled_prebuild.reset();
+    }
 }
 
 // Set while this thread translates a cached graphics record: CreateGraphicsPipeline drops one
@@ -1588,8 +1793,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         std::vector<u8> payload;
     };
     std::vector<PrebuildRecord> prebuild;
-    for (const auto& [index, key] : NewestFirst(std::move(skipped_graphics),
-                                                PrebuildLimit(kept_pipelines, queued_graphics))) {
+    for (const auto& [index, key] :
+         NewestFirst(std::move(skipped_graphics),
+                     std::min(PrebuildLimit(kept_pipelines, queued_graphics), PrebuildMax()))) {
         const CacheV2::LogRecord& record = *records[index];
         prebuild.push_back({
             .key = key,
@@ -2269,11 +2475,16 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    if (VideoCommon::Cfg::g_any) [[unlikely]] {
+        VideoCommon::Cfg::Report();
+    }
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
-    while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
-        evicted_pipelines.pop_front();
-    }
+    // Only transfer ownership here: driver destruction can take milliseconds per frame. The
+    // eviction tick includes the last command using the pipeline, including queued worker work.
+    constexpr size_t MaxRetiredPerFrame = 8;
+    pipeline_reaper.RetireCompleted(evicted_pipelines, MaxRetiredPerFrame,
+                                    [this](u64 tick) { return scheduler.IsFree(tick); });
     while (!retired_compute_pipelines.empty() &&
            scheduler.IsFree(retired_compute_pipelines.front().first) &&
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
@@ -2281,6 +2492,7 @@ void PipelineCache::TickFrame() {
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
+        graphics_stage_pool.Prune();
         EvictUnusedPipelines();
     }
     constexpr u64 PrebuildCheckFrames = 60;
@@ -2303,7 +2515,8 @@ void PipelineCache::TickFrame() {
 void PipelineCache::EvictUnusedPipelines() {
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
     // rebuild cost below, so none are evicted there.
-    if (device.IsMoltenVK() || frame_count <= EvictAfterFrames) {
+    const size_t forced_budget = ForcedPipelineBudget();
+    if (device.IsMoltenVK() || (forced_budget == 0 && frame_count <= EvictAfterFrames)) {
         return;
     }
     // An evicted pipeline used again is translated again on the GPU thread (~8.5 ms) and built
@@ -2311,13 +2524,16 @@ void PipelineCache::EvictUnusedPipelines() {
     // a place visited again after a few minutes needs hundreds of them at once (OoT: 8,158
     // rebuilt in 80 min, multi-second freezes). So they go only past the kept limit, least
     // recently used first; a prebuilt one no draw has used counts as used at boot.
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    // With EDEN_NX2_PIPELINE_BUDGET, every pipeline but the current one is a candidate.
+    const u64 unused_frames = forced_budget != 0 ? 0 : EvictAfterFrames;
+    const u64 cutoff = forced_budget != 0 ? frame_count + 1 : frame_count - EvictAfterFrames;
+    const size_t built =
+        static_cast<size_t>(std::ranges::count_if(graphics_cache, [](const auto& entry) {
+            return entry.second != nullptr && entry.second->IsBuilt();
+        }));
     std::vector<GraphicsPipelineCacheKey> evict;
-    if (const size_t kept = KeptPipelines(); kept != 0) {
-        const size_t built = static_cast<size_t>(
-            std::ranges::count_if(graphics_cache, [](const auto& entry) {
-                return entry.second != nullptr && entry.second->IsBuilt();
-            }));
+    const size_t kept = forced_budget != 0 ? forced_budget : KeptPipelines();
+    if (kept != 0) {
         if (built <= kept) {
             return;
         }
@@ -2358,9 +2574,9 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         evicted_hashes.insert(it->first.Hash());
         evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
-        KeptGraphicsStages kept = it->second->TakeKeptStages();
-        const u64 bytes = kept.Bytes();
-        kept_stages.Add(it->first, std::move(kept), bytes);
+        KeptGraphicsStages kept_stage = it->second->TakeKeptStages();
+        const u64 bytes = kept_stage.Bytes();
+        kept_stages.Add(it->first, std::move(kept_stage), bytes);
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         graphics_cache.erase(it);
     }
@@ -2369,10 +2585,13 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
+    VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Evict, evict.size(), built, kept,
+                                  tick);
     LOG_INFO(Render_Vulkan,
-             "Evicted {} graphics pipelines unused for {} frames, {} left; {} evicted ones kept "
-             "for a rebuild ({} KiB), {} rebuilt from them and {} translated again since the last",
-             evict.size(), EvictAfterFrames, graphics_cache.size(), kept_stages.Size(),
+             "Evicted {} graphics pipelines unused for {} frames, least recently used first ({} "
+             "were built, {} kept), {} left; {} evicted ones kept for a rebuild ({} KiB), {} "
+             "rebuilt from them and {} translated again since the last",
+             evict.size(), unused_frames, built, kept, graphics_cache.size(), kept_stages.Size(),
              kept_stages.Bytes() >> 10, rebuilt_from_kept, translated_again);
     rebuilt_from_kept = 0;
     translated_again = 0;
@@ -2459,6 +2678,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
         }
     }
     if (discard) {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Skip,
+                                      pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]);
         static std::atomic<u64> skipped{};
         if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
             // Counts lookups, not draws: a draw state can look its pipeline up more than once.
@@ -2471,10 +2692,6 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGraphicsStages kept) {
-    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
-    for (size_t stage = 0; stage < infos.size(); ++stage) {
-        infos[stage] = kept.infos[stage].get();
-    }
     const u64 bytes = kept.Bytes();
     auto emit = [spirv = std::move(kept.spirv)] {
         std::array<std::vector<u32>, Maxwell::MaxShaderStage> code;
@@ -2492,8 +2709,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(true, bytes), nullptr, render_pass_cache, graphics_key,
-        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit),
-        std::move(kept.mesh_emulation));
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, std::move(kept.infos),
+        std::move(emit), std::move(kept.mesh_emulation));
     pipeline->SetMappedPointers(std::move(kept.mapped_pointers));
     return pipeline;
 }
@@ -2970,7 +3187,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
-        render_pass_cache, key, std::move(stage_spirv), infos, std::move(emit_stages),
+        render_pass_cache, key, std::move(stage_spirv),
+        GraphicsPipeline::InternStageInfos(graphics_stage_pool, key, infos), std::move(emit_stages),
         std::move(mesh_emulation));
     pipeline->SetMappedPointers(std::move(mapped_pointers));
     return pipeline;
@@ -3170,6 +3388,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                   : RuntimeBuild::New;
     std::optional<ParallelTranslation> parallel;
     SCOPE_EXIT {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Build, graphics_key.Hash(),
+                                      graphics_key.unique_hashes[1], graphics_key.unique_hashes[5]);
         const auto elapsed = std::chrono::steady_clock::now() - begin;
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
@@ -3279,6 +3499,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
         VideoCommon::Nx2Profile::Zone::ComputePipelineMiss};
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::Build, key.Hash(),
+                                      key.unique_hash);
         ReportRuntimePipeline(RuntimeBuild::Compute, std::chrono::steady_clock::now() - begin,
                               fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
                                           key.unique_hash,

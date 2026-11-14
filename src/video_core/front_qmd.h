@@ -1,0 +1,911 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "common/common_types.h"
+#include "video_core/gpu_split.h"
+#include "video_core/native_qmd.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_drain_check.h"
+
+namespace VideoCommon {
+
+inline bool g_qmd_view = [] {
+    const char* value = std::getenv("EDEN_NX2_QMD_VIEW");
+    return value == nullptr || value[0] != '0';
+}();
+inline void ReadQmdViewSwitch() {
+    const char* value = std::getenv("EDEN_NX2_QMD_VIEW");
+    g_qmd_view = value == nullptr || value[0] != '0';
+}
+
+/// The QMD scheduling of every channel (Tegra::NativeQmdScheduler), run on the split GPU thread's
+/// front as its back will run it, on a table of its own: what the launches release is known when
+/// they are sent, for the front's view of the semaphore words (GpuSplit::NoteSemaphoreWrite).
+///
+/// The table is the back's from the start: an engine's front takes it over with the back drained
+/// when it takes the engine's macros over (TakeOver). It stays the back's as long as the front
+/// reads the descriptors the back will read. The front reads one when it sends a signal, the back
+/// when it runs it, both from guest memory without the GPU caches. The front takes a descriptor:
+/// - from the signal's own inline QMD, which the back writes right before;
+/// - from memory, once the back ran every write sent there (GpuSplit::MemoryWritesTarget: the
+///   writes placed in its granule and the unplaced ones), on pages GPU work never wrote
+///   (Nx2MayBeGpuWritten);
+/// - from the inline QMD a LOAD_INLINE_QMD_DATA still queued writes there, when that is the last
+///   write sent there (NoteInlineWrite).
+/// No change of the GPU's mappings may be queued either (GpuSplit::LastMappingChange). Memory holds
+/// what the back finds there only while the back has not run the signal's entry yet: the front
+/// sends and values it under a GpuSplit::PublishHold.
+///
+/// Where the back has yet to run a write the front can't read past (into a QMD the signal reads,
+/// or anywhere, or to the mappings), the signal waits, with what it changed in the table taken
+/// back (NativeQmdScheduler::BeginAttempt), and every signal sent after it waits behind it: the
+/// table stays the back's as of the signals valued. The front values the waiting ones in order
+/// once the back ran what the first waits for (CatchUp). Late, the back may have run the signal
+/// and what followed it, so memory holds what the back read only where nothing sent after the
+/// signal writes the QMD, and no release of the waiting signals writes a QMD read late. Their
+/// releases are placed at their signals' positions, not noted. Where the front can't read what
+/// the back read at all (a QMD on a GPU-written page, written after the signal, released into,
+/// or the mappings changed after it), it loses the table: it stops valuing, and takes the back's
+/// table over the next time the back has run everything sent, between commands or at a QMD
+/// method (MaybeTakeOver).
+///
+/// `Memory`, the channel's GPU address space as the back reads it, has:
+/// - bool IsMapped(GPUVAddr, u64), void Read(GPUVAddr, void*, u64), u32 ReadWord(GPUVAddr) (as
+///   MemoryManager::Read<u32>), bool InSyncpointShim(GPUVAddr, u64);
+/// - std::optional<u64> Device(GPUVAddr), bool GpuWritten(u64 device, u64 size);
+/// - u64 WritesTarget(const GpuSplit&, GPUVAddr, u64), void NoteWrite(GpuSplit&, GPUVAddr, u64),
+///   void NoteWriteAt(GpuSplit&, GPUVAddr, u64 size, u64 position);
+/// - const void* Id(): the address space's, the same for every Memory of it.
+class FrontQmdView {
+public:
+    using Descriptor = Tegra::NativeQmdScheduler::Descriptor;
+
+    /// The view the compute engines of every channel feed: they share the back's table.
+    static FrontQmdView& Get() {
+        static FrontQmdView view;
+        return view;
+    }
+
+    /// The back ran everything sent and runs nothing (the split drained, or it waits for work):
+    /// takes over the table `back` shares with the other engines. `where`: TEST.
+    void TakeOver(const Tegra::NativeQmdScheduler& back, Nx2AcquireStats::QmdTakeOver where) {
+        const auto start = std::chrono::steady_clock::now(); // TEST
+        scheduler.CopyStates(back);
+        synced = true;
+        Nx2AcquireStats::NoteQmdTakeOverDropped(waiting.size()); // TEST
+        ClearWaiting();
+        Nx2AcquireStats::NoteQmdSync(where, std::chrono::steady_clock::now() - start);
+    }
+
+    /// The front, between commands and before QMD methods: takes the back's table over if the
+    /// view lost it or signals wait, and the back has run everything sent.
+    void MaybeTakeOver(const GpuSplit& split, const Tegra::NativeQmdScheduler& back,
+                       Nx2AcquireStats::QmdTakeOver where) {
+        if (!Current() && split.Ran(split.Position())) {
+            TakeOver(back, where);
+        }
+    }
+    void MaybeTakeOver(const GpuSplit& split, Nx2AcquireStats::QmdTakeOver where) {
+        MaybeTakeOver(split, back_table, where);
+    }
+
+    /// TEST (EDEN_NX2_DRAIN_CHECK): the releases noted since the last call, the descriptors read
+    /// for them, and whether every signal since was valued; every 512th time while the view is
+    /// current, and after it valued signals late, a copy of its table; the position of the entry
+    /// whose signals wait, from the `first_waiting`-th on; the signals valued late since, with
+    /// what they read; nothing if no signal was sent since.
+    struct Checks {
+        std::vector<Nx2DrainCheck::QmdRelease> releases;
+        std::vector<Nx2DrainCheck::QmdRead> reads;
+        std::shared_ptr<const Tegra::NativeQmdScheduler> table;
+        bool valued;
+        bool table_after_late;
+        u64 wait_position;
+        u32 first_waiting;
+        std::vector<Nx2DrainCheck::LateQmdRead> late;
+    };
+    [[nodiscard]] std::optional<Checks> TakeChecks() {
+        if (!checks_pending) {
+            return std::nullopt;
+        }
+        checks_pending = false;
+        Checks taken{std::move(checks),
+                     std::move(check_reads),
+                     nullptr,
+                     !checks_unvalued,
+                     false,
+                     check_wait_position,
+                     check_first_waiting,
+                     std::move(late_checks)};
+        if (taken.valued && Current() && (table_check_due || ++table_checks % 512 == 0)) {
+            auto copy =
+                std::make_shared<Tegra::NativeQmdScheduler>(Tegra::NativeQmdScheduler::OwnTable{});
+            copy->CopyStates(scheduler);
+            taken.table = std::move(copy);
+            taken.table_after_late = table_check_due;
+            table_check_due = false;
+        }
+        checks.clear();
+        check_reads.clear();
+        late_checks.clear();
+        checks_unvalued = false;
+        check_wait_position = 0;
+        check_first_waiting = 0;
+        return taken;
+    }
+
+    /// The engines schedule QMDs the front does not see (the split stopped).
+    void Lose() {
+        synced = false;
+        inline_writes_count = 0;
+        ClearWaiting();
+    }
+
+    [[nodiscard]] bool Synced() const {
+        return synced;
+    }
+    /// Whether the table is the back's as of everything sent: synced, and no signal waits.
+    [[nodiscard]] bool Current() const {
+        return synced && waiting.empty();
+    }
+    /// TEST: whether the view's table holds the QMD states `other` does.
+    [[nodiscard]] bool SameTable(const Tegra::NativeQmdScheduler& other) const {
+        return scheduler.SameStates(other);
+    }
+
+    /// EDEN_NX2_RUNAHEAD: the longest inline upload the view keeps (NoteUpload).
+    static constexpr u64 MaxUploadBytes = 2048;
+
+    /// EDEN_NX2_RUNAHEAD: a compute engine's front sent all of an inline upload of one linear
+    /// line: once the back ran the entries before `position`, `bytes` are in guest memory from
+    /// `address` of the address space `memory` (Memory::Id). Until then the front reads a QMD
+    /// they cover from here, if the upload is the last write sent there (ReadDescriptor).
+    /// `prior`: the last write sent over the upload's granules before it (GpuSplit::
+    /// MemoryWritesTarget as it began), for EDEN_NX2_RUNAHEAD_QMD_PATCH.
+    void NoteUpload(const void* memory, GPUVAddr address, std::span<const u8> bytes, u64 position,
+                    u64 prior = ~u64{0}) {
+        if (bytes.empty() || bytes.size() > MaxUploadBytes) {
+            return;
+        }
+        KeptUpload& kept = uploads[uploads_count % uploads.size()];
+        ++uploads_count;
+        kept.memory = memory;
+        kept.address = address;
+        kept.size = bytes.size();
+        kept.position = position;
+        kept.prior = prior;
+        std::memcpy(kept.bytes.data(), bytes.data(), bytes.size());
+    }
+
+    /// LOAD_INLINE_QMD_DATA was just sent: running it, the back writes `qmd` to the QMD at
+    /// `device`. Until then the front reads it from here (ReadDescriptor).
+    void NoteInlineWrite(const GpuSplit& split, u64 device, const Descriptor& qmd) {
+        InlineWrite& written = inline_writes[inline_writes_count % inline_writes.size()];
+        ++inline_writes_count;
+        written.device = device;
+        written.position = split.Position();
+        written.qmd = qmd;
+        written.overwritten = false;
+    }
+
+    /// The scheduling of PCAS action `argument` on the QMD at `address` that the back runs at the
+    /// entry just sent (KeplerCompute::ProcessNativeMethod); `inline_qmd`: the QMD it writes there
+    /// right before. Notes what the launches it runs release, or has the signal wait. The entry
+    /// must still be unpublished (GpuSplit::PublishHold): the back must not have run it.
+    template <typename Memory>
+    void Signal(GpuSplit& split, const Memory& memory, GPUVAddr address, u32 argument,
+                const Descriptor* inline_qmd) {
+        if (!g_qmd_view) {
+            Lose();
+            split.NoteUnplacedWrite();
+            checks_pending = Nx2DrainCheck::g_enabled;
+            checks_unvalued = true;
+            return;
+        }
+        split.NoteCacheWrite(); // The dispatches' shader stores
+        using Lost = Nx2AcquireStats::QmdLost;
+        checks_pending = Nx2DrainCheck::g_enabled; // TEST
+        const u64 position = split.Position();
+        if (checks_pending) {
+            // TEST: the back must not have run the entry yet, the n-th signal of its entry.
+            if (split.Unpublished() == 0) {
+                Nx2DrainCheck::NotePublishedEarly();
+            }
+            entry_signals = position != entry_position ? 0 : entry_signals + 1;
+            entry_position = position;
+        }
+        if (synced) {
+            CatchUp(split, memory);
+        }
+        if (!synced) {
+            Unvalued(split, Lost::NotSynced);
+            return;
+        }
+        if (!waiting.empty()) {
+            // Behind a signal still waiting.
+            Wait(split, position, memory.Id(), address, argument, inline_qmd, std::nullopt);
+            return;
+        }
+        const Outcome outcome =
+            Attempt(split, memory, position, address, argument, inline_qmd, false);
+        if (outcome.valued) {
+            Nx2AcquireStats::NoteQmdSignal(std::nullopt);
+            return;
+        }
+        if (outcome.retry_after) {
+            retry_after = *outcome.retry_after;
+            if (Nx2AcquireStats::g_enabled && outcome.lost == Lost::Pending) {
+                NoteWaitWriter(split, memory, position, outcome); // TEST
+            }
+            Wait(split, position, memory.Id(), address, argument, inline_qmd, outcome.lost);
+            return;
+        }
+        synced = false;
+        Unvalued(split, outcome.lost);
+    }
+
+private:
+    struct Release {
+        GPUVAddr address;
+        u32 payload;
+        u32 flags;
+    };
+
+    /// An inline QMD a LOAD_INLINE_QMD_DATA sent writes (NoteInlineWrite).
+    struct InlineWrite {
+        u64 device{};
+        u64 position{};
+        Descriptor qmd{};
+        bool overwritten{}; ///< A release of the same entry writes into it after
+    };
+
+    /// A signal sent at `position` that waits to be valued (`inline_qmd` if `has_inline`).
+    struct WaitingSignal {
+        u64 position;
+        const void* memory; ///< Memory::Id of the address space it reads
+        GPUVAddr address;
+        u32 argument;
+        bool has_inline;
+        Descriptor inline_qmd;
+        u32 index; ///< TEST: of the signals of its entry
+    };
+
+    /// How an attempt to value a signal ended: valued, or taken back, to try again once the back
+    /// ran `retry_after`, or for good (the view loses its table).
+    struct Outcome {
+        bool valued;
+        std::optional<u64> retry_after;
+        Nx2AcquireStats::QmdLost lost;
+        u64 qmd{}; ///< TEST: the QMD it could not read
+    };
+
+    /// Signals that wait, at most: a back that far behind leaves the view to its next takeover.
+    static constexpr size_t MaxWaiting = 4096;
+
+    /// A signal the front can't value, its table lost: no release of it is noted, and the view
+    /// takes the back's table over once the back ran it.
+    void Unvalued(GpuSplit& split, Nx2AcquireStats::QmdLost lost) {
+        checks_unvalued = true; // TEST
+        if (RunAhead::enabled) [[unlikely]] {
+            // Its releases may write anywhere until the back ran it (GpuSplit::RunAheadReach).
+            split.NoteUnvaluedSignal(false);
+            if (RunAhead::stats) {
+                ++RunAhead::counters.unvalued;
+            }
+        }
+        Nx2AcquireStats::NoteQmdSignal(lost, WhatSent(split, lost));
+    }
+
+    /// TEST: what sent the last write the view could not read past, for `lost`.
+    [[nodiscard]] static UnplacedKind WhatSent(const GpuSplit& split,
+                                               Nx2AcquireStats::QmdLost lost) {
+        return lost == Nx2AcquireStats::QmdLost::Mappings ? split.LastMappingKind()
+                                                          : split.LastUnplacedKind();
+    }
+
+    /// TEST (EDEN_NX2_GPU_PROFILE / EDEN_NX2_ACQUIRE_VERIFY): what wrote the QMD a signal sent at
+    /// `position` waits for, as it was sent: a release into it the front noted, else the engine
+    /// method whose entry ends at the write's position, else another entry (a CPU function, a
+    /// deferred call). Logs the first.
+    template <typename Memory>
+    void NoteWaitWriter(const GpuSplit& split, const Memory& memory, u64 position,
+                        const Outcome& outcome) const {
+        const u64 target = *outcome.retry_after;
+        std::string writer;
+        if (const auto device = memory.Device(outcome.qmd)) {
+            for (u64 offset = 0; offset < sizeof(Descriptor) && writer.empty(); offset += 4) {
+                const auto queued = split.QueuedSemaphoreWriteAt(*device + offset);
+                if (queued && queued->position == target) {
+                    writer = fmt::format("a release into word {}", offset / 4);
+                }
+            }
+        }
+        if (writer.empty()) {
+            writer = split.MethodEndingAt(target);
+        }
+        if (writer.empty()) {
+            writer = "another entry";
+        }
+        static u32 logged{};
+        if (logged < 16) {
+            ++logged;
+            LOG_INFO(HW_GPU,
+                     "QMD view: a signal waits for a write into the QMD at {:#x} by {}, sent {} "
+                     "ring words before it; the back is {} words behind",
+                     outcome.qmd, writer, position - target, split.Backlog());
+        }
+        Nx2AcquireStats::NoteQmdWaitWriter(writer);
+    }
+
+    /// The signal sent at `position` waits, first (`why`: what it waits for) or behind the others.
+    /// None of its releases is noted: they are placed once it is valued.
+    void Wait(GpuSplit& split, u64 position, const void* memory_id, GPUVAddr address, u32 argument,
+              const Descriptor* inline_qmd, std::optional<Nx2AcquireStats::QmdLost> why) {
+        checks_unvalued = true; // TEST
+        if (RunAhead::enabled) [[unlikely]] {
+            // Its releases are placed once it is valued, or stay unknown if it never is.
+            split.NoteUnvaluedSignal(true);
+            if (RunAhead::stats) {
+                ++RunAhead::counters.unvalued;
+            }
+        }
+        if (waiting.size() >= MaxWaiting) {
+            Nx2AcquireStats::NoteQmdLateLost(Nx2AcquireStats::QmdLost::TooMany,
+                                             waiting.size()); // TEST
+            synced = false;
+            ClearWaiting();
+            Nx2AcquireStats::NoteQmdSignal(Nx2AcquireStats::QmdLost::NotSynced); // TEST
+            return;
+        }
+        Nx2AcquireStats::NoteQmdWait(why, why ? WhatSent(split, *why) : UnplacedKind::Other);
+        WaitingSignal& signal = waiting.emplace_back();
+        signal.position = position;
+        signal.memory = memory_id;
+        signal.address = address;
+        signal.argument = argument;
+        signal.has_inline = inline_qmd != nullptr;
+        if (inline_qmd != nullptr) {
+            signal.inline_qmd = *inline_qmd;
+        }
+        if (checks_pending) {
+            // TEST: the back keeps what it reads for the signals of this entry from here on.
+            signal.index = entry_signals;
+            if (check_wait_position != position) {
+                check_wait_position = position;
+                check_first_waiting = entry_signals;
+            }
+        }
+    }
+
+    void ClearWaiting() {
+        if (RunAhead::enabled && !waiting.empty()) [[unlikely]] {
+            // Dropped unvalued: their releases stay unknown until the back ran them.
+            GpuSplit::Get().NoteWaitingSignalsDone(true);
+        }
+        waiting.clear();
+        late_reads.clear();
+        retry_after = 0;
+    }
+
+    /// Values the waiting signals that read `memory` in order, from the first, as long as the back
+    /// ran what the first waits for.
+    template <typename Memory>
+    void CatchUp(GpuSplit& split, const Memory& memory) {
+        while (!waiting.empty()) {
+            const WaitingSignal& first = waiting.front();
+            if (first.memory != memory.Id() || !split.Ran(retry_after)) {
+                return;
+            }
+            const Outcome outcome =
+                Attempt(split, memory, first.position, first.address, first.argument,
+                        first.has_inline ? &first.inline_qmd : nullptr, true);
+            if (outcome.retry_after) {
+                retry_after = *outcome.retry_after;
+                return;
+            }
+            if (!outcome.valued) {
+                Nx2AcquireStats::NoteQmdLateLost(outcome.lost, waiting.size()); // TEST
+                synced = false;
+                ClearWaiting();
+                return;
+            }
+            if (Nx2DrainCheck::g_enabled) {
+                // TEST: what it read, for the back to compare (CheckLateQmdReads).
+                late_checks.push_back({first.position, first.index, std::move(late_reads_read)});
+                late_reads_read.clear();
+                table_check_due = table_check_due || waiting.size() == 1;
+            }
+            waiting.pop_front();
+            retry_after = 0;
+            Nx2AcquireStats::NoteQmdLate(waiting.empty()); // TEST
+        }
+        // Every signal sent before the reads made late is valued: none of their releases waits.
+        late_reads.clear();
+        if (RunAhead::enabled) [[unlikely]] {
+            // Their releases are placed (Attempt, late): the split logs where they write.
+            split.NoteWaitingSignalsDone(false);
+        }
+    }
+
+    /// Runs the signal sent at `position` on the table as the back runs it, and notes what its
+    /// launches release, or places it if `late`. Takes it back where the front can't read a QMD
+    /// as the back reads it.
+    template <typename Memory>
+    Outcome Attempt(GpuSplit& split, const Memory& memory, u64 position, GPUVAddr address,
+                    u32 argument, const Descriptor* inline_qmd, bool late) {
+        using Lost = Nx2AcquireStats::QmdLost;
+        // The back finds the mappings every change sent before the signal made, and none after it.
+        const u64 mapping_change = split.LastMappingChange();
+        if (mapping_change > position) {
+            return {false, std::nullopt, Lost::MappedAfter};
+        }
+        if (!split.Ran(mapping_change)) {
+            return {false, mapping_change, Lost::Mappings};
+        }
+        releases.clear();
+        attempt_reads.clear();
+        late_reads_read.clear();                         // TEST
+        const size_t checked_reads = check_reads.size(); // TEST
+        std::optional<Outcome> failure;
+        const auto read = [&](u64 qmd_address, Descriptor& descriptor) {
+            if (!memory.IsMapped(qmd_address, sizeof(descriptor))) {
+                return false;
+            }
+            if (inline_qmd != nullptr && qmd_address == address) {
+                descriptor = *inline_qmd;
+            } else if (const auto unread =
+                           ReadDescriptor(split, memory, qmd_address, position, descriptor)) {
+                failure = unread;
+                return false; // Stops the scheduling, which is taken back
+            }
+            // A release this signal ran before writes into the QMD.
+            for (const Release& earlier : releases) {
+                if (earlier.address + 16 > qmd_address &&
+                    earlier.address < qmd_address + sizeof(descriptor)) {
+                    failure = Outcome{false, std::nullopt, Lost::ReleasedInto};
+                    return false;
+                }
+            }
+            attempt_reads.push_back(qmd_address);
+            if (Nx2DrainCheck::g_enabled) {
+                // TEST: what the back reads too.
+                (late ? late_reads_read : check_reads).push_back({qmd_address, descriptor});
+            }
+            return true;
+        };
+        const auto release = [&](u64 destination, u32 payload, u32 flags) {
+            const bool four_words = (flags >> 30) == 0;
+            if (!memory.IsMapped(destination, four_words ? 16 : sizeof(u32))) {
+                return false;
+            }
+            releases.push_back({destination, payload, flags});
+            return true;
+        };
+        scheduler.BeginAttempt();
+        scheduler.Signal(address, argument, read, release, [](const Descriptor&) { return true; });
+        if (!failure && late && ReleasesIntoLateReads()) {
+            failure = Outcome{false, std::nullopt, Lost::LateReleasedInto};
+        }
+        if (failure) {
+            scheduler.RollbackAttempt();
+            check_reads.resize(checked_reads); // TEST: tried again later
+            return *failure;
+        }
+        scheduler.CommitAttempt();
+        if (late) {
+            for (const u64 read_address : attempt_reads) {
+                late_reads.insert(read_address >> 8);
+            }
+            for (const Release& done : releases) {
+                memory.NoteWriteAt(split, done.address, (done.flags >> 30) == 0 ? 16 : 4, position);
+            }
+        } else {
+            for (const Release& noted : releases) {
+                NoteRelease(split, memory, noted.address, noted.payload, noted.flags);
+            }
+        }
+        return {true, std::nullopt, Lost::NotSynced};
+    }
+
+    /// Late: whether a release of the signal writes a QMD it read, or one a signal valued late
+    /// before read. The back may have run the release before the front read that QMD.
+    [[nodiscard]] bool ReleasesIntoLateReads() const {
+        for (const Release& done : releases) {
+            const u64 first = done.address >> 8;
+            const u64 last = (done.address + 15) >> 8;
+            for (const u64 read_address : attempt_reads) {
+                if ((read_address >> 8) == first || (read_address >> 8) == last) {
+                    return true;
+                }
+            }
+            if (late_reads.contains(first) || late_reads.contains(last)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Reads into `descriptor` the QMD at `qmd_address` as the back read it, or will, running the
+    /// signal sent at `position`, or tells why the front can't.
+    template <typename Memory>
+    [[nodiscard]] std::optional<Outcome> ReadDescriptor(const GpuSplit& split, const Memory& memory,
+                                                        GPUVAddr qmd_address, u64 position,
+                                                        Descriptor& descriptor) const {
+        using Lost = Nx2AcquireStats::QmdLost;
+        const auto device = memory.Device(qmd_address);
+        if (!device || memory.GpuWritten(*device, sizeof(descriptor))) {
+            return Outcome{false, std::nullopt, Lost::GpuWritten};
+        }
+        // The last write sent there, placed or not (the inline write covers the whole QMD).
+        const u64 target = memory.WritesTarget(split, qmd_address, sizeof(descriptor));
+        const Lost lost = target == split.LastUnplacedWrite() ? Lost::Unplaced : Lost::Pending;
+        if (target > position) {
+            // Sent after the signal (it waited): memory may hold it, the back read what was before.
+            return Outcome{false, std::nullopt, Lost::WrittenAfter, qmd_address};
+        }
+        if (split.Ran(target)) {
+            // Read only once Ran saw the back past the write: the back stores its position after
+            // the writes before it. A read before that look may be older than the write. The back
+            // can run a write published shortly before the signal (to an idle back, after a few
+            // words) while the front reads, and store its position before the front looks.
+            memory.Read(qmd_address, descriptor.data(), sizeof(descriptor));
+            return std::nullopt;
+        }
+        if (const InlineWrite* written = QueuedInlineWrite(split, *device);
+            written != nullptr && written->position == target) {
+            descriptor = written->qmd;
+            Nx2AcquireStats::NoteQmdInlineRead(); // TEST
+            return std::nullopt;
+        }
+        if (RunAhead::enabled) [[unlikely]] {
+            // An inline upload still queued wrote the whole QMD last (EDEN_NX2_RUNAHEAD): the
+            // back finds its words there, as the front sent them.
+            if (const KeptUpload* kept = QueuedUpload(split, memory.Id(), qmd_address);
+                kept != nullptr && kept->position == target) {
+                std::memcpy(descriptor.data(), kept->bytes.data() + (qmd_address - kept->address),
+                            sizeof(descriptor));
+                if (RunAhead::stats) {
+                    ++RunAhead::counters.upload_qmds;
+                }
+                return std::nullopt;
+            }
+            if (RunAhead::stats && PartlyUploaded(memory.Id(), qmd_address, target)) {
+                ++RunAhead::counters.upload_rejects[3];
+            }
+            // EDEN_NX2_RUNAHEAD_QMD: the last write to the QMD is an upload still queued that
+            // covers part of it (games rewrite a few words of a QMD between dispatches). Where the
+            // last writes to the rest ran, memory holds the rest as the back will find it: nothing
+            // sent after the upload wrote anywhere in the QMD (it is the last write there), and
+            // the exact placement tells the parts within a granule apart.
+            if (RunAhead::qmd_patch &&
+                ReadPatched(split, memory, qmd_address, target, descriptor)) {
+                if (RunAhead::stats) {
+                    ++RunAhead::counters.upload_qmds;
+                    ++RunAhead::counters.upload_qmds_partial;
+                }
+                return std::nullopt;
+            }
+            if (const KeptUpload* part = RunAhead::qmd && !RunAhead::qmd_patch
+                                             ? PartUpload(split, memory.Id(), qmd_address, target)
+                                             : nullptr;
+                part != nullptr) {
+                const GPUVAddr qmd_end = qmd_address + sizeof(descriptor);
+                const GPUVAddr begin = (std::max)(part->address, qmd_address);
+                const GPUVAddr end = (std::min<GPUVAddr>)(part->address + part->size, qmd_end);
+                const bool before_ran =
+                    begin == qmd_address ||
+                    split.Ran(memory.WritesTarget(split, qmd_address, begin - qmd_address));
+                const bool after_ran =
+                    end == qmd_end || split.Ran(memory.WritesTarget(split, end, qmd_end - end));
+                if (before_ran && after_ran) {
+                    memory.Read(qmd_address, descriptor.data(), sizeof(descriptor));
+                    std::memcpy(reinterpret_cast<u8*>(descriptor.data()) + (begin - qmd_address),
+                                part->bytes.data() + (begin - part->address), end - begin);
+                    if (RunAhead::stats) {
+                        ++RunAhead::counters.upload_qmds;
+                        ++RunAhead::counters.upload_qmds_partial;
+                    }
+                    return std::nullopt;
+                }
+            }
+        }
+        return Outcome{false, target, lost, qmd_address};
+    }
+
+    /// EDEN_NX2_RUNAHEAD: an inline upload (NoteUpload) the back has not run yet.
+    struct KeptUpload {
+        const void* memory{};
+        GPUVAddr address{};
+        u64 size{};
+        u64 position{};
+        u64 prior{}; ///< The last write over its granules before it (~0: unknown)
+        std::array<u8, MaxUploadBytes> bytes{};
+    };
+
+    /// EDEN_NX2_RUNAHEAD_QMD_PATCH: the QMD at `qmd_address`, whose last write (at `target`) is a
+    /// kept upload over part of it, as the back will find it: walking back from that upload through
+    /// the uploads that were each the last write over the QMD's granule before the next, until one
+    /// covers the whole QMD or the writes before the first ran (memory holds those), then those
+    /// uploads' words on top in the order sent. A QMD is one 256-byte granule (its address is the
+    /// register shifted by 8), so `prior` covers all of it.
+    template <typename Memory>
+    [[nodiscard]] bool ReadPatched(const GpuSplit& split, const Memory& memory,
+                                   GPUVAddr qmd_address, u64 target, Descriptor& descriptor) const {
+        const GPUVAddr qmd_end = qmd_address + sizeof(Descriptor);
+        std::array<const KeptUpload*, 8> chain{};
+        size_t count = 0;
+        bool covered = false;
+        for (u64 last = target; count < chain.size();) {
+            const KeptUpload* upload = PartUpload(split, memory.Id(), qmd_address, last);
+            if (upload == nullptr || upload->prior == ~u64{0}) {
+                return false;
+            }
+            chain[count++] = upload;
+            covered = upload->address <= qmd_address && upload->address + upload->size >= qmd_end;
+            if (covered || split.Ran(upload->prior)) {
+                break;
+            }
+            last = upload->prior;
+        }
+        if (count == 0 || !(covered || split.Ran(chain[count - 1]->prior))) {
+            return false;
+        }
+        if (!covered) {
+            memory.Read(qmd_address, descriptor.data(), sizeof(descriptor));
+        }
+        auto* const bytes = reinterpret_cast<u8*>(descriptor.data());
+        for (size_t i = count; i-- > 0;) {
+            const KeptUpload& upload = *chain[i];
+            const GPUVAddr begin = (std::max)(upload.address, qmd_address);
+            const GPUVAddr end = (std::min<GPUVAddr>)(upload.address + upload.size, qmd_end);
+            std::memcpy(bytes + (begin - qmd_address),
+                        upload.bytes.data() + (begin - upload.address), end - begin);
+        }
+        return true;
+    }
+
+    /// EDEN_NX2_RUNAHEAD_STATS: whether the last write to the QMD at `qmd_address` (at `target`) is
+    /// a kept upload that covers only part of it.
+    [[nodiscard]] bool PartlyUploaded(const void* memory, GPUVAddr qmd_address, u64 target) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (kept.memory == memory && kept.position == target &&
+                kept.address < qmd_address + sizeof(Descriptor) &&
+                qmd_address < kept.address + kept.size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// EDEN_NX2_RUNAHEAD_QMD: the kept upload the back has not run yet that wrote last (at
+    /// `target`) over part of the QMD at `qmd_address`.
+    [[nodiscard]] const KeptUpload* PartUpload(const GpuSplit& split, const void* memory,
+                                               GPUVAddr qmd_address, u64 target) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (split.Ran(kept.position)) {
+                break; // The back wrote it, and the older ones
+            }
+            if (kept.memory == memory && kept.position == target &&
+                kept.address < qmd_address + sizeof(Descriptor) &&
+                qmd_address < kept.address + kept.size) {
+                return &kept;
+            }
+        }
+        return nullptr;
+    }
+
+    /// The newest kept upload of `memory` the back has not run yet that covers the QMD at
+    /// `qmd_address`.
+    [[nodiscard]] const KeptUpload* QueuedUpload(const GpuSplit& split, const void* memory,
+                                                 GPUVAddr qmd_address) const {
+        const size_t count = (std::min)(uploads_count, uploads.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const KeptUpload& kept = uploads[(uploads_count - i) % uploads.size()];
+            if (split.Ran(kept.position)) {
+                break; // The back wrote it, and the older ones
+            }
+            if (kept.memory == memory && kept.address <= qmd_address &&
+                qmd_address - kept.address + sizeof(Descriptor) <= kept.size) {
+                return &kept;
+            }
+        }
+        return nullptr;
+    }
+
+    /// The last inline QMD sent to the QMD at `device` that the back has not written yet.
+    [[nodiscard]] const InlineWrite* QueuedInlineWrite(const GpuSplit& split, u64 device) const {
+        const size_t count = (std::min)(inline_writes_count, inline_writes.size());
+        for (size_t i = 1; i <= count; ++i) {
+            const InlineWrite& written =
+                inline_writes[(inline_writes_count - i) % inline_writes.size()];
+            if (split.Ran(written.position)) {
+                break; // The back wrote it, and the older ones
+            }
+            if (written.device == device) {
+                return written.overwritten ? nullptr : &written;
+            }
+        }
+        return nullptr;
+    }
+
+    /// A release the back runs with the entry just sent, as ProcessNativeMethod's: what the word
+    /// holds once the back ran it.
+    template <typename Memory>
+    void NoteRelease(GpuSplit& split, const Memory& memory, GPUVAddr address, u32 payload,
+                     u32 flags) {
+        const bool four_words = (flags >> 30) == 0;
+        const bool reduction = (flags & (1U << 26)) != 0;
+        const bool maximum = !reduction && !four_words && (flags & (1U << 19)) != 0;
+        const u64 size = four_words ? 16 : sizeof(u32);
+        const auto device = memory.Device(address);
+        // The word a reduction or a maximum combines the payload with, before this write.
+        std::optional<u32> base;
+        bool window_base = false;
+        if (device && (reduction || maximum)) {
+            base = WordAt(split, memory, address, *device, &window_base);
+            RunAhead::counters.window_bases += window_base && RunAhead::stats ? 1 : 0;
+        }
+        memory.NoteWrite(split, address, size);
+        if (!device) {
+            return;
+        }
+        // An inline QMD this entry wrote before is no longer what memory holds there.
+        for (size_t i = 1; i <= (std::min)(inline_writes_count, inline_writes.size()); ++i) {
+            InlineWrite& written = inline_writes[(inline_writes_count - i) % inline_writes.size()];
+            if (written.position != split.Position()) {
+                break;
+            }
+            if (written.device < *device + size && *device < written.device + sizeof(Descriptor)) {
+                written.overwritten = true;
+            }
+        }
+        // TEST: what was noted (EDEN_NX2_DRAIN_CHECK, EDEN_NX2_GPU_PROFILE /
+        // EDEN_NX2_ACQUIRE_VERIFY).
+        const auto check = [this](u64 word, u32 value, bool known, bool at_least) {
+            using Note = Nx2AcquireStats::QmdNote;
+            Nx2AcquireStats::NoteQmdNote(!known     ? Note::Unknown
+                                         : at_least ? Note::AtLeast
+                                                    : Note::Exact);
+            if (checks_pending) {
+                checks.push_back({word, value, known, at_least, nullptr});
+            }
+        };
+        SemRecorder::Add({.kind = "front-qmd",
+                          .address = *device,
+                          .gpu = address,
+                          .value = payload,
+                          .position = split.Position(),
+                          .flags = flags});
+        if (reduction) {
+            const bool is_signed = ((flags >> 24) & 1) != 0;
+            const u32 value =
+                base ? Tegra::ReduceSemaphore((flags >> 20) & 7, is_signed, *base, payload) : 0;
+            split.NoteSemaphoreWrite(*device, value, base.has_value(), GpuSplit::Landing::AtRun,
+                                     false, GpuSplit::SemaphoreWriter::QmdReduction, window_base);
+            check(*device, value, base.has_value(), false);
+        } else if (four_words) {
+            // The payload as 64 bits, a timestamp after it.
+            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
+            split.NoteSemaphoreWrite(*device + 4, 0, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
+            check(*device, payload, true, false);
+            check(*device + 4, 0, true, false);
+        } else if (maximum) {
+            // Whatever the word held, it holds the payload at least.
+            const u32 value = base ? (std::max)(*base, payload) : payload;
+            split.NoteSemaphoreWrite(*device, value, true, !base.has_value(),
+                                     GpuSplit::SemaphoreWriter::QmdReduction, window_base);
+            check(*device, value, true, !base.has_value());
+        } else {
+            split.NoteSemaphoreWrite(*device, payload, true, GpuSplit::Landing::Fenced, false,
+                                     GpuSplit::SemaphoreWriter::QmdRelease);
+            check(*device, payload, true, false);
+        }
+        Nx2AcquireStats::NoteRelease(*device, Nx2AcquireStats::Releaser::Qmd);
+        if (four_words) {
+            Nx2AcquireStats::NoteRelease(*device + 4, Nx2AcquireStats::Releaser::Qmd);
+        }
+    }
+
+    /// The word the back finds at `address` (`device`) when it runs the entry just sent, where
+    /// the front knows it: the last release sent there, if nothing sent since may have written
+    /// over it, else memory, once the back ran every write sent there before the entry. The entry
+    /// itself is held unpublished (PublishHold): an idle back that ran it before this read would
+    /// leave its own increment in memory, and the front would count it twice.
+    ///
+    /// EDEN_NX2_RUNAHEAD_LANDINGS: in a landing window a reduction or maximum lands as a fence
+    /// operation instead, after every write to the word before it: the last release noted there
+    /// when the window's order tells it (EDEN_NX2_RUNAHEAD_WINDOW_BASE, GpuSplit::WindowBase:
+    /// `window_base` set), and memory only while no landing the back made a fence operation is
+    /// pending there (one the front did not note: a QMD signal it could not value).
+    template <typename Memory>
+    [[nodiscard]] std::optional<u32> WordAt(const GpuSplit& split, const Memory& memory,
+                                            GPUVAddr address, u64 device,
+                                            bool* window_base = nullptr) const {
+        // The back reads the syncpoint shim from the syncpoints.
+        if (memory.InSyncpointShim(address, sizeof(u32)) ||
+            Tegra::Nx2MirrorShadow::Get().Diverts(device)) {
+            return std::nullopt;
+        }
+        // The last write sent to the word's granule, placed or not.
+        const u64 target = memory.WritesTarget(split, address, sizeof(u32));
+        if (const auto queued = split.QueuedSemaphoreWriteAt(device)) {
+            if (queued->known && !queued->at_least && !queued->fenced &&
+                queued->position >= target) {
+                return queued->payload;
+            }
+            if (RunAhead::window_base && RunAhead::landings) [[unlikely]] {
+                const auto base =
+                    split.WindowBase(device, target, memory.GpuWritten(device, sizeof(u32)));
+                if (base && window_base != nullptr) {
+                    *window_base = true;
+                }
+                return base;
+            }
+            return std::nullopt;
+        }
+        if (!split.MemoryHoldsBase(device, target, memory.GpuWritten(device, sizeof(u32)))) {
+            return std::nullopt;
+        }
+        return memory.ReadWord(address);
+    }
+
+    Tegra::NativeQmdScheduler scheduler{Tegra::NativeQmdScheduler::OwnTable{}};
+    /// The table the engines of every channel share, which the back's scheduling uses.
+    Tegra::NativeQmdScheduler back_table;
+    std::vector<Release> releases;
+    std::vector<u64> attempt_reads; ///< The QMDs the attempt read
+    bool synced{};
+    /// Signals that wait to be valued, oldest first; the first may be once the back ran
+    /// retry_after. late_reads: the granules of the QMDs read late since the waiting began.
+    std::deque<WaitingSignal> waiting;
+    u64 retry_after{};
+    std::unordered_set<u64> late_reads;
+    /// TEST (EDEN_NX2_DRAIN_CHECK): the entry the last signal came with and its signals before
+    /// it; the entry whose signals wait and the first that waits there, for TakeChecks; what the
+    /// last late attempt read; the signals valued late since TakeChecks; a table copy is due.
+    u64 entry_position{};
+    u32 entry_signals{};
+    u64 check_wait_position{};
+    u32 check_first_waiting{};
+    std::vector<Nx2DrainCheck::QmdRead> late_reads_read;
+    std::vector<Nx2DrainCheck::LateQmdRead> late_checks;
+    bool table_check_due{};
+    /// The last inline QMDs sent, oldest first from inline_writes_count on: a back a millisecond
+    /// behind has some ten to write, a few times that in long frames.
+    std::array<InlineWrite, 256> inline_writes{};
+    size_t inline_writes_count{};
+    /// EDEN_NX2_RUNAHEAD: the last inline uploads sent (NoteUpload), oldest first from
+    /// uploads_count on.
+    /// About as many uploads as the back runs behind the front (one patch per dispatch): the walk
+    /// back through a QMD's patches (ReadPatched) needs the older ones still here.
+    std::array<KeptUpload, 64> uploads{};
+    size_t uploads_count{};
+    /// TEST (EDEN_NX2_DRAIN_CHECK): see TakeChecks.
+    std::vector<Nx2DrainCheck::QmdRelease> checks;
+    std::vector<Nx2DrainCheck::QmdRead> check_reads;
+    u64 table_checks{};
+    bool checks_pending{};
+    bool checks_unvalued{};
+};
+
+} // namespace VideoCommon

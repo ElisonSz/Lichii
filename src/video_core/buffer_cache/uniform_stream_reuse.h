@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -31,13 +32,30 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     { runtime.CurrentTick() } -> std::convertible_to<u64>;
 };
 
+[[nodiscard]] inline bool UniformStreamReuseSwitch() {
+    const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
+    return value == nullptr || value[0] != '0';
+}
+
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
+/// A plain flag: checked for every uniform buffer of every draw, where a function's static is
+/// checked for its initialization on every call (MSVC reads a thread-local for it).
+inline bool g_uniform_stream_reuse = UniformStreamReuseSwitch();
+
+/// TEST: EDEN_NX2_UBO_COMPARE=0 gathers every buffer into scratch before the compare, as before
+/// the compare in place, so one build measures both (EDEN_NX2_UBO_STATS=1 times the binds).
+inline bool g_uniform_compare_in_place = true;
+
+/// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
+/// nx2_switches.txt, so a switch set only there takes effect from that point on.
+inline void ReadUniformStreamReuseSwitch() {
+    g_uniform_stream_reuse = UniformStreamReuseSwitch();
+    const char* const compare = std::getenv("EDEN_NX2_UBO_COMPARE");
+    g_uniform_compare_in_place = compare == nullptr || compare[0] != '0';
+}
+
 [[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+    return g_uniform_stream_reuse;
 }
 
 template <class Ref>
@@ -119,30 +137,40 @@ template <class Runtime, class DeviceMemory>
         slot.tick = runtime.CurrentTick();
         return true;
     }
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
-
-    const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+    // Guest memory in one piece of host memory (most of these buffers lie within a page) is
+    // compared where it is; other ranges are gathered into scratch first.
+    const u8* guest = nullptr;
+    if constexpr (requires { device_memory.GetSpan(device_addr, size_t{size}); }) {
+        if (g_uniform_compare_in_place) {
+            guest = device_memory.GetSpan(device_addr, size_t{size});
+        }
+    }
+    if (guest == nullptr) {
+        device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+        guest = reuse.scratch.data();
+    }
+    const bool same_bytes = slot.size == size && std::memcmp(slot.bytes.data(), guest, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         slot.misses = 0;
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
+    if (!same_bytes) {
+        // The slot takes the bytes first and the stream gets the slot's: the guest may write its
+        // memory meanwhile, and the slot must hold what its allocation holds.
+        slot.size = size;
+        std::memcpy(slot.bytes.data(), guest, size);
+    }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
+    std::memcpy(span.data(), slot.bytes.data(), size);
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
     if (same_bytes) {
         slot.misses = 0;
-    } else {
-        slot.size = size;
-        std::memcpy(slot.bytes.data(), scratch, size);
-        if (++slot.misses >= Reuse::MissStreak) {
-            slot.misses = 0;
-            slot.direct = Reuse::DirectBinds;
-        }
+    } else if (++slot.misses >= Reuse::MissStreak) {
+        slot.misses = 0;
+        slot.direct = Reuse::DirectBinds;
     }
     return true;
 }
@@ -178,6 +206,62 @@ template <class Runtime>
         UniformStreamReuseState<typename Runtime::StreamUniformRef>().slots[stage][index];
     runtime.RebindStreamUniform(slot.ref, size);
     return true;
+}
+
+/// EDEN_NX2_DRAWX_KEEP_AUDIT: what RebindKeptUniform does with a range, by the first of its tests
+/// that fails, and whether guest memory still holds the bytes of the allocation it would bind.
+enum class KeptUniform : u8 {
+    Held,             ///< Bound; guest memory holds the allocation's bytes
+    Stale,            ///< Bound; guest memory changed since (a write the keep rule missed)
+    RefusedSize,      ///< Refused: another size (another pipeline), or nothing streamed
+    RefusedAddress,   ///< Refused: the slot last streamed another address
+    RefusedTick,      ///< Refused: another command buffer; guest memory holds the bytes
+    RefusedTickStale, ///< Refused: another command buffer; guest memory changed (a missed write)
+    Count,
+};
+
+struct KeptUniformAudit {
+    KeptUniform result{};
+    u32 offset{}; ///< Stale ones: the first byte that differs
+    u32 was{};    ///< ... the allocation's word there (the aligned word holding that byte)
+    u32 now{};    ///< ... guest memory's word there
+};
+
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] KeptUniformAudit AuditKeptUniform(Runtime& runtime, DeviceMemory& device_memory,
+                                                size_t stage, u32 index, u64 device_addr,
+                                                u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+        index >= Reuse::NumSlots) {
+        return {.result = KeptUniform::RefusedSize};
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    const typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.size != size) {
+        return {.result = KeptUniform::RefusedSize};
+    }
+    if (slot.device_addr != device_addr) {
+        return {.result = KeptUniform::RefusedAddress};
+    }
+    const bool same_tick = slot.tick == runtime.CurrentTick();
+    device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+    u32 offset = 0;
+    while (offset < size && slot.bytes[offset] == reuse.scratch[offset]) {
+        ++offset;
+    }
+    if (offset == size) {
+        return {.result = same_tick ? KeptUniform::Held : KeptUniform::RefusedTick};
+    }
+    KeptUniformAudit audit{
+        .result = same_tick ? KeptUniform::Stale : KeptUniform::RefusedTickStale,
+        .offset = offset,
+    };
+    const u32 word = offset & ~3U;
+    const size_t bytes = (std::min<size_t>)(sizeof(u32), size - word);
+    std::memcpy(&audit.was, slot.bytes.data() + word, bytes);
+    std::memcpy(&audit.now, reuse.scratch.data() + word, bytes);
+    return audit;
 }
 
 /// EDEN_NX2_UBO_KEEP_VERIFY: whether guest memory still holds the bytes the slot's last

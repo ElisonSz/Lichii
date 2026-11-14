@@ -25,17 +25,23 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/wait_stats.h"
 
 namespace VideoCommon {
 
 class FenceBase {
 public:
     explicit FenceBase(bool is_stubbed_) : is_stubbed{is_stubbed_} {}
+
+    u64 sync_trace_id{}; // Diagnostic report identity, zero for ordinary fences.
 
     bool IsStubbed() const {
         return is_stubbed;
@@ -83,6 +89,9 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
+        const WaitStats::ReasonScope wait_reason{VideoCore::g_signaling_query_report_fence
+                                                     ? WaitStats::Reason::Query
+                                                     : WaitStats::Reason::Fence};
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
         // fence runs its operation at once, before the host GPU has run the work the report
@@ -93,6 +102,24 @@ public:
                                       ? Settings::IsGPULevelHigh()
                                       : Settings::IsGPUFenceBehaviorBalanced() ||
                                             Settings::IsGPUFenceBehaviorAccurate());
+        // EDEN_NX2_RUNAHEAD_LANDINGS: a guest-visible landing (RunAhead::LandingScope) in a landing
+        // window becomes an operation of this fence, or of the next one if this one is skipped,
+        // instead of running now: after the fence-flagged release an acquire went on before
+        // (GpuSplit::OpenLandingWindow). No fence is made for it, no work submitted.
+        const bool converted = !delay_fence && RunAhead::LandingScope::active &&
+                               RunAhead::landings && GpuSplit::Get().ConvertsLandings();
+        if (converted) [[unlikely]] {
+            // The entry's fenced writes include it (the front noted the release fenced).
+            func = [operation = std::move(func),
+                    token = GpuSplit::Get().ConvertedLanding(RunAhead::LandingScope::device, false),
+                    entry = GpuSplit::Get().TrackFencedWrite()]() mutable {
+                if (RunAhead::landings_verify) {
+                    GpuSplit::CheckConvertedLanding(token);
+                }
+                operation();
+                entry.reset(); // Landed: the entry's fenced writes may complete
+            };
+        }
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -102,6 +129,12 @@ public:
         }
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+            if (converted) [[unlikely]] {
+                SyncOperation(std::move(func));
+                GpuSplit::Get().NoteLandingUncommitted();
+                rasterizer.InvalidateGPUCache();
+                return;
+            }
             func();
             rasterizer.InvalidateGPUCache();
             return;
@@ -110,26 +143,33 @@ public:
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         TFence new_fence = CreateFence(!should_flush);
+        if (SyncTrace::enabled) {
+            new_fence->sync_trace_id = SyncTrace::current_report;
+        }
         if constexpr (can_async_check) {
             guard.lock();
         }
         {
             std::scoped_lock lock{uncommitted_guard};
-            if (delay_fence) {
+            if (delay_fence || converted) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
+            // A list the fencing thread ran, with the capacity it grew to (EDEN_NX2_BACKX_OPS's
+            // reuse, which nx2 does always), else a new one.
             if (!spare_operations.empty()) {
                 uncommitted_operations = std::move(spare_operations.back());
                 spare_operations.pop_back();
+                BackX::Count(BackX::Counter::OpsReused);
             } else {
                 uncommitted_operations = OperationList{}; // moved-from: make it empty explicitly
                 uncommitted_operations.reserve(64);
+                BackX::Count(BackX::Counter::OpsAllocated);
             }
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
-        if (!delay_fence) {
+        if (!delay_fence && !converted) {
             func();
         }
         fences.push(std::move(new_fence));
@@ -161,6 +201,8 @@ public:
         }
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
+        // The guest waits on host values (nvhost event waits): a landing.
+        const RunAhead::LandingScope landing_scope;
         SignalFence(std::move(func));
     }
 
@@ -259,6 +301,7 @@ private:
 
     void ReleaseThreadFunc(std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPUFencingThread");
+        const WaitStats::ThreadScope wait_thread{WaitStats::Thread::Fencing};
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
 
@@ -298,14 +341,23 @@ private:
                 }
                 take_front();
             }
+            if (SyncTrace::enabled) {
+                SyncTrace::Mark(batch.front().fence->sync_trace_id, SyncTrace::W0);
+            }
             if (!batch.front().fence->IsStubbed()) {
                 WaitFence(batch.front().fence);
+            }
+            if (SyncTrace::enabled) {
+                SyncTrace::Mark(batch.front().fence->sync_trace_id, SyncTrace::W1);
             }
             {
                 std::unique_lock lock(guard);
                 while (batch.size() < MaxBatch && !fences.empty() &&
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
+                    if (SyncTrace::enabled) {
+                        SyncTrace::BatchObserved(batch.back().fence->sync_trace_id);
+                    }
                 }
             }
             if (!batch.empty()) {
@@ -341,10 +393,13 @@ private:
                 VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             }
             {
+                // The emptied lists go back to SignalFence, unless one grew past what is worth
+                // keeping (a burst of operations).
                 std::scoped_lock lock{uncommitted_guard};
                 for (Released& released : batch) {
-                    if (spare_operations.size() < MaxSpareOperationLists &&
-                        released.operations.capacity() != 0) {
+                    const size_t capacity = released.operations.capacity();
+                    if (spare_operations.size() < MaxSpareOperationLists && capacity != 0 &&
+                        capacity <= MaxSpareOperations) {
                         spare_operations.push_back(std::move(released.operations));
                     }
                 }
@@ -368,6 +423,8 @@ private:
     static constexpr u8 TextureFlushes = 1;
     static constexpr u8 BufferFlushes = 2;
     static constexpr size_t MaxSpareOperationLists = 32;
+    /// Capacity of a list worth keeping (EDEN_NX2_BACKX_OPS's recycler kept up to 4096).
+    static constexpr size_t MaxSpareOperations = 4096;
 
     /// committed: what CommitAsyncFlushes returned for this fence.
     void PopAsyncFlushes(u8 committed) {

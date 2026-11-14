@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <new>
 
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/nx2_map_stats.h"
 #include "common/thread.h"
 #endif
 
@@ -27,6 +29,13 @@ DeviceMemory::DeviceMemory()
     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
              VirtualReserveSize} {
 #ifdef _WIN32
+    // EDEN_NX2_ZERO_TRIM=0 (comparisons): no trim passes, so pages the guest cleared stay in the
+    // working set and a later touch of them takes no page fault.
+    if (const char* const value = std::getenv("EDEN_NX2_ZERO_TRIM");
+        value != nullptr && value[0] == '0') {
+        LOG_INFO(HW_Memory, "EDEN_NX2_ZERO_TRIM=0: zero-page trimming is off");
+        return;
+    }
     zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
 #endif
 }
@@ -37,8 +46,9 @@ DeviceMemory::~DeviceMemory() = default;
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
 // A pass comes every 5 s while they keep turning up, backing off to once every 5 minutes: after
-// boot most passes trim 1-2 MiB for about a second of work. It waits out bulk mapping (loads,
-// spawns), whose map calls stalled 10-14 ms while a pass ran.
+// boot most passes trim 1-2 MiB for about a second of work (in game a pass finds a few MiB but
+// walks the whole working set, ~1.3 s on this thread). It waits out bulk mapping (loads, spawns),
+// whose map calls stalled 10-14 ms while a pass ran, and gives way to a guest that maps or unmaps.
 void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     using namespace std::chrono_literals;
     Common::SetCurrentThreadName("ZeroTrim");
@@ -90,6 +100,10 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+        if (Common::Nx2MapStats::Enabled()) {
+            LOG_INFO(HW_Memory, "Zero trim pass: {} MiB of {} MiB resident in {} ms",
+                     trimmed >> 20, resident >> 20, ms);
+        }
         if (trimmed < Busy) {
             interval = (std::min)(interval * 2, std::chrono::seconds{300});
             continue;

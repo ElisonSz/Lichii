@@ -289,6 +289,14 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
                                   device_address, cpu_address, size);
             }
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+            static const bool trace_memory = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+            if (trace_memory) {
+                LOG_INFO(Service_NVDRV,
+                         "Memory trace: guest map GPU {:#x}+{:#x} process {:#x} device {:#x} "
+                         "address-space {} map-serial {}",
+                         gpu_address, size, cpu_address, device_address, gmmu->GetID(),
+                         gmmu->MapSerial());
+            }
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
@@ -303,7 +311,15 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
     }
     // The GPU thread may still be running command lists that use the range. Outside `mutex`, as
     // Nx2Map's GPU-thread work.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] {
+        gmmu->Unmap(gpu_address, size);
+        static const bool trace_memory = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+        if (trace_memory) {
+            LOG_INFO(Service_NVDRV,
+                     "Memory trace: guest unmap GPU {:#x}+{:#x} address-space {} map-serial {}",
+                     gpu_address, size, gmmu->GetID(), gmmu->MapSerial());
+        }
+    });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 

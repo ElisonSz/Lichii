@@ -22,7 +22,9 @@ namespace VideoCommon::GpuTrace {
 /// File: a 64-byte header, then one zstd stream of records. Each record is a RecordHeader followed
 /// by `size` payload bytes.
 inline constexpr std::array<char, 8> Magic{'L', 'X', 'G', 'T', 'R', 'A', 'C', 'E'};
-inline constexpr u32 FormatVersion = 1;
+/// 2: the pusher state holds its copy-engine and inline-to-memory registers (DmaPusher::
+/// dma_registers, inline_to_memory_registers) in place of the DMA semaphore's three words.
+inline constexpr u32 FormatVersion = 2;
 inline constexpr u64 PageBits = 12;
 inline constexpr u64 PageSize = u64{1} << PageBits;
 

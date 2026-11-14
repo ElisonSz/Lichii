@@ -25,6 +25,15 @@ public:
         elements[index].push_back(std::move(object));
     }
 
+    template <typename F>
+    void ForEach(F&& visitor) const {
+        for (const auto& bucket : elements) {
+            for (const auto& object : bucket) {
+                visitor(object);
+            }
+        }
+    }
+
 private:
     size_t index = 0;
     std::array<std::vector<T>, TICKS_TO_DESTROY> elements;

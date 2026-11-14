@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/bounded_store.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_reaper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -276,6 +277,23 @@ private:
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
+    PipelineDestroyStats destroy_stats;
+    std::array<GraphicsPipeline::CpuMemory, static_cast<size_t>(PipelineOrigin::Count)> cpu_memory;
+
+    bool defer_destruction{};
+    size_t deferred_count{};
+    void RetirePipeline(std::unique_ptr<GraphicsPipeline> pipeline, PipelineOrigin origin);
+    PipelineReaper<GraphicsPipeline> pipeline_reaper{
+        [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+            const auto begin = PipelineDestroyTime::Clock::now();
+            const auto origin = pipeline->destroy_origin;
+            auto handles = pipeline->TakeHandles();
+            pipeline.reset();
+            PipelineDestroyTime time;
+            time.cpu_ms = PipelineDestroyTime::Milliseconds(begin);
+            DestroyPipelineHandles(handles, time);
+            destroy_stats.Add(origin, time);
+        }};
     /// IR of the pipelines whose job emits their SPIR-V
     QueuedIrBudget queued_ir{VideoCommon::DefaultShaderJobBudget()};
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;
@@ -307,6 +325,7 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
+    GraphicsStageInfoPool graphics_stage_pool;
     ShaderPools main_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;

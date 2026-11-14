@@ -10,6 +10,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
@@ -103,14 +105,16 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
     const VkDeviceSize needed{Common::AlignUp(size, alignment)};
     if (frame_reused) {
         frame_reused = false;
-        scheduler.Wait(frame_ticks[frame_index]);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::DescriptorChunk,
+                                           [&] { scheduler.Wait(frame_ticks[frame_index]); });
     }
     if (cursor + needed > chunk_capacity) {
         if (chunk_cursor + 1 < chunks_per_frame) {
             ++chunk_cursor;
         } else {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer frame exhausted, stalling on the GPU");
-            scheduler.Finish();
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::DescriptorChunk,
+                                               [&] { scheduler.Finish(); });
             chunk_cursor = 0;
             ++generation;
         }

@@ -25,6 +25,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -415,7 +417,9 @@ StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
 
 void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
-        scheduler.Finish(); // the old output may still be in use
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+            scheduler.Finish();
+        }); // the old output may still be in use
     }
     output_image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -489,7 +493,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                  model_preset != settings.preset;
     const bool reset = in.reset || options_changed;
     if (options_changed && !extent_changed) {
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                           [&] { scheduler.Finish(); });
     }
     if (extent_changed) {
         CreateOutput(in.upscale_size);

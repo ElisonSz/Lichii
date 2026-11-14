@@ -14,7 +14,7 @@
 
 namespace Dynarmic::Backend::X64 {
 
-#if defined(__linux__) && !defined(__ANDROID__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
 namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name);
 }  // namespace detail
@@ -23,7 +23,8 @@ void PerfMapRegister(T start, const void* end, std::string_view friendly_name) n
     detail::PerfMapRegister(std::bit_cast<const void*>(start), end, friendly_name);
 }
 void PerfMapClear();
-/// PERF_BUILDID_DIR is set (read once): blocks need a perf map name.
+/// PERF_BUILDID_DIR (Linux) or EDEN_NX2_JIT_MAP (Windows) is set (read once): blocks need a perf
+/// map name.
 bool PerfMapEnabled() noexcept;
 #else
 // Resolve to no-op (compiler thinks fmt has side effects)

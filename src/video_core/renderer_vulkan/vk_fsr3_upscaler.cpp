@@ -43,6 +43,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -456,7 +458,9 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
         in.upscale_size.width != upscale_extent.width ||
         in.upscale_size.height != upscale_extent.height) {
         if (output.image) {
-            scheduler.Finish(); // the old images may still be in use
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+                scheduler.Finish();
+            }); // the old images may still be in use
         }
         CreateResources(in.render_size, in.upscale_size);
     }

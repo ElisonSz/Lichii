@@ -18,12 +18,18 @@ CacheWriter::CacheWriter(std::filesystem::path file_, WriterOptions options_)
       thread{[this](std::stop_token stop) { Run(stop); }} {}
 
 CacheWriter::~CacheWriter() {
+    // TEST: distinguish the durable write/compaction from releasing the loaded program records.
+    const auto begin = Clock::now();
     if (!Drain(ShutdownDrain)) {
         std::scoped_lock lock{mutex};
         LOG_WARNING(Common_Filesystem, "{} shader cache records were not written to {}",
                     queued_records, Common::FS::PathToUTF8String(file));
     }
     thread.request_stop();
+    thread.join();
+    LOG_INFO(Render_Vulkan,
+             "Pipeline cache teardown: shader cache v2 writer drain and join took {:.1f} ms",
+             std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
 }
 
 void CacheWriter::Append(RecordKind kind, u64 key, std::span<const u8> payload) {

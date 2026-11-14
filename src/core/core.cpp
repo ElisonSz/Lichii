@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <atomic>
 #include <memory>
@@ -616,13 +617,23 @@ struct System::Impl {
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
+        // TEST: where shutdown spends its time (the frontend stops waiting after 10 s).
+        auto step_begin = std::chrono::steady_clock::now();
+        const auto step = [&step_begin](const char* name) {
+            const auto now = std::chrono::steady_clock::now();
+            LOG_INFO(Core, "Shutdown: {} took {:.1f} ms", name,
+                     std::chrono::duration<double, std::milli>(now - step_begin).count());
+            step_begin = now;
+        };
         if (gpu_core)
             gpu_core->NotifyShutdown();
+        step("stopping the GPU threads");
 
         stop_event.request_stop();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        step("suspending emulation");
         if (service_manager) {
             // Services on host threads that still wait for one on the guest cores give up (after
             // a close during the boot shader load, the guest cores never started).
@@ -630,7 +641,9 @@ struct System::Impl {
         }
         kernel.CloseServices();
         applet_manager.DropPendingProcess();
+        step("closing services");
         kernel.ShutdownCores();
+        step("shutting down the cores");
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
         Common::NoteShutdownProgress();
@@ -640,16 +653,21 @@ struct System::Impl {
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        step("services, file systems and loader");
         Common::NoteShutdownProgress();
         audio_core.reset();
+        step("audio");
         Common::NoteShutdownProgress();
         gpu_core.reset();
+        step("the GPU and renderer");
         Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        step("host1x and the CPU manager");
         debugger.reset();
         kernel.Shutdown();
+        step("the kernel");
         stop_event = {};
         Network::RestartSocketOperations();
 
@@ -660,6 +678,7 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+        step("network and glue registrations (shutdown complete)");
 
         // The guest RAM section keeps every page the game touched until it is destroyed (up to
         // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
@@ -768,7 +787,10 @@ struct System::Impl {
 
 System::System() : impl{std::make_unique<Impl>(*this)} {}
 
-System::~System() = default;
+System::~System() {
+    impl.reset();
+    VideoCore::WaitForAsyncTeardown();
+}
 
 CpuManager& System::GetCpuManager() {
     return impl->cpu_manager;

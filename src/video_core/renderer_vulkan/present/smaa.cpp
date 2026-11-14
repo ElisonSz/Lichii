@@ -23,6 +23,8 @@
 #include "video_core/host_shaders/smaa_neighborhood_blending_frag_spv.h"
 #include "video_core/host_shaders/smaa_neighborhood_blending_vert_spv.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 SMAA::SMAA(const Device& device, MemoryAllocator& allocator, size_t image_count, VkExtent2D extent)
@@ -208,7 +210,8 @@ void SMAA::UploadImages(const Device& device, Scheduler& scheduler) {
             }
         }
     });
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
 
     m_images_ready = true;
 }

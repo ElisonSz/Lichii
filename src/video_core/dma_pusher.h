@@ -221,6 +221,7 @@ public:
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
         subchannel_type[subchannel_id] = engine_type;
+        engine->bound_type = engine_type;
     }
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
@@ -255,9 +256,11 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
-    /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
-    void NoteDmaSemaphore(u32 method, u32 argument);
+    /// TEST: compares parsed command words with memory at their place on the back.
+    void CheckParsedEntry(GPUVAddr address, std::span<const CommandHeader> commands,
+                          bool skipped_writers, u32 path);
+    void ShadowEngineMethod(Engines::EngineTypes type, u32 method, u32 argument);
+    void NoteEngineWrites(Engines::EngineTypes type, u32 method);
     /// Copies the list's words from memory again, as of suspension count `now`, from entry
     /// `first_entry` on (the entries before it ran already). Waits for the list's copier job first.
     void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
@@ -284,6 +287,9 @@ public:
     /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
     /// `*pending` and pending_list_tick instead of waiting (the result is false then).
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
+    /// Takes a complete compute macro call's GPU-written parameters as slot placeholders when
+    /// a tagged dry run proves the front can leave their values to the host GPU.
+    bool TakeGpuWrittenListWords(const CommandListHeader& header);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
@@ -349,8 +355,13 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
-    /// The copy engine's semaphore address (high, low) and payload as sent (NoteDmaSemaphore).
-    std::array<u32, 3> dma_semaphore{};
+    /// The registers of the channel's copy engine (MaxwellDMA::RegisterCount) and its
+    /// inline-to-memory engine (KeplerMemory::Regs::NUM_REGS), as the methods sent left them
+    /// (ShadowEngineMethod): where the back's copies and uploads write.
+    static constexpr size_t DmaRegisterCount = 0x800;
+    static constexpr size_t InlineToMemoryRegisterCount = 0x7f;
+    std::array<u32, DmaRegisterCount> dma_registers{};
+    std::array<u32, InlineToMemoryRegisterCount> inline_to_memory_registers{};
 
     Engines::Puller puller;
     std::mutex sync_mutex;

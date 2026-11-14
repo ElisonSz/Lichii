@@ -17,6 +17,8 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 using PushConstants = std::array<u32, 4 + 2 + 2 + 1>;
@@ -84,7 +86,8 @@ void SGSR::UploadImages(const Device& device, Scheduler& scheduler) {
             for (auto& image : m_dynamic_images)
                 ClearColorImage(cmdbuf, *image.image);
         });
-        scheduler.Finish();
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                           [&] { scheduler.Finish(); });
         m_images_ready = true;
     }
 }

@@ -9,6 +9,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
@@ -182,7 +184,8 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
                 oldest = item.tick;
             }
         }
-        scheduler.Wait(oldest);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::MultiRangeRetire,
+                                           [&] { scheduler.Wait(oldest); });
         DrainRetired(scheduler);
     }
     retired.push_back(Retired{

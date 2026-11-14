@@ -143,7 +143,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
-/// The address range of every loaded module, sorted.
+/// Address ranges [first, second) of the modules loaded when sampling started, sorted.
 using Modules = std::vector<std::pair<DWORD64, DWORD64>>;
 
 Modules LoadedModules() {
@@ -173,6 +173,8 @@ bool InModule(const Modules& modules, DWORD64 address) {
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
 // stops once the stack pointer leaves the thread's stack.
+// A frame outside every module in `modules` (generated code) is recorded and ends the walk,
+// without asking the unwinder about it.
 unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
               const Modules& modules) {
     if (tib == nullptr) {
@@ -378,6 +380,46 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::fclose(out);
     }
+
+    // <out>.addr: the same stacks with module+offset frames, root first. Names from public
+    // symbols alone can be wrong (internal functions take the name before them); these frames
+    // symbolize offline with inlined functions and lines (llvm-symbolizer --relative-address,
+    // one byte back for a return address).
+    std::unordered_map<DWORD64, std::string> module_offsets;
+    const auto module_offset = [&module_offsets](DWORD64 frame) -> const std::string& {
+        const auto [entry, is_new] = module_offsets.try_emplace(frame);
+        if (is_new) {
+            HMODULE module_handle{};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(frame), &module_handle)) {
+                char module_path[MAX_PATH] = "?";
+                GetModuleFileNameA(module_handle, module_path, sizeof(module_path));
+                const char* const module_name = std::strrchr(module_path, '\\');
+                entry->second =
+                    fmt::format("{}+{:#x}", module_name != nullptr ? module_name + 1 : module_path,
+                                frame - reinterpret_cast<DWORD64>(module_handle));
+            } else {
+                entry->second = fmt::format("jit+{:#x}", frame);
+            }
+        }
+        return entry->second;
+    };
+    std::map<std::string, unsigned> folded_addresses;
+    for (const Sample& sample : samples) {
+        std::string line = targets[sample.thread].name;
+        for (unsigned i = sample.depth; i-- > 0;) {
+            line += ';';
+            line += module_offset(sample.frames[i]);
+        }
+        ++folded_addresses[line];
+    }
+    if (std::FILE* const addr_file = std::fopen((std::string{path} + ".addr").c_str(), "w")) {
+        for (const auto& [line, count] : folded_addresses) {
+            std::fprintf(addr_file, "%s %u\n", line.c_str(), count);
+        }
+        std::fclose(addr_file);
+    }
     return text;
 }
 
@@ -389,6 +431,9 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     if (targets.empty()) {
         return "no thread matches";
     }
+    // Walks stop at frames outside the modules loaded now (Walk; this was EDEN_NX2_SAMPLE_GUEST=1
+    // and is always on now). Read before any thread is suspended: the snapshot takes the loader
+    // lock. A failed snapshot leaves no ranges: every walk then stops at its first frame.
     const Modules modules = LoadedModules();
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);

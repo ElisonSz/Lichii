@@ -29,6 +29,7 @@
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
 #endif
+#include "video_core/renderer_vulkan/async_teardown.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -52,6 +53,8 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -155,69 +158,108 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
     return Device(*instance, physical_device, surface, dld);
 }
 
-RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
-                               Tegra::MaxwellDeviceMemoryManager& device_memory_,
-                               Tegra::GPU& gpu_,
-                               std::unique_ptr<Core::Frontend::GraphicsContext> context_)
-try
-    : RendererBase(emu_window, std::move(context_))
-    , device_memory(device_memory_)
-    , gpu(gpu_)
-    , library(OpenLibrary(context.get()))
-    , dld()
+// Dispatch tables must stay at fixed addresses: every Vulkan wrapper points into these owners.
+// This object contains no renderer, guest memory, graphics context or window references.
+struct RendererVulkan::DriverOwner {
+    DriverOwner(Core::Frontend::EmuWindow& window,
+                Core::Frontend::GraphicsContext* graphics_context)
+        : library{OpenLibrary(graphics_context)},
 #ifdef EGLANTINE_STREAMLINE
-    , streamline_started(Streamline::Start(render_window.GetWindowInfo().render_surface))
+          streamline_started{Streamline::Start(window.GetWindowInfo().render_surface)},
 #endif
-    // Create raw Vulkan instance first
-    , instance(CreateInstance(*library,
-                            dld,
-                            VK_API_VERSION_1_1,
-                            render_window.GetWindowInfo().type,
-                            Settings::values.renderer_debug.GetValue()))
-    // Create debug messenger if debug is enabled
-    , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
-                                                    : vk::DebugUtilsMessenger{})
-    // Create surface
-    , surface(CreateSurface(instance, render_window.GetWindowInfo()))
-    , device(CreateDevice(instance, dld, *surface))
-    , memory_allocator(device)
-    , state_tracker()
-    , scheduler(device, state_tracker)
-    , swapchain(PresentationSurface(),
-                device,
-                scheduler,
-               render_window.GetFramebufferLayout().width,
-               render_window.GetFramebufferLayout().height,
-               ChooseOutputFormat(device.GetPhysical(), *surface,
-                                  render_window.GetWindowInfo().render_surface))
-    , present_manager(instance,
-                      render_window,
-                      device,
-                      memory_allocator,
-                      scheduler,
-                      swapchain,
-                      surface)
-    , blit_swapchain(device_memory,
-                   device,
-                   memory_allocator,
-                   present_manager,
-                   scheduler,
-                   PresentFiltersForDisplay)
-    , blit_capture(device_memory,
-                   device,
-                   memory_allocator,
-                   present_manager,
-                   scheduler,
-                   PresentFiltersForDisplay)
-    , blit_applet(device_memory,
-                  device,
-                  memory_allocator,
-                  present_manager,
-                  scheduler,
-                  PresentFiltersForAppletCapture)
-    , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
+          instance{CreateInstance(*library, dld, VK_API_VERSION_1_1, window.GetWindowInfo().type,
+                                  Settings::values.renderer_debug.GetValue())},
+          debug_messenger{Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
+                                                          : vk::DebugUtilsMessenger{}},
+          surface{CreateSurface(instance, window.GetWindowInfo())},
+          device{CreateDevice(instance, dld, *surface)}, memory_allocator{device} {
+    }
+
+    ~DriverOwner() {
+        clock.Start();
+        LOG_INFO(Render_Vulkan, "Vulkan driver owner: destroying pipelines, device and instance");
+        device.DrainRetiredPipelines();
+        clock.Step("deferred pipeline handles");
+    }
+
+    // Last member to be destroyed logs after the instance and library have really gone away.
+    struct Completion {
+        ~Completion() {
+            LOG_INFO(Render_Vulkan, "Vulkan driver owner: destruction complete");
+        }
+    } completion;
+    VideoCommon::TeardownClock clock;
+    VideoCommon::TeardownMarker library_done{clock, "driver owner library and dispatch"};
+    std::shared_ptr<Common::DynamicLibrary> library;
+    vk::InstanceDispatch dld;
+#ifdef EGLANTINE_STREAMLINE
+    bool streamline_started;
+#endif
+    VideoCommon::TeardownMarker instance_done{clock, "driver owner instance"};
+    vk::Instance instance;
+    vk::DebugUtilsMessenger debug_messenger;
+    vk::SurfaceKHR surface;
+    VideoCommon::TeardownMarker device_done{clock, "driver owner device and allocator"};
+    Device device;
+    VideoCommon::TeardownMarker memory_done{clock, "driver owner memory allocator"};
+    MemoryAllocator memory_allocator;
+    bool retiring{};
+};
+
+RendererVulkan::DriverOwner* RendererVulkan::CreateDriverOwner(
+    Core::Frontend::EmuWindow& window, Core::Frontend::GraphicsContext* graphics_context) {
+    // Serialize admission before Streamline starts or the driver's shared cache is read.
+    AsyncTeardown::Get().Wait();
+    return new DriverOwner{window, graphics_context};
+}
+
+void RendererVulkan::DriverOwnerDeleter::operator()(DriverOwner* owner) const {
+    // All renderer members, including present workers and the swapchain, have already gone.
+    // Never let a VkSurfaceKHR or a callback into frontend state outlive the emulation thread.
+    owner->surface.reset();
+    owner->debug_messenger.reset();
+    const char* check = std::getenv("EDEN_NX2_PIPELINE_TEARDOWN_CHECK");
+    if (check != nullptr && check[0] == '1') {
+        ASSERT(!owner->surface && !owner->debug_messenger);
+        LOG_INFO(Render_Vulkan,
+                 "Async teardown check: surface 0, debug messenger 0 before handoff");
+    }
+    LOG_INFO(Render_Vulkan, "Vulkan teardown: window resources destroyed");
+    if (owner->retiring && AsyncTeardownEnabled()) {
+        LOG_INFO(Render_Vulkan, "Async Vulkan teardown: handing driver owner to background thread");
+        AsyncTeardown::Get().Retire(std::unique_ptr<DriverOwner>{owner});
+    } else {
+        delete owner;
+    }
+}
+
+RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
+                               Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
+                               std::unique_ptr<Core::Frontend::GraphicsContext> context_) try
+    : RendererBase(emu_window, std::move(context_)), device_memory(device_memory_), gpu(gpu_),
+      driver_owner(CreateDriverOwner(render_window, context.get())), library(driver_owner->library),
+      dld(driver_owner->dld), instance(driver_owner->instance),
+      debug_messenger(driver_owner->debug_messenger), surface(driver_owner->surface),
+      device(driver_owner->device), memory_allocator(driver_owner->memory_allocator),
+      state_tracker(), scheduler(device, state_tracker),
+      swapchain(PresentationSurface(), device, scheduler,
+                render_window.GetFramebufferLayout().width,
+                render_window.GetFramebufferLayout().height,
+                ChooseOutputFormat(device.GetPhysical(), *surface,
+                                   render_window.GetWindowInfo().render_surface)),
+      present_manager(instance, render_window, device, memory_allocator, scheduler, swapchain,
+                      surface),
+      blit_swapchain(device_memory, device, memory_allocator, present_manager, scheduler,
+                     PresentFiltersForDisplay),
+      blit_capture(device_memory, device, memory_allocator, present_manager, scheduler,
+                   PresentFiltersForDisplay),
+      blit_applet(device_memory, device, memory_allocator, present_manager, scheduler,
+                  PresentFiltersForAppletCapture),
+      rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker,
+                 scheduler)
 #ifdef HAS_LSFG
-    , frame_gen(memory_allocator, scheduler)
+      ,
+      frame_gen(memory_allocator, scheduler)
 #endif
 {
 
@@ -272,8 +314,11 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    teardown_clock.Start();
+    driver_owner->retiring = true;
     scheduler.RegisterOnSubmit([] {});
     void(device.GetLogical().WaitIdle());
+    teardown_clock.Step("device idle before renderer destruction");
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
@@ -336,7 +381,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         generated->present_spacing = spacing;
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
-        scheduler.Flush(*generated->render_ready);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Present,
+                                           [&] { scheduler.Flush(*generated->render_ready); });
         present_manager.Present(generated);
     }
 #endif
@@ -344,7 +390,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (const auto mark = scheduler.NextFrameMark(); mark != Scheduler::FrameMark::None) {
         scheduler.MarkFrameEnd(++trace_frame, mark);
     }
-    scheduler.Flush(*frame->render_ready);
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Present,
+                                       [&] { scheduler.Flush(*frame->render_ready); });
 #ifdef EGLANTINE_STREAMLINE
     {
         const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();
@@ -499,7 +546,8 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
     });
 
     // Ensure the copy is fully completed before saving the capture
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 
     // Copy backing image data to the capture buffer
     dst_buffer.Invalidate();
@@ -542,7 +590,8 @@ std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
     });
 
     // Ensure the copy is fully completed before writing the capture
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 
     // Swizzle image data to the capture buffer
     dst_buffer.Invalidate();

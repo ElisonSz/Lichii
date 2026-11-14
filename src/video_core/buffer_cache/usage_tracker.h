@@ -36,17 +36,7 @@ public:
             return;
         }
         tracked = false;
-        // Only Track sets words, and only in [set_begin, set_end): a buffer of hundreds of MiB
-        // bound in part cleared all its words (8 bytes a 4 KiB page) every frame.
-        std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
-                  pages.begin() + static_cast<std::ptrdiff_t>(set_end), 0ULL);
-        if (BackX::g_verify && std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
-            BackX::Mismatch("usage tracker word set outside the tracked extent", set_begin,
-                            set_end);
-            std::ranges::fill(pages, 0ULL);
-        }
-        set_begin = 0;
-        set_end = 0;
+        ResetSetWords();
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -105,6 +95,30 @@ public:
     }
 
 private:
+    /// Clears the words set since the last reset, [set_begin, set_end); every other word is zero
+    /// already (only Track sets words). A buffer of hundreds of MiB bound in part cleared all its
+    /// words (8 bytes a 4 KiB page) every frame. Always on (EDEN_NX2_BACKX_TICK's bounded reset,
+    /// made unconditional upstream); EDEN_NX2_BACKX_STATS counts the words cleared and skipped.
+    void ResetSetWords() noexcept {
+        if (set_end != 0) {
+            std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
+                      pages.begin() + static_cast<std::ptrdiff_t>(set_end), 0ULL);
+        }
+        BackX::Count(BackX::Counter::TickResets);
+        BackX::Count(BackX::Counter::TickWordsCleared, set_end - set_begin);
+        BackX::Count(BackX::Counter::TickWordsSkipped, pages.size() - (set_end - set_begin));
+        if (BackX::g_verify) [[unlikely]] {
+            if (std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
+                BackX::Mismatch(BackX::Check::Tick,
+                                "usage tracker word set outside the tracked extent", set_begin,
+                                set_end);
+                std::ranges::fill(pages, 0ULL);
+            }
+        }
+        set_begin = 0;
+        set_end = 0;
+    }
+
     void FillPages(size_t begin, size_t end) noexcept {
         if (begin >= end) {
             return;

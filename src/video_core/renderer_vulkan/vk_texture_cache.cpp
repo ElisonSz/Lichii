@@ -17,6 +17,10 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <bit>
+#include <chrono>
+#include <cstdint>
+#include <initializer_list>
+#include <iterator>
 #include <numeric>
 #include "common/alignment.h"
 #include "common/bit_util.h"
@@ -27,11 +31,12 @@
 #include "shader_recompiler/exception.h"
 
 #include <atomic>
+#include "video_core/fsr.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
-#include "video_core/fsr.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/stream_stats.h"
 #include "video_core/texture_cache/host_mip_limits.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -46,6 +51,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/stale_targets.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -56,6 +62,8 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/textures/decoders.h"
+
+#include "video_core/wait_stats.h"
 
 namespace Vulkan {
 
@@ -534,11 +542,46 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return image_ci;
 }
 
+/// Smallest image that takes its memory from the render target pool: smaller ones fit the
+/// default blocks several at a time.
+constexpr u64 RenderTargetPoolMinBytes = 4ULL << 20;
+
+/// TEST (EDEN_NX2_MEM_TRACE): counts one host object and the time it took to make.
+class HostObjectTimer {
+public:
+    explicit HostObjectTimer(u64& count_, u64& ns_, bool enabled_)
+        : count{count_}, ns{ns_}, enabled{enabled_} {
+        if (enabled) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~HostObjectTimer() {
+        if (!enabled) {
+            return;
+        }
+        ++count;
+        ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count());
+    }
+    HostObjectTimer(const HostObjectTimer&) = delete;
+    HostObjectTimer& operator=(const HostObjectTimer&) = delete;
+
+private:
+    u64& count;
+    u64& ns;
+    bool enabled;
+    std::chrono::steady_clock::time_point start{};
+};
+
+/// `pool`: the runtime whose HostImagePool may supply the image, with `pool_key` set to what the
+/// image was made as if the pool may keep it afterwards.
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false, TextureCacheRuntime* pool = nullptr,
+                                  std::optional<HostImagePool::Key>* pool_key = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -584,7 +627,83 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+    // Images asked for without memory stay out of the pool even when they got memory after all.
+    const bool pooled = pool != nullptr && pool_key != nullptr && !unbacked && !aliased &&
+                        VideoCommon::StaleTargets::pool_images;
+    if (pooled) {
+        *pool_key = HostImagePool::Key{
+            .flags = image_ci.flags,
+            .type = image_ci.imageType,
+            .format = image_ci.format,
+            .width = image_ci.extent.width,
+            .height = image_ci.extent.height,
+            .depth = image_ci.extent.depth,
+            .levels = image_ci.mipLevels,
+            .layers = image_ci.arrayLayers,
+            .samples = image_ci.samples,
+            .usage = image_ci.usage,
+            .view_formats = view_formats.data(),
+            .view_format_count = view_formats.size(),
+        };
+        if (vk::Image kept = pool->TakeHostImage(**pool_key)) {
+            return kept;
+        }
+    }
+    // A game that sizes its shadow maps by the view makes a dozen large single-level images a
+    // frame, each target with the texture that samples it, in sizes it never repeats: no kept
+    // image fits those, and over 8 MiB each would be a driver allocation of its own.
+    const u64 texel_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
+                            VideoCore::Surface::BytesPerBlock(info.format);
+    const bool render_target =
+        pool != nullptr && may_fail && VideoCommon::StaleTargets::target_memory_pool &&
+        image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 && image_ci.extent.depth == 1 &&
+        image_ci.samples == VK_SAMPLE_COUNT_1_BIT &&
+        VideoCore::Surface::DefaultBlockWidth(info.format) == 1 &&
+        texel_bytes >= RenderTargetPoolMinBytes &&
+        texel_bytes <= Device::RenderTargetPoolBlockSize / 2;
+    const auto make = [&] {
+        return may_fail ? allocator.TryCreateImage(image_ci, false, render_target)
+                        : allocator.CreateImage(image_ci);
+    };
+    if (pool == nullptr) {
+        return make();
+    }
+    const auto start = pool->host_memory_trace ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+    vk::Image image;
+    if (may_fail && pool->HostImagePoolBytes() != 0) {
+        image = allocator.TryCreateImageWithinBudget(image_ci, render_target);
+        if (!image) {
+            // Reclaim optional images before paging or taking host/unbacked fallbacks.
+            pool->ReleaseHostImagePool();
+            image = allocator.TryCreateImageWithinBudget(image_ci, render_target);
+        }
+        if (!image) {
+            image = make();
+        }
+    } else {
+        image = make();
+    }
+    if (!pool->host_memory_trace) {
+        return image;
+    }
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+    TextureCacheRuntime::HostObjectStats& made = pool->host_object_stats;
+    ++made.images;
+    made.image_ns += ns;
+    if (image) {
+        const vk::Image::MemoryBlock block = image.GetMemoryBlock();
+        if (block.block == 0) {
+            ++made.own_memory;
+            made.own_memory_ns += ns;
+        } else if (block.block_size == Device::RenderTargetPoolBlockSize) {
+            ++made.target_pool;
+            made.target_pool_ns += ns;
+        }
+    }
+    return image;
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -969,6 +1088,8 @@ struct RangedBarrierRange {
 void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage image,
                        VkImageAspectFlags aspect_mask, bool is_initialized,
                        std::span<const VkBufferImageCopy> copies) {
+    const VideoCommon::StreamStats::Scope transfer_scope{
+        VideoCommon::StreamStats::Counter::TransferWorkerNs};
     static constexpr VkAccessFlags WRITE_ACCESS_FLAGS =
                                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -1009,12 +1130,18 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
             .subresourceRange = subresource_range,
     };
 
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                           read_barrier);
+    {
+        const VideoCommon::StreamStats::Scope barrier_scope{
+            VideoCommon::StreamStats::Counter::TransferBarrierNs};
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, read_barrier);
+    }
     cmdbuf.CopyBufferToImage(src_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
     // TODO: Move this to another API
+    const VideoCommon::StreamStats::Scope barrier_scope{
+        VideoCommon::StreamStats::Counter::TransferBarrierNs};
     cmdbuf.PipelineBarrier(
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
@@ -1319,6 +1446,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       render_pass_cache{render_pass_cache_}, descriptor_pool{descriptor_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
       resolution{Settings::values.resolution_info} {
+    host_memory_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    host_image_pool.SetTrace(host_memory_trace);
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -1357,10 +1486,13 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 }
 
 void TextureCacheRuntime::Finish() {
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Download,
+                                       [&] { scheduler.Finish(); });
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
+    const VideoCommon::StreamStats::Scope staging_scope{
+        VideoCommon::StreamStats::Counter::StagingNs};
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
 }
 
@@ -2153,7 +2285,9 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         temporal_history.extent.width != extent.width ||
         temporal_history.extent.height != extent.height) {
         if (temporal_history.images[0]) {
-            scheduler.Finish(); // the old history may still be in use
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+                scheduler.Finish();
+            }); // the old history may still be in use
         }
         for (size_t i = 0; i < temporal_history.images.size(); ++i) {
             temporal_history.images[i] = memory_allocator.CreateImage(VkImageCreateInfo{
@@ -2876,6 +3010,12 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
     return device.GetDeviceMemoryUsage();
 }
 
+void TextureCacheRuntime::ReclaimOptionalSnapshots() {
+    if (astc_decoder_pass) {
+        astc_decoder_pass->ReclaimSnapshots();
+    }
+}
+
 u64 TextureCacheRuntime::CurrentTick() const noexcept {
     return scheduler.CurrentTick();
 }
@@ -2923,6 +3063,45 @@ void TextureCacheRuntime::LogMemoryTrace() {
              staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
+    staging_buffer_pool.LogMemoryTrace();
+    u64 transcodes{};
+    u64 free_decode{};
+    u64 temporary{};
+    u64 msaa{};
+    u64 resolves{};
+    u64 byte_shadows{};
+    u64 history{};
+    for (const auto& entry : pending_transcodes) {
+        transcodes += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& entry : free_transcodes) {
+        free_decode += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& buffer : buffers) {
+        temporary += buffer.AllocationSize();
+    }
+    for (const auto& entry : msaa_scratch_images) {
+        msaa += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& [handle, entry] : resolve_shadows) {
+        resolves += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& [tick, entry] : pending_resolve_shadows) {
+        resolves += entry.image.GetMemoryBlock().size;
+    }
+    for (const auto& entry : pending_byte_addressed_shadows) {
+        byte_shadows += entry.image.GetMemoryBlock().size + entry.bridge.AllocationSize();
+    }
+    for (const auto& image : temporal_history.images) {
+        history += image.GetMemoryBlock().size;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Memory trace: texture runtime transcodes pending/free {}/{} MiB, temporary {} MiB, "
+             "MSAA {} MiB, resolve {} MiB, byte shadows {} MiB, history {} MiB; GPU tick {}",
+             transcodes >> 20, free_decode >> 20, temporary >> 20, msaa >> 20, resolves >> 20,
+             byte_shadows >> 20, history >> 20, scheduler.CurrentTick());
+    LOG_INFO(Render_Vulkan, "Memory trace: GPU completed tick {}",
+             scheduler.GetMasterSemaphore().KnownGpuTick());
     Vulkan::LogMemoryTrace(device);
 }
 
@@ -2980,6 +3159,242 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+size_t HostImagePool::KeyHash::operator()(const Key& key) const noexcept {
+    u64 hash = 0xCBF29CE484222325ULL;
+    for (const u64 part :
+         {u64{key.flags}, static_cast<u64>(key.type), static_cast<u64>(key.format),
+          u64{key.width}, u64{key.height}, u64{key.depth}, u64{key.levels}, u64{key.layers},
+          static_cast<u64>(key.samples), u64{key.usage},
+          static_cast<u64>(reinterpret_cast<uintptr_t>(key.view_formats)),
+          static_cast<u64>(key.view_format_count)}) {
+        hash = (hash ^ part) * 0x100000001B3ULL;
+    }
+    return static_cast<size_t>(hash ^ (hash >> 32));
+}
+
+vk::Image HostImagePool::Take(const Key& key, const Scheduler& scheduler) {
+    ShapeStats* const shape = trace ? &shape_stats[key] : nullptr;
+    const auto miss = [&] {
+        ++stats.misses;
+        if (shape != nullptr) {
+            ++shape->misses;
+        }
+        return vk::Image{};
+    };
+    const auto found = images.find(key);
+    if (found == images.end()) {
+        return miss();
+    }
+    std::vector<Entry>& list = found->second;
+    const auto entry = std::ranges::find_if(
+        list, [&scheduler](const Entry& kept) { return scheduler.IsFree(kept.tick); });
+    if (entry == list.end()) {
+        return miss();
+    }
+    vk::Image image = std::move(entry->image);
+    bytes -= entry->bytes;
+    --count;
+    list.erase(entry);
+    if (list.empty()) {
+        images.erase(found);
+    }
+    ++stats.hits;
+    if (shape != nullptr) {
+        ++shape->hits;
+    }
+    return image;
+}
+
+void HostImagePool::Keep(const Key& key, vk::Image& image, u64 tick, u64 limit,
+                          const Scheduler& scheduler, const Device& device) {
+    ShapeStats* const shape = trace ? &shape_stats[key] : nullptr;
+    const auto refuse = [&] {
+        ++stats.refused;
+        if (shape != nullptr) {
+            ++shape->refused;
+        }
+    };
+    // Every admitted entry is complete: eviction, expiry and pressure trim may destroy it.
+    if (!scheduler.IsFree(tick)) {
+        ++stats.refused_pending;
+        refuse();
+        return;
+    }
+    const auto memory_block = image.GetMemoryBlock();
+    if (!device.IsCountedDeviceLocalMemory(memory_block.memory_type)) {
+        ++stats.refused_nonlocal;
+        refuse();
+        return;
+    }
+    const u64 size = memory_block.size;
+    if (size == 0 || size > limit / 4) {
+        refuse();
+        return;
+    }
+    while (bytes + size > limit || count >= MaxImages) {
+        // Full: the image that waited longest makes room. What a game asks for again it asks
+        // for within a frame or two, so that one is the least likely to be wanted.
+        auto longest = images.end();
+        for (auto list = images.begin(); list != images.end(); ++list) {
+            if (longest == images.end() || list->second.front().unused_frames >
+                                               longest->second.front().unused_frames) {
+                longest = list;
+            }
+        }
+        if (longest == images.end() || longest->second.front().unused_frames == 0) {
+            refuse();
+            return;
+        }
+        std::vector<Entry>& list = longest->second;
+        bytes -= list.front().bytes;
+        --count;
+        ++stats.evicted;
+        list.erase(list.begin());
+        if (list.empty()) {
+            images.erase(longest);
+        }
+    }
+    images[key].push_back(Entry{
+        .image = std::move(image),
+        .tick = tick,
+        .bytes = size,
+        .unused_frames = 0,
+    });
+    bytes += size;
+    ++count;
+    ++stats.kept;
+    if (shape != nullptr) {
+        ++shape->kept;
+    }
+}
+
+void HostImagePool::Tick() {
+    const u64 repayment = (std::min)(expiry_debt, MaxExpiredBytes);
+    expiry_debt -= repayment;
+    u64 budget = MaxExpiredBytes - repayment;
+    for (auto list = images.begin(); list != images.end();) {
+        std::erase_if(list->second, [&](Entry& entry) {
+            if (++entry.unused_frames <= MaxUnusedFrames || budget == 0) {
+                return false;
+            }
+            if (entry.bytes > budget) {
+                expiry_debt += entry.bytes - budget;
+                budget = 0;
+            } else {
+                budget -= entry.bytes;
+            }
+            bytes -= entry.bytes;
+            --count;
+            ++stats.expired;
+            stats.expired_bytes += entry.bytes;
+            return true;
+        });
+        list = list->second.empty() ? images.erase(list) : std::next(list);
+    }
+}
+
+void HostImagePool::Trim(u64 requested_bytes) {
+    while (requested_bytes != 0 && !images.empty()) {
+        auto longest = images.begin();
+        for (auto candidate = std::next(images.begin()); candidate != images.end(); ++candidate) {
+            if (candidate->second.front().unused_frames > longest->second.front().unused_frames) {
+                longest = candidate;
+            }
+        }
+        std::vector<Entry>& entries = longest->second;
+        const u64 freed_bytes = entries.front().bytes;
+        requested_bytes -= (std::min)(requested_bytes, freed_bytes);
+        bytes -= freed_bytes;
+        --count;
+        ++stats.trimmed;
+        stats.trimmed_bytes += freed_bytes;
+        entries.erase(entries.begin());
+        if (entries.empty()) {
+            images.erase(longest);
+        }
+    }
+}
+
+void HostImagePool::Release() {
+    stats.released += count;
+    images.clear();
+    bytes = 0;
+    count = 0;
+}
+
+void HostImagePool::ReportShapes() {
+    struct Row {
+        Key key;
+        ShapeStats shape;
+        size_t held;
+        u64 held_bytes;
+    };
+    std::vector<Row> rows;
+    rows.reserve(shape_stats.size() + images.size());
+    for (const auto& counted : shape_stats) {
+        rows.push_back(Row{counted.first, counted.second, 0, 0});
+    }
+    for (const auto& held : images) {
+        const Key& key = held.first;
+        auto row =
+            std::ranges::find_if(rows, [&key](const Row& known) { return known.key == key; });
+        if (row == rows.end()) {
+            rows.push_back(Row{key, ShapeStats{}, 0, 0});
+            row = std::prev(rows.end());
+        }
+        row->held = held.second.size();
+        for (const Entry& entry : held.second) {
+            row->held_bytes += entry.bytes;
+        }
+    }
+    shape_stats.clear();
+    // The shapes asked for most, then the ones that hold the most memory unasked.
+    std::ranges::sort(rows, [](const Row& left, const Row& right) {
+        const u64 left_asked = left.shape.hits + left.shape.misses;
+        const u64 right_asked = right.shape.hits + right.shape.misses;
+        return left_asked != right_asked ? left_asked > right_asked
+                                         : left.held_bytes > right.held_bytes;
+    });
+    size_t listed{};
+    size_t unasked{};
+    for (const Row& row : rows) {
+        const bool asked = row.shape.hits + row.shape.misses != 0;
+        if (asked ? listed >= 14 : unasked >= 6) {
+            continue;
+        }
+        ++(asked ? listed : unasked);
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: pool shape format {} {}x{}x{} levels {} layers {} samples {} "
+                 "usage {:#x} flags {:#x} views {}@{}: hits {} misses {} kept {} refused {}; "
+                 "holds {} images {} MiB",
+                 static_cast<u32>(row.key.format), row.key.width, row.key.height, row.key.depth,
+                 row.key.levels, row.key.layers, static_cast<u32>(row.key.samples),
+                 static_cast<u32>(row.key.usage), static_cast<u32>(row.key.flags),
+                 row.key.view_format_count, fmt::ptr(row.key.view_formats), row.shape.hits,
+                 row.shape.misses, row.shape.kept, row.shape.refused, row.held,
+                 row.held_bytes >> 20);
+    }
+}
+
+vk::Image TextureCacheRuntime::TakeHostImage(const HostImagePool::Key& key) {
+    return host_image_pool.Take(key, scheduler);
+}
+
+void TextureCacheRuntime::KeepHostImage(const HostImagePool::Key& key, vk::Image& image,
+                                        std::optional<u64> last_use) {
+    if (!VideoCommon::StaleTargets::pool_images) {
+        return;
+    }
+    // One frame's worth of a game that remakes its targets every frame is a few hundred MiB,
+    // and it takes a frame or two until the GPU is past a deleted image.
+    const u64 limit = (std::min)(u64{1} << 30, device.GetDeviceLocalMemory() / 8);
+    // The pool hands the image out once the GPU ran the last commands recorded on it, whatever
+    // order the next user's commands would run in. An image the cache did not retire may have
+    // been used up to now.
+    host_image_pool.Keep(key, image, last_use.value_or(scheduler.CurrentTick()), limit,
+                         scheduler, device);
+}
+
 void TextureCacheRuntime::TickFrame() {
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
@@ -3022,6 +3437,35 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
         return scheduler.IsFree(pending.first);
     });
+    host_image_pool.Tick();
+    if (!host_memory_trace) {
+        return;
+    }
+    if (const auto now = std::chrono::steady_clock::now();
+        now - host_object_report >= std::chrono::seconds{2}) {
+        host_object_report = now;
+        const HostObjectStats made = std::exchange(host_object_stats, HostObjectStats{});
+        const HostImagePool::Stats pool = host_image_pool.TakeStats();
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: host images made {} in {} us (own memory {} in {} us, target pool "
+                 "{} in {} us), views {} in {} us, framebuffers {} "
+                 "in {} us; image pool {}: hits {} misses {} kept {} refused {} evicted {} "
+                 "expired {} released {}; holds {} images, {} MiB",
+                 made.images, made.image_ns / 1000, made.own_memory, made.own_memory_ns / 1000,
+                 made.target_pool, made.target_pool_ns / 1000, made.views, made.view_ns / 1000,
+                 made.framebuffers, made.framebuffer_ns / 1000,
+                 VideoCommon::StaleTargets::pool_images, pool.hits, pool.misses, pool.kept,
+                 pool.refused, pool.evicted, pool.expired, pool.released, host_image_pool.Count(),
+                 host_image_pool.Bytes() >> 20);
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: image pool pressure: pre-fallback releases {}, trimmed {} images "
+                 "{} bytes; refused non-local {}, pending {}; expired {} bytes, expiry debt {} "
+                 "bytes",
+                 made.pool_pressure_releases, pool.trimmed, pool.trimmed_bytes,
+                 pool.refused_nonlocal, pool.refused_pending,
+                 pool.expired_bytes, host_image_pool.ExpiryDebt());
+        host_image_pool.ReportShapes();
+    }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -3042,7 +3486,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, &runtime_, &pool_key)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -3130,6 +3574,11 @@ Image::~Image() {
         if (scaled_image) {
             runtime->EraseResolveShadow(*scaled_image);
         }
+    }
+    // A moved-from image has no handle left. Views of the image are destroyed with this object
+    // or by the cache; the host image itself can serve the next image of its shape.
+    if (runtime != nullptr && pool_key && original_image && !original_image.IsUnbacked()) {
+        runtime->KeepHostImage(*pool_key, original_image, retire_tick);
     }
 }
 
@@ -4200,6 +4649,15 @@ VkImageView Image::StorageImageLayerView(s32 level, u32 layer) {
     return *view;
 }
 
+u32 Image::HostFormat() const noexcept {
+    const auto format_override = AstcHostFormat(runtime->device, info);
+    return static_cast<u32>(
+        format_override
+            ? *format_override
+            : MaxwellToVK::SurfaceFormat(runtime->device, FormatType::Optimal, false, info.format)
+                  .format);
+}
+
 bool Image::IsRescaled() const noexcept {
     return True(flags & ImageFlagBits::Rescaled);
 }
@@ -4375,6 +4833,8 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
       device{&runtime.device}, image_handle{image.Handle()},
       samples(ConvertSampleCount(image.info.num_samples)) {
     using Shader::TextureType;
+    const HostObjectTimer timer{runtime.host_object_stats.views, runtime.host_object_stats.view_ns,
+                                runtime.host_memory_trace};
     if (image.host_level_offset == 0)
         range = HostRange(image, range);
 
@@ -4584,6 +5044,13 @@ VkImageView ImageView::ColorView() {
 
 VkImageView ImageView::StorageView(Shader::TextureType texture_type,
                                    Shader::ImageFormat image_format, bool is_byte_addressed) {
+    if (!image_handle) {
+        return VK_NULL_HANDLE;
+    }
+    if (null_image) {
+        // Devices without nullDescriptor own a fallback image for an absent guest texture.
+        return Handle(texture_type);
+    }
     if (is_byte_addressed &&
         (texture_type != Shader::TextureType::Color2D ||
          image_format != Shader::ImageFormat::R32_UINT ||
@@ -4616,7 +5083,8 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
 }
 
 bool ImageView::IsRescaled() const noexcept {
-    return (*slot_images)[image_id].IsRescaled();
+    const Image* const image = BackingImage();
+    return image && image->IsRescaled();
 }
 
 vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
@@ -4967,6 +5435,8 @@ Framebuffer::~Framebuffer() = default;
 void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     std::span<ImageView*, NUM_RT> color_buffers,
                                     ImageView* depth_buffer, bool is_rescaled_) {
+    const HostObjectTimer timer{runtime.host_object_stats.framebuffers,
+                                runtime.host_object_stats.framebuffer_ns, runtime.host_memory_trace};
     boost::container::small_vector<VkImageView, NUM_RT * 2 + 2> attachments;
     RenderPassKey renderpass_key{};
     // A framebuffer can't have more layers than any of its attachments: one with more layers
@@ -5340,6 +5810,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .level_view = [&pending](s32 level) { return *pending.views[level]; },
                 .wait = true,
                 .levels = levels,
+                .source_address = image.gpu_addr + u64{base} * layer_stride,
+                .storage_format = DecodeFormat,
             },
             batch_map, swizzles);
         for (u32 level = 0; level < levels; ++level) {
@@ -5362,6 +5834,53 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
+}
+
+bool TextureCacheRuntime::ClearImage(Image& image) {
+    const VkImageAspectFlags aspect_mask = image.AspectMask();
+    const bool color = aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT;
+    const bool depth_stencil =
+        (aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    if ((!color && !depth_stencil) || image.info.num_samples != 1 ||
+        VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+        VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1 ||
+        True(image.flags & VideoCommon::ImageFlagBits::Converted)) {
+        return false;
+    }
+    FlushDeferredClear();
+    TransitionImageLayout(image);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    const VkImage handle = image.Handle();
+    scheduler.Record([handle, aspect_mask, color](vk::CommandBuffer cmdbuf) {
+        const VkImageSubresourceRange range{aspect_mask, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                            VK_REMAINING_ARRAY_LAYERS};
+        const VkImageMemoryBarrier before{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = handle,
+            .subresourceRange = range,
+        };
+        auto after = before;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, before);
+        if (color) {
+            cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, VkClearColorValue{}, range);
+        } else {
+            cmdbuf.ClearDepthStencilImage(handle, VK_IMAGE_LAYOUT_GENERAL,
+                                          VkClearDepthStencilValue{}, range);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, after);
+    });
+    return true;
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {

@@ -8,6 +8,10 @@ add_executable(tests
     common/thread_worker.cpp
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
+    video_core/draw_delta.cpp
+    video_core/draw_reuse.cpp
+    video_core/drawx.cpp
+    video_core/oot_whiteout.cpp
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
@@ -16,8 +20,13 @@ add_executable(tests
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
     video_core/host_mip_limits.cpp
+    video_core/stream.cpp
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
+    video_core/nx2_fast_wake.cpp
+    video_core/nx2_sync_suspend.cpp
+    video_core/nx2_cfg.cpp
+    video_core/nx2_runahead.cpp
     video_core/hdr_output.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
@@ -43,6 +52,7 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
+    video_core/image_join.cpp
     audio_core/batch_decoder.cpp
     audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
@@ -86,6 +96,8 @@ add_executable(tests
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
     video_core/host_memory_limit.cpp
+    video_core/texture_memory.cpp
+    video_core/stale_targets.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
@@ -211,6 +223,9 @@ add_executable(tests
     video_core/memory_tracker.cpp
     video_core/invalidation_accumulator.cpp
     video_core/memory_manager_runs.cpp
+    video_core/memtrack_translation.cpp
+    video_core/memtrack_word.cpp
+    video_core/protect_in_place.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
@@ -225,6 +240,7 @@ add_executable(tests
     video_core/ampere_compute_lowering.cpp
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
+    video_core/native_macro_batch.cpp
     video_core/native_macro_fifo.cpp
     video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp

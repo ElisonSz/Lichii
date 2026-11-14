@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <string_view>
@@ -30,6 +31,8 @@
 #include "video_core/vulkan_common/streamline.h"
 #include "video_core/vulkan_common/streamline_frame_gen.h"
 #endif
+
+#include "video_core/wait_stats.h"
 
 namespace Vulkan {
 
@@ -300,28 +303,52 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     }
 
     const auto wait_with_frame_pacing = [this, may_flush] {
+    // EDEN_NX2_FRAME_PACING=<fps> (diagnostic): the frame pacing mode's target for comparisons
+    // without changing the configuration (0 = Auto: no pacing).
+    static const double forced_target_fps = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRAME_PACING");
+        return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+    }();
+    if (forced_target_fps >= 0.0) {
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], forced_target_fps, may_flush);
+        });
+        return;
+    }
     switch (Settings::values.frame_pacing_mode.GetValue()) {
     case Settings::FramePacingMode::Target_Auto:
-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_30:
-        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_60:
-        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_90:
-        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+        });
         break;
     case Settings::FramePacingMode::Target_120:
-        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+        });
         break;
     }
     };
 
 #ifdef __ANDROID__
     if (android_get_device_api_level() >= 30) {
-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Swapchain, [&] {
+            scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        });
     } else {
         wait_with_frame_pacing();
     }

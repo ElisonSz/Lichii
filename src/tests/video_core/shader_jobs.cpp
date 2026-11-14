@@ -281,6 +281,83 @@ TEST_CASE("Shader jobs alternate an aged Background backlog with Soon jobs",
     REQUIRE(std::vector<int>(ids.begin(), ids.begin() + 5) == std::vector<int>{0, -1, 1, -2, 2});
 }
 
+TEST_CASE("Background shader stages stay within their limit", "[video_core][shader_jobs]") {
+    for (const size_t limit : {size_t{1}, size_t{2}}) {
+        auto config = Config(4, 4);
+        config.max_background_stages = limit;
+        ShaderJobScheduler scheduler{config};
+        std::atomic<size_t> running{};
+        std::atomic<size_t> peak{};
+        const auto stage{[&running, &peak] {
+            const size_t now = ++running;
+            size_t seen = peak.load();
+            while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+            }
+            std::this_thread::sleep_for(2ms);
+            --running;
+        }};
+        std::vector<ShaderJobHandle> handles;
+        for (int id = 0; id < 16; ++id) {
+            handles.push_back(scheduler.Submit(
+                TwoStageJob(Background, [stage](ShaderJobContext&) { stage(); }, stage)));
+        }
+        for (const auto& handle : handles) {
+            handle.Wait();
+        }
+        const auto stats = scheduler.Stats();
+
+        for (const auto& handle : handles) {
+            REQUIRE(handle.Status() == ShaderJobStatus::Done);
+        }
+        REQUIRE(peak.load() <= limit);
+        REQUIRE(stats.peak_background_stages <= limit);
+        REQUIRE(stats.priorities[2].done == 16);
+    }
+}
+
+TEST_CASE("A Soon shader job finds a worker while Background stages hold their limit",
+          "[video_core][shader_jobs]") {
+    auto config = Config(2, 1);
+    config.max_background_stages = 1;
+    ShaderJobScheduler scheduler{config};
+    Gate gate;
+    std::promise<void> entered;
+    const auto background = scheduler.Submit(CpuJob(Background, [&] {
+        entered.set_value();
+        gate.Wait();
+    }));
+    entered.get_future().wait();
+    const auto second = scheduler.Submit(CpuJob(Background, [] {}));
+    const auto soon = scheduler.Submit(CpuJob(Soon, [] {}));
+    const bool soon_ran = soon.WaitFor(5s);
+    const bool second_queued = second.Status() == ShaderJobStatus::Queued;
+    gate.Open();
+    background.Wait();
+    second.Wait();
+
+    REQUIRE(soon_ran);
+    REQUIRE(second_queued);
+    REQUIRE(second.Status() == ShaderJobStatus::Done);
+}
+
+TEST_CASE("Background driver stages go before more Background translations",
+          "[video_core][shader_jobs]") {
+    auto config = Config(2, 2);
+    config.max_background_stages = 1;
+    ShaderJobScheduler scheduler{config};
+    Order order;
+    std::vector<ShaderJobHandle> handles;
+    for (int id = 0; id < 3; ++id) {
+        handles.push_back(scheduler.Submit(TwoStageJob(
+            Background, [&order, id](ShaderJobContext&) { order.Add(id * 2); },
+            [&order, id] { order.Add(id * 2 + 1); })));
+    }
+    for (const auto& handle : handles) {
+        handle.Wait();
+    }
+    REQUIRE(order.Get() == std::vector<int>{0, 1, 2, 3, 4, 5});
+}
+
 TEST_CASE("Shader job budget admits by in-flight bytes", "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(4, 1, 100)};
     Gate first_gate, later_gate;

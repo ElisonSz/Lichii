@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -25,19 +26,19 @@
 #include <boost/container/static_vector.hpp>
 #include <queue>
 
+#include <ranges>
 #include "common/common_types.h"
-#include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
-#include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
-#include "video_core/texture_cache/pending_download.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
@@ -45,6 +46,7 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/pending_download.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
@@ -100,6 +102,10 @@ struct SampledTextureMemo {
     u64 host_serial{};         ///< MemoryManager::HostPointerSerial
     u64 image_changes{};       ///< DescriptorTable::changes of both tables
     u64 sampler_changes{};
+    /// EDEN_NX2_CFG_TIC: the image table's layout_changes, and the view deletion count, when the
+    /// memo was made or last found to hold
+    u64 image_layout_changes{};
+    u32 view_deaths{};
     bool via_header_index{}; ///< The sampler binding the handles were split with
     bool valid{};
     u32 misses{}; ///< Draws in a row that did not find the memo good
@@ -138,6 +144,7 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheOperations;
     /// Address shift for caching images into a hash table
     static constexpr u64 LICHII_PAGEBITS = 20;
 
@@ -209,6 +216,70 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
     /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
     std::chrono::steady_clock::time_point mem_trace_time{};
+    bool mem_trace_enabled{};
+    bool actual_image_accounting{};
+    struct CollectionTrace {
+        u64 passes{};
+        u64 aggressive{};
+        u64 empty{};
+        u64 examined{};
+        u64 decoding{};
+        u64 costly{};
+        u64 download_protected{};
+        u64 deleted{};
+        u64 downloaded{};
+    } collection_trace;
+    u64 trace_created{};
+    u64 trace_deleted{};
+    u64 trace_frame{};
+    u32 trace_creation_lines{};
+    u32 trace_tic_lines{};
+    const char* trace_origin = "copy/dma";
+    u32 trace_descriptor{};
+    bool trace_oom_dumped{};
+    std::array<u64, 5>
+        trace_origins{}; // Copy/DMA, graphics TIC, compute TIC, target, clear target.
+    std::map<u64, u64> trace_tic_creations;
+    u64 trace_tic_changes{};
+    u64 trace_tic_misses{};
+    u64 trace_readbacks{};
+    u64 trace_readback_images{};
+    u64 trace_readback_bytes{};
+    u64 trace_joins{};
+    u64 trace_aliases{};
+    u64 trace_bad_overlaps{};
+    u64 trace_ignored{};
+    u64 trace_lookups{};
+    u64 trace_lookup_hits{};
+    u64 trace_lookup_candidates{};
+    u64 trace_lookup_remapped{};
+    u64 trace_lookup_rejected{};
+    u32 trace_rejection_lines{};
+    u64 trace_stale_layout{};
+    u64 trace_stale_contents{};
+    u64 trace_stale_footprints{};
+    u64 trace_stale_failures{};
+    u64 trace_stale_drops{};
+    u64 trace_stale_drop_bytes{};
+    u64 trace_stale_clears{};
+    u64 trace_stale_clear_ns{};
+    u64 trace_stale_reference_scans{};
+    std::array<u64, StaleTargets::NumKept> trace_stale_kept{};
+    u64 trace_stale_unconfirmed{};
+    u64 trace_stale_aged{};
+    u64 trace_stale_aged_bytes{};
+    u64 trace_stale_aged_partners{};
+    std::array<u64, 3> trace_stale_aged_kept{}; // Pending work, a live alias, a live subresource.
+    u64 trace_stale_zeroes{};
+    u64 trace_stale_zero_bytes{};
+    u64 trace_stale_zero_ns{};
+    u64 stale_birth{};
+    u64 trace_stale_creations{};
+    u64 trace_stale_create_ns{};
+    u64 trace_stale_verified{};
+
+    void TraceMemory();
+    u64 ScaledImageMemoryBytes(const typename P::Image& image) const;
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -308,20 +379,34 @@ public:
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
     /// Whether the handle words and descriptors `memo` was built from still match guest memory.
+    /// EDEN_NX2_CFG_TIC: and none of its views was deleted since the memo last checked them;
+    /// `lost_view` is set when that is why it no longer holds.
     [[nodiscard]] bool TextureMemoStillHolds(const SampledTextureMemo& memo,
-                                             std::span<const GPUVAddr> handle_addresses) const;
+                                             std::span<const GPUVAddr> handle_addresses,
+                                             bool* lost_view = nullptr) const;
 
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
     /// handle_addresses are where the draw reads its texture handles from, in binding order.
+    /// EDEN_NX2_CFG_TIC: `kept_over_deletions` is set when views were deleted since the memo was
+    /// made, none of its own (the base resolves in full then); it counts if the call returns true.
     [[nodiscard]] bool ResolveMemoizedTextures(SampledTextureMemo& memo,
                                                std::span<const GPUVAddr> handle_addresses,
                                                std::span<ImageViewInOut> views,
-                                               std::span<SamplerId> samplers);
+                                               std::span<SamplerId> samplers,
+                                               bool* kept_over_deletions = nullptr);
 
     /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
     void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
                          std::span<const ImageViewInOut> views, std::span<const SamplerId> samplers);
+
+    using DrawDeltaSnapshot = DrawDeltaTextures<TICEntry, TSCEntry>;
+    /// Capture the table bytes used by the full resolve, or compare current guest bytes with them.
+    /// Called under the texture cache mutex; descriptor-table epochs protect deleted view IDs.
+    void CaptureDrawDeltaTextures(DrawDeltaSnapshot& snapshot,
+                                  std::span<const DrawDeltaSnapshot::Handle> handles);
+    [[nodiscard]] DrawDeltaTextureResult MatchDrawDeltaTextures(
+        const DrawDeltaSnapshot& snapshot, std::span<const DrawDeltaSnapshot::Handle> handles);
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
@@ -363,6 +448,25 @@ public:
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
     void UpdateRenderTargets(bool is_clear);
+
+    /// Record a confirmed whole clear and retire only fully proven stale targets.
+    void NotifyFullClear(ImageViewId view_id);
+
+    /// A clear under a render condition, which proves nothing about the memory it covers.
+    void NoteUnconfirmedClear() {
+        ++trace_stale_unconfirmed;
+    }
+
+    void CollectStaleReferences();
+    /// Drops the render targets other images were made over and nothing has used for
+    /// StaleTargets::retire_age frames, every frame and whatever the memory use.
+    void RetireStaleTargets();
+    /// Takes the device memory of the host images the runtime keeps for reuse out of
+    /// total_used_memory.
+    void DeductPooledImages();
+    bool StaleTargetReferenced(ImageId id) const;
+    void MarkStaleTransfer(ImageBase& image);
+    ::Common::unordered_set<ImageId> stale_references;
 
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
@@ -509,8 +613,30 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// Reclaim optional host images before collecting active cache contents.
+    void TrimHostImagePool(bool out_of_memory);
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
+
+    /// EDEN_NX2_CFG_TIC: DescriptorTable::ReadImageEntry with the counts and verify.
+    std::pair<TICEntry, bool> ReadImageTableEntry(DescriptorTable<TICEntry, ImageViewId>& table,
+                                                  u32 index);
+
+    /// EDEN_NX2_CFG_TIC: views deleted (DeleteImage, InvalidateScale) get the deletion's count.
+    void NoteDeletedViews(std::span<const ImageViewId> removed_views);
+
+    /// EDEN_NX2_CFG_TIC: the base's Invalidate of every channel's image tables for a deletion.
+    void InvalidateTablesForDeletion();
+
+    /// EDEN_NX2_CFG_TIC: whether view `id` was deleted after the deletion count was `stamp`.
+    [[nodiscard]] bool ViewDiedAfter(ImageViewId id, u32 stamp) const noexcept {
+        return view_deaths.DiedAfter(id.Value(), stamp);
+    }
+
+    /// EDEN_NX2_CFG_TIC verify: the view the base binds a texture header to, without creating
+    /// one (an invalid id if it would create one).
+    [[nodiscard]] ImageViewId ResolvedViewOf(const TICEntry& descriptor) const;
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -641,7 +767,7 @@ private:
     void InvalidateScale(Image& image);
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
-    u64 GetScaledImageSizeBytes(const ImageBase& image);
+    static u64 GetScaledImageSizeBytes(const ImageBase& image);
 
     /// The device memory an image counts for in total_used_memory between two driver readings:
     /// none for an unbacked image (too large to back, or over unwritten sparse blocks), what is
@@ -704,6 +830,10 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// EDEN_NX2_CFG_TIC: image view deletions so far and when each view slot's last one was.
+    Cfg::ViewDeaths view_deaths;
+    /// EDEN_NX2_CFG_TIC: the deletion being made invalidates the tables in full (NoteDeletedViews).
+    bool tables_invalidated_in_full = false;
     std::vector<ImageId>* prepare_log{}; ///< LogPrepares
     bool prepare_log_dry{};
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can

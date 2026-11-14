@@ -111,17 +111,17 @@ void ComputePipeline::Configure() {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch (for an
             // array, for each element).
-            return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, *gpu_memory,
-                                   [&](u32 cbuf) -> GPUVAddr {
-                                       return cbuf < cbufs.size() &&
-                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
-                                                       1) != 0
-                                                  ? cbufs[cbuf].Address()
-                                                  : GPUVAddr{};
-                                   },
-                                   storage_buffer_alignment, index),
-                               via_header_index);
+            return VideoCommon::TexturePairOrNull(
+                VideoCommon::EvaluateTextureHandle(
+                    info, desc.handle_program, *gpu_memory,
+                    [&](u32 cbuf) -> GPUVAddr {
+                        return cbuf < cbufs.size() &&
+                                       ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0
+                                   ? cbufs[cbuf].Address()
+                                   : GPUVAddr{};
+                    },
+                    storage_buffer_alignment, index),
+                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
         const u32 index_offset{index << desc.size_shift};
@@ -163,7 +163,9 @@ void ComputePipeline::Configure() {
     }
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
+            const auto handle{VideoCommon::HandleMustBeNull(info, desc, index)
+                                  ? VideoCommon::NULL_TEXTURE_HANDLE
+                                  : read_handle(desc, index)};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);

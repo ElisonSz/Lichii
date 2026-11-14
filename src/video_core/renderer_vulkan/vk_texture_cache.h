@@ -10,6 +10,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -74,6 +77,113 @@ struct ByteAddressedRange {
     return VkExtent2D{width / 2, height};
 }
 
+/// Host images of deleted cache images, kept for the next image made with the same create info.
+/// A game that places its render targets at new addresses every frame has the cache make and
+/// delete dozens of images a frame, each a vkCreateImage with an allocation and their release.
+/// A kept image holds what its last user left in it, which is as undefined as a new image's
+/// contents: the cache uploads, clears or zeroes every image before it is read.
+class HostImagePool {
+public:
+    struct Key {
+        VkImageCreateFlags flags;
+        VkImageType type;
+        VkFormat format;
+        u32 width;
+        u32 height;
+        u32 depth;
+        u32 levels;
+        u32 layers;
+        VkSampleCountFlagBits samples;
+        VkImageUsageFlags usage;
+        const VkFormat* view_formats; ///< The view format list's storage, one per guest format
+        size_t view_format_count;
+
+        [[nodiscard]] bool operator==(const Key&) const noexcept = default;
+    };
+    struct Stats {
+        u64 hits{};
+        u64 misses{};
+        u64 kept{};
+        u64 refused{};
+        u64 evicted{};
+        u64 expired{};
+        u64 expired_bytes{};
+        u64 released{};
+        u64 trimmed{};
+        u64 trimmed_bytes{};
+        u64 refused_nonlocal{};
+        u64 refused_pending{};
+    };
+
+    /// A kept image made as `key` that the GPU no longer uses, or none.
+    [[nodiscard]] vk::Image Take(const Key& key, const Scheduler& scheduler);
+
+    /// Keeps `image`, whose last commands were recorded by `tick`. A pool holding `limit` bytes
+    /// makes room by destroying the images that waited longest; `image` is left to its owner
+    /// if nothing here waited longer than it, or it is too large to keep.
+    void Keep(const Key& key, vk::Image& image, u64 tick, u64 limit,
+              const Scheduler& scheduler, const Device& device);
+
+    /// Once a frame: expire unused images against a byte allowance, carrying overshoot as debt.
+    void Tick();
+
+    /// Destroys the longest-waiting entries until at least requested_bytes have been freed.
+    void Trim(u64 requested_bytes);
+
+    /// Destroys every kept image: an image did not fit in the device's memory.
+    void Release();
+
+    /// TEST (EDEN_NX2_MEM_TRACE): count per shape, and log the busiest ones.
+    void SetTrace(bool enabled) noexcept {
+        trace = enabled;
+    }
+    void ReportShapes();
+
+    [[nodiscard]] u64 Bytes() const noexcept {
+        return bytes;
+    }
+    [[nodiscard]] size_t Count() const noexcept {
+        return count;
+    }
+    [[nodiscard]] u64 ExpiryDebt() const noexcept {
+        return expiry_debt;
+    }
+    [[nodiscard]] Stats TakeStats() noexcept {
+        return std::exchange(stats, Stats{});
+    }
+
+private:
+    static constexpr u32 MaxUnusedFrames = 30;
+    // A frame may exceed this allowance by one image; later frames repay the excess first.
+    static constexpr u64 MaxExpiredBytes = u64{64} << 20;
+    static constexpr size_t MaxImages = 2048;
+
+    struct Entry {
+        vk::Image image;
+        u64 tick;
+        u64 bytes;
+        u32 unused_frames;
+    };
+    struct KeyHash {
+        [[nodiscard]] size_t operator()(const Key& key) const noexcept;
+    };
+
+    struct ShapeStats {
+        u64 hits{};
+        u64 misses{};
+        u64 kept{};
+        u64 refused{};
+    };
+
+    std::unordered_map<Key, std::vector<Entry>, KeyHash> images; ///< Longest wait first
+    u64 bytes{};
+    u64 expiry_debt{};
+    size_t count{};
+    Stats stats;
+    bool trace{};
+    std::unordered_map<Key, ShapeStats, KeyHash> shape_stats;
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -99,6 +209,48 @@ public:
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
+
+    void ReclaimOptionalSnapshots();
+
+    /// A kept host image made as `key`, or none (HostImagePool).
+    [[nodiscard]] vk::Image TakeHostImage(const HostImagePool::Key& key);
+
+    /// Offers the host image of a cache image that is being destroyed to the pool. `last_use`:
+    /// the tick after which no command was recorded on it, if the cache said (Image::RetiredAt).
+    void KeepHostImage(const HostImagePool::Key& key, vk::Image& image,
+                       std::optional<u64> last_use);
+
+    /// Device memory of the kept host images: free to the cache, which deducts it from its use.
+    [[nodiscard]] u64 HostImagePoolBytes() const noexcept {
+        return host_image_pool.Bytes();
+    }
+
+    /// Reclaim completed optional images before the allocator's pressure fallbacks.
+    void ReleaseHostImagePool() {
+        ++host_object_stats.pool_pressure_releases;
+        host_image_pool.Release();
+    }
+
+    void TrimHostImagePool(u64 requested_bytes) {
+        host_image_pool.Trim(requested_bytes);
+    }
+
+    /// TEST (EDEN_NX2_MEM_TRACE): host objects made, and the time that took.
+    struct HostObjectStats {
+        u64 images{};
+        u64 image_ns{};
+        u64 own_memory{}; ///< Of the images: a driver allocation of their own
+        u64 own_memory_ns{};
+        u64 target_pool{}; ///< Of the images: in the render target pool's blocks
+        u64 target_pool_ns{};
+        u64 views{};
+        u64 view_ns{};
+        u64 framebuffers{};
+        u64 framebuffer_ns{};
+        u64 pool_pressure_releases{};
+    };
+    HostObjectStats host_object_stats;
+    bool host_memory_trace{};
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
@@ -202,6 +354,8 @@ public:
     void InsertUploadMemoryBarrier() {}
 
     void TransitionImageLayout(Image& image);
+
+    bool ClearImage(Image& image);
 
     bool HasBrokenTextureViewFormats() const noexcept {
         // No known Vulkan driver has broken image views
@@ -350,6 +504,8 @@ public:
     };
 
     std::vector<MsaaScratchImage> msaa_scratch_images;
+    HostImagePool host_image_pool;
+    std::chrono::steady_clock::time_point host_object_report{};
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
 
@@ -494,9 +650,17 @@ public:
     Image& operator=(const Image&) = delete;
 
     Image(Image&&) = default;
-    Image& operator=(Image&&) = default;
+    Image& operator=(Image&&) = delete;
+
+    /// The cache deleted the image: no command is recorded on it after `tick`. Its host image
+    /// can serve another image once the GPU is past that tick (HostImagePool).
+    void RetiredAt(u64 tick) noexcept {
+        retire_tick = tick;
+    }
 
     u32 HostMipLevels() const noexcept;
+
+    [[nodiscard]] u32 HostFormat() const noexcept;
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
@@ -524,6 +688,11 @@ public:
         return *(this->*current_image);
     }
 
+    // A failed scale helper can restore the original handle while leaving Rescaled set.
+    [[nodiscard]] bool HandleMatchesRescaling() const noexcept {
+        return current_image == (IsRescaled() ? &Image::scaled_image : &Image::original_image);
+    }
+
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
         return aspect_mask;
     }
@@ -535,6 +704,22 @@ public:
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
         return original_image.GetMemoryBlock();
+    }
+
+    /// Actual VMA allocations, including the retained scaled image and compute upload buffer.
+    [[nodiscard]] std::array<u64, 3> AllocationBytes() const noexcept {
+        return {original_image.GetMemoryBlock().size + SparseBoundBytes(),
+                scaled_image.GetMemoryBlock().size, compute_unswizzle_buffer.AllocationSize()};
+    }
+
+    /// Non-sparse image allocations by VMA memory type. Sparse bindings are reported separately.
+    [[nodiscard]] std::array<std::pair<u32, u64>, 3> AllocationTypes() const noexcept {
+        const auto original = original_image.GetMemoryBlock();
+        const auto scaled = scaled_image.GetMemoryBlock();
+        return {{{original.memory_type, original.size},
+                 {scaled.memory_type, scaled.size},
+                 {compute_unswizzle_buffer.Location().memory_type,
+                  compute_unswizzle_buffer.AllocationSize()}}};
     }
 
     /// Returns true when the image is already initialized and mark it as initialized
@@ -686,6 +871,10 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    /// What original_image was made as, if the pool may keep it (HostImagePool). Declared before
+    /// it: making the image fills this in.
+    std::optional<HostImagePool::Key> pool_key;
+    std::optional<u64> retire_tick; ///< Set by RetiredAt
     vk::Image original_image;
     vk::Image scaled_image;
 

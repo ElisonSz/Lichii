@@ -20,6 +20,9 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/thread.h"
+#include "video_core/nx2_fast_wake.h"
+#include "video_core/nx2_sem_recorder.h"
+#include "video_core/nx2_sync_trace.h"
 
 namespace Tegra {
 
@@ -189,6 +192,12 @@ public:
             direct_words.insert(word);
             has_direct.store(true, std::memory_order_release);
         }
+        if (VideoCommon::SemRecorder::Enabled()) {
+            VideoCommon::SemRecorder::Add({.kind = "shadow-direct-drop",
+                                           .address = word,
+                                           .gpu = gpu_address,
+                                           .flags = words.contains(word)});
+        }
         words.erase(word);
     }
 
@@ -220,6 +229,7 @@ public:
     /// guest: what guest memory holds at the word now.
     void Set(u64 device_address, u32 value, u32 guest) {
         std::scoped_lock lock{mutex};
+        VideoCommon::SemRecorder::Record("shadow-set", device_address, value, guest);
         words.insert_or_assign(device_address & ~u64{3}, Word{value, guest});
         has_words.store(true, std::memory_order_release);
     }
@@ -235,11 +245,29 @@ public:
         if (it == words.end()) {
             return std::nullopt;
         }
+        VideoCommon::SemRecorder::Record("shadow-read", device_address, it->second.value,
+                                         it->second.guest, guest);
         if (it->second.guest != guest) {
+            VideoCommon::SemRecorder::Record("shadow-changed-drop", device_address,
+                                             it->second.value, it->second.guest, guest);
             words.erase(it);
             return std::nullopt;
         }
         return it->second.value;
+    }
+
+    /// The mirrored value held for the word and the guest value it was set with, without dropping
+    /// a stale one (for logs).
+    std::optional<std::pair<u32, u32>> Peek(u64 device_address) const {
+        if (!has_words.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        std::scoped_lock lock{mutex};
+        const auto it = words.find(device_address & ~u64{3});
+        if (it == words.end()) {
+            return std::nullopt;
+        }
+        return std::pair{it->second.value, it->second.guest};
     }
 
     void Clear() {
@@ -271,6 +299,7 @@ inline void Nx2ClearSemaphoreRegions() {
         g_nx2_semaphore_regions.clear();
     }
     Nx2MirrorShadow::Get().Clear();
+    VideoCommon::SemRecorder::Reset();
 }
 
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
@@ -565,6 +594,14 @@ public:
     static constexpr u32 AcquireEqual = 0x1;
     static constexpr u32 AcquireGequal = 0x4;
     static constexpr u32 AcquireMask = 0x8;
+    enum class Source : u8 {
+        Unknown,
+        PayloadRelease,
+        QueryResult,
+        QmdReduction,
+        QmdMax,
+        Count,
+    };
     /// One per channel suspended at once.
     static constexpr size_t MaxWaiters = 64;
 
@@ -598,13 +635,20 @@ public:
         free_slot->word = word;
         free_slot->seen =
             word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
-        free_slot->latched.store(false, std::memory_order_relaxed);
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::RemoveWaiter(owner);
+            free_slot->sync_trace_id = 0;
+        }
+        free_slot->latched.store(0, std::memory_order_relaxed);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
         return true;
     }
 
     void Remove(const void* owner) {
+        if (VideoCommon::SyncTrace::enabled) {
+            VideoCommon::SyncTrace::RemoveWaiter(owner);
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -624,10 +668,25 @@ public:
         for (const Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
-                return slot.latched.load(std::memory_order_acquire);
+                const bool met = slot.latched.load(std::memory_order_acquire) != 0;
+                if (VideoCommon::SyncTrace::enabled && met) {
+                    VideoCommon::SyncTrace::Observe(slot.sync_trace_id, owner);
+                }
+                return met;
             }
         }
         return false;
+    }
+
+    /// The first writer that met this waiter, published in the latch itself.
+    [[nodiscard]] Source LatchSource(const void* owner) const {
+        for (const Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+                const u8 latch = slot.latched.load(std::memory_order_acquire);
+                return latch == 0 ? Source::Unknown : static_cast<Source>(latch - 1);
+            }
+        }
+        return Source::Unknown;
     }
 
     /// GPU thread: whether a watched word changed in memory since it was added or since the last
@@ -651,23 +710,46 @@ public:
     }
 
     /// A GPU write of value to the u32 at device_address.
-    void OnWrite(u64 device_address, u32 value) {
+    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown,
+                 u64 sync_trace_id = 0) {
+        VideoCommon::SemRecorder::Record("waiter-write", device_address, value);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
         bool latched = false;
+        bool newly_latched = false;
         {
             std::scoped_lock lk{mutex};
             for (Slot& slot : slots) {
                 if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
                     slot.address == device_address && Matches(slot, value)) {
-                    slot.latched.store(true, std::memory_order_release);
+                    VideoCommon::SemRecorder::Record("waiter-latch", device_address, value,
+                                                     slot.value, slot.operation);
+                    const u8 previous = slot.latched.load(std::memory_order_relaxed);
+                    if (VideoCommon::SyncTrace::enabled && previous == 0) {
+                        slot.sync_trace_id = sync_trace_id;
+                        if (sync_trace_id != 0) {
+                            VideoCommon::SyncTrace::Matched(
+                                sync_trace_id, slot.owner.load(std::memory_order_relaxed));
+                        }
+                    }
+                    // Keep the first source, and retain the release publication on every matching
+                    // write: the acquire sees the engine's preceding writes as before.
+                    slot.latched.store(previous != 0 ? previous
+                                                     : static_cast<u8>(static_cast<u8>(source) + 1),
+                                       std::memory_order_release);
                     latched = true;
+                    newly_latched |= previous == 0;
                 }
             }
         }
+        // Never wake the front under the waiter-table lock; it may immediately remove its slot.
         if (latched) {
             Nx2PendingWake::Get().Notify();
+        }
+        if (VideoCommon::FastWake::enabled && newly_latched &&
+            VideoCommon::FastWake::pending.Notify()) {
+            VideoCommon::FastWake::counters.latch_signals.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -679,7 +761,8 @@ private:
         u32 operation{};
         u32* word{}; ///< The semaphore in host memory, or null
         u32 seen{};  ///< *word when last looked at (WordStored)
-        std::atomic<bool> latched{};
+        u64 sync_trace_id{}; // First latch writer; published by latched release/acquire.
+        std::atomic<u8> latched{}; ///< Zero, or Source + 1 of the first matching write
     };
 
     static bool Matches(const Slot& slot, u32 current) {

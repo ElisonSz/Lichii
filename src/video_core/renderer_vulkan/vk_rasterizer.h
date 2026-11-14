@@ -16,24 +16,26 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_oot_whiteout.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
-#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
-#include "video_core/vertex_input_cache.h"
+#include "video_core/teardown_timing.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -102,6 +104,7 @@ public:
     void ResetCounter(VideoCommon::QueryType type) override;
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
+    void NoteFastDrawWrite(GPUVAddr gpu_addr, u64 size) override;
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
     void FlushAll() override;
@@ -116,6 +119,14 @@ public:
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    bool Nx2ListSlotsSupported() const override;
+    std::optional<u32> Nx2AcquireListSlot() override;
+    void Nx2ReleaseListSlot(u32 slot) override;
+    void Nx2SnapshotListWords(DAddr device_addr, u32 count, u32 slot) override;
+    void Nx2NoteOwedListWord(DAddr device_addr, u32 value) override;
+    void Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) override;
+    void Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) override;
+    void Nx2CheckListSlot(u32 slot, std::span<const u32> words) override; // TEST
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -261,7 +272,9 @@ private:
     /// registers VideoCommon::VertexInputKey holds).
     void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
                           u32 max_bindings, VertexInputState& state);
-    /// Dynamic vertex input states built before, by the registers they were built from.
+    /// Dynamic vertex input states built before, by the registers they were built from
+    /// (EDEN_NX2_DRAW_VERTEX_INPUT's cache, always on). VideoCommon::VertexInputCache comes from
+    /// draw_delta.h.
     VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
 
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
@@ -291,24 +304,40 @@ private:
     s32 bound_channel_id = -1;
     Scheduler& scheduler;
 
+    VideoCommon::TeardownClock teardown_clock;
+    VideoCommon::TeardownMarker teardown_staging{teardown_clock, "staging buffers"};
     StagingBufferPool staging_pool;
+    VideoCommon::TeardownMarker teardown_descriptors{teardown_clock, "descriptor pools"};
     DescriptorPool descriptor_pool;
+    VideoCommon::TeardownMarker teardown_queues{teardown_clock,
+                                                "descriptor queues and buffer ring"};
     GuestDescriptorQueue guest_descriptor_queue;
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
     DescriptorBufferRing descriptor_buffer_ring;
+    VideoCommon::TeardownMarker teardown_blit{teardown_clock, "image blitter and render passes"};
     BlitImageHelper blit_image;
     RenderPassCache render_pass_cache;
 
+    VideoCommon::TeardownMarker teardown_textures{teardown_clock, "texture cache and runtime"};
     TextureCacheRuntime texture_cache_runtime;
     TextureCache texture_cache;
+    VideoCommon::TeardownMarker teardown_buffers{teardown_clock, "buffer cache and runtime"};
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
+    VideoCommon::TeardownMarker teardown_queries{teardown_clock, "query cache and runtime"};
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
+    VideoCommon::TeardownMarker teardown_pipelines{teardown_clock,
+                                                   "pipeline cache including members"};
     PipelineCache pipeline_cache;
+    VideoCommon::TeardownMarker teardown_tail{teardown_clock,
+                                              "upscaler, frame dump, fences and DMA"};
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
     FrameDump frame_dump;
+    OotWhiteoutDetector whiteout;
+    void WhiteoutBindings(bool compute, u64 shader);
+    std::array<u64, 5> whiteout_binding_frames{};
 
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
@@ -426,6 +455,7 @@ private:
         const Tegra::Engines::Maxwell3D* maxwell3d{};
         u64 serial{};
         u64 map_serial{};
+        u64 match_serial{};
         u64 tick{};
         u64 render_pass{};
         Maxwell::PrimitiveTopology topology{};
@@ -441,6 +471,8 @@ private:
         HandleBind,
         HandleData,
         SampledImages,
+        TextureHandles,
+        TextureDescriptors,
         ComputedHandles,
         VertexInput,
         Count,
@@ -461,13 +493,26 @@ private:
         Count,
     };
     enum class DrawPath : u8 { Full, Delta, Count };
+    /// EDEN_NX2_DRAW_REUSE: how candidates' handles were found to hold (DeltaStillHolds).
+    enum class ReuseCheck : u8 { Untouched, Reevaluated, Changed, BackedOff, Count };
     struct FastDrawStats {
         u64 delta{};
+        std::array<u64, static_cast<size_t>(ReuseCheck::Count)> reuse{};
+        /// EDEN_NX2_DRAW_VERTEX_INPUT: states recorded from the cache and built.
+        u64 vertex_input_hits{};
+        u64 vertex_input_misses{};
+        /// EDEN_NX2_DRAW_REUSE: full resolves whose delta candidate failed its checks.
+        u64 candidate_full_ns{};
+        u64 candidate_full_draws{};
         std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
         std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
         /// PrepareDraw time and draws per path.
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// Exact experiment union (id=1, layout=2, queries=4), then full/delta path.
+        std::array<std::array<u64, 2>, 8> matched_ns{};
+        std::array<std::array<u64, 2>, 8> matched_draws{};
+        std::array<u64, 8> matched_rejected{};
         /// EDEN_NX2_FAST_DRAW_VERIFY
         u64 verified{};
         u64 pipeline_mismatches{};
@@ -480,6 +525,12 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        /// StateChanged draws by the union of all break classes since the previous draw.
+        std::array<u64, 1U << VideoCommon::Nx2FastDraw::NumBreakClasses> break_sets{};
+        /// New cases actually accepted, and compared by FAST_DRAW_VERIFY, respectively.
+        std::array<u64, 3> experiment_draws{};
+        std::array<u64, 3> experiment_verified{};
+        u64 frames{};
         u64 window_start{};
     };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
@@ -489,9 +540,18 @@ private:
                                 bool constant_buffer_data);
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
-    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    bool DeltaStillHolds(u64 serial, u64 map_serial, bool matching = false);
+    /// EDEN_NX2_DRAW_REUSE: whether a constant buffer bind or data written since the previous draw
+    /// (taken_delta) reaches what the pipeline's handles are computed from.
+    bool DeltaHandleInputsReached(const GraphicsPipeline& pipeline);
+    /// EDEN_NX2_DRAW_REUSE: whether a write the caches were told about since the previous draw
+    /// reaches the texture or sampler header tables (or such writes were lost).
+    bool NotedWritesReachHeaders();
+    /// Device memory of the header tables NotedWritesReachHeaders checks.
+    VideoCommon::Nx2FastDraw::DeviceSpans header_spans;
+    VideoCommon::Nx2FastDraw::DeviceSpans sampler_spans;
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
-                          u64 map_serial);
+                          u64 map_serial, u64 match_serial);
     void ReportFastDraws();
 
     /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
@@ -516,6 +576,9 @@ private:
 
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// EDEN_NX2_DRAW_REUSE: the pipeline TakeReusableDraw looked up for a vertex layout change,
+    /// which PrepareDraw takes instead of looking it up again (null: none).
+    GraphicsPipeline* prelooked_pipeline{};
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>
@@ -527,6 +590,36 @@ private:
     /// Constant buffer data since the last BeginGraphicsUniforms that no delta it got holds.
     bool uniform_writes_lost{};
     FastDrawStats fast_draw_stats;
+    /// Track D (EDEN_NX2_DRAWX_*), logged with the fast draw windows.
+    struct DrawXStats {
+        u64 converted{};            ///< Delta draws whose chain a skipped break kept
+        u64 pipeline_state_same{};  ///< Fixed-function/shader re-lookups: same pipeline or twin
+        u64 pipeline_state_other{}; ///< ... another pipeline (full resolve)
+        u64 uniform_full_draws{};   ///< Full draws taking uniform keeps
+        /// ... outside a keep chain (a non-register break came first): only nx2's keep rule
+        /// (until a synchronisation point) keeps uniforms there.
+        u64 uniform_full_unchained{};
+        u64 uniform_full_blocked{}; ///< Full draws without (writes lost, keeps off)
+        u64 uniform_full_kept{};    ///< Uniform buffers kept on those full draws
+        u64 uniform_full_streamed{};
+        u64 twins{};      ///< Delta candidates that went on with a twin pipeline
+        u64 twin_delta{}; ///< ... and were drawn as delta draws
+        u64 twins_by_descriptors{}; ///< Twins only EDEN_NX2_DRAWX_TWIN2 allows
+        u64 verified{}; ///< Candidates a skipped break or a twin kept, prepared in full, compared
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+    } drawx_stats;
+    /// EDEN_NX2_DRAWX_TWIN: the pipeline the previous draw bound when TakeReusableDraw handed on
+    /// its delta state to a twin (taken_draw.pipeline), else null.
+    GraphicsPipeline* twin_source{};
+    /// EDEN_NX2_DRAWX_UNIFORMS: Nx2FastDraw::g_keep_serial when the previous draw began binding
+    /// uniforms, if it is the draw that took g_delta last (statistics: DrawXStats).
+    VideoCommon::Nx2FastDraw::KeepChain drawx_keep_chain;
+    u32 taken_break_classes{};
+    bool matched_candidate{};
+    u64 fast_draw_window{};
+    void NoteStateChanged();
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};

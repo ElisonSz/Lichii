@@ -19,12 +19,13 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_trace.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -32,8 +33,11 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/stream_stats.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+#include "video_core/wait_stats.h"
 
 namespace Vulkan {
 
@@ -163,7 +167,8 @@ Scheduler::~Scheduler() {
         worker_thread.request_stop();
         worker_thread.join();
         if (trace_gpu_tick != 0) {
-            master_semaphore->Wait(trace_gpu_tick);
+            VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::Trace,
+                                               [&] { master_semaphore->Wait(trace_gpu_tick); });
         }
     }
 }
@@ -208,6 +213,9 @@ bool Scheduler::DeferFlush() {
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;
     }
+    if (VideoCommon::WaitStats::Enabled()) {
+        deferred_wait_reasons |= VideoCommon::WaitStats::CurrentReasonBit();
+    }
     flush_pending = true;
     return true;
 }
@@ -250,12 +258,16 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
+    const VideoCommon::WaitStats::ReasonScope wait_reason{VideoCommon::WaitStats::Reason::Finish};
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
+    VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Finishes);
+    const VideoCommon::StreamStats::Scope stream_finish{
+        VideoCommon::StreamStats::Counter::FinishNs};
     // When finishing, we need to wait for the submission to have executed on the device.
     const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
@@ -275,6 +287,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::WorkerWait);
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -368,6 +381,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (VideoCommon::StreamStats::Enabled()) {
+        VideoCommon::StreamStats::frames.Graphics(CurrentTick());
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -572,6 +588,7 @@ bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
+    const VideoCommon::WaitStats::ThreadScope wait_thread{VideoCommon::WaitStats::Thread::Worker};
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
     const VideoCommon::StutterTrace::ThreadScope stutter_thread{
         VideoCommon::StutterTrace::Thread::Worker};
@@ -882,6 +899,7 @@ void Scheduler::TraceGpuSubmission() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::Submit);
     if (uploads_pending) {
         // Keep the copies in the tick that protects their staging regions and buffer lifetimes.
         FlushUploads();
@@ -893,7 +911,21 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     EndPendingOperations();
     InvalidateState();
 
+    if (VideoCommon::WaitStats::Enabled()) {
+        const u64 trigger = VideoCommon::WaitStats::CurrentReasonBit();
+        // An idle-hook flush has no new cause; keep the causes that requested it.
+        const u64 reasons = deferred_wait_reasons != 0 && VideoCommon::WaitStats::CurrentReason() ==
+                                                              VideoCommon::WaitStats::Reason::Other
+                                ? deferred_wait_reasons
+                                : trigger | deferred_wait_reasons;
+        VideoCommon::WaitStats::RecordSubmission(reasons, flush_pending);
+        deferred_wait_reasons = 0;
+    }
+    VideoCommon::StreamStats::Add(VideoCommon::StreamStats::Counter::Submissions);
     const u64 signal_value = master_semaphore->NextTick();
+    if (VideoCommon::SyncTrace::enabled) {
+        VideoCommon::SyncTrace::Issued(this, signal_value);
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -925,8 +957,16 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const VkResult result = [&] {
+            const VideoCommon::StreamStats::Scope stream_submit{
+                VideoCommon::StreamStats::Counter::QueueSubmitNs};
+            if (VideoCommon::SyncTrace::enabled) {
+                VideoCommon::SyncTrace::Submitted(this, signal_value);
+            }
+            return master_semaphore->SubmitQueue(cmdbuf, upload_cmdbuf, signal_semaphore,
+                                                 wait_semaphore, signal_value);
+        }();
+        switch (result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
@@ -989,6 +1029,7 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
+        VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::PassEnd);
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;

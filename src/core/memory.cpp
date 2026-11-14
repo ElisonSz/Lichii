@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -40,6 +41,8 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_protect.h"
+#include "video_core/nx2_sem_recorder.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -355,35 +358,47 @@ struct Memory::Impl {
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
-        return WalkBlock(addr, size,
-        [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
-            LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
-        },
-        [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
-        },
-        [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            if (!unsafe) {
-                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-            }
-            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
-            VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
-        });
+        return WalkBlock(
+            addr, size,
+            [addr, size](const std::size_t offset, const std::size_t copy_amount,
+                         const Common::ProcessAddress current_vaddr) {
+                LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})",
+                          GetInteger(current_vaddr), GetInteger(addr), size);
+            },
+            [&](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+                RecordCpuStore(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            },
+            [&](const Common::ProcessAddress current_vaddr, const std::size_t offset,
+                const std::size_t copy_amount, u8* const ptr) {
+                if (!unsafe) {
+                    HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                }
+                RecordCpuStore(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
+            });
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
-        return WalkBlock(addr, size,
-        [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
-            LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
-        },
-        [=](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            std::memset(ptr, 0, copy_amount);
-        },
-        [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-            std::memset(ptr, 0, copy_amount);
-            VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
-        });
+        return WalkBlock(
+            addr, size,
+            [addr, size](const std::size_t offset, const std::size_t copy_amount,
+                         const Common::ProcessAddress current_vaddr) {
+                LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})",
+                          GetInteger(current_vaddr), GetInteger(addr), size);
+            },
+            [this](const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+                RecordCpuStore(ptr, nullptr, copy_amount);
+                std::memset(ptr, 0, copy_amount);
+            },
+            [&](const Common::ProcessAddress current_vaddr, const std::size_t offset,
+                const std::size_t copy_amount, u8* const ptr) {
+                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                RecordCpuStore(ptr, nullptr, copy_amount);
+                std::memset(ptr, 0, copy_amount);
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
+            });
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
@@ -521,7 +536,17 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                // EDEN_NX2_PROTECT_STATS: the call's time and source.
+                const u64 start = VideoCommon::Nx2Protect::NowNs();
+                host_buffer->Protect(vaddr, size, perm);
+                const u64 end = VideoCommon::Nx2Protect::NowNs();
+                VideoCommon::Nx2Protect::NoteProtect(
+                    cached, size, end - start,
+                    system.GetCurrentHostThreadID() < Core::Hardware::NUM_CPU_CORES, end);
+            } else {
+                host_buffer->Protect(vaddr, size, perm);
+            }
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
@@ -599,9 +624,103 @@ struct Memory::Impl {
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
+    /// EDEN_NX2_PROTECT_STATS: what the reads that asked the caches got back, and whether a core
+    /// that kept its last 4 or 16 areas (instead of 1) would have had the read's address in one.
+    /// One line every 10 s.
+    void NoteAskedArea(size_t core, DAddr address, const VideoCore::RasterizerDownloadArea& area) {
+        struct Counters {
+            std::atomic<u64> asks{};
+            std::atomic<u64> preemptive{};
+            std::atomic<u64> in_flight{};
+            std::atomic<u64> page_sized{};
+            std::atomic<u64> in_last4{};
+            std::atomic<u64> in_last16{};
+            std::atomic<u64> bytes{};
+            std::atomic<u64> window_start{};
+        };
+        static Counters counters;
+        auto& recent = recent_read_areas[core];
+        bool in4 = false;
+        bool in16 = false;
+        for (size_t i = 0; i < recent.size(); ++i) {
+            const auto& old_area = recent[(recent_read_area_next[core] + recent.size() - 1 - i) %
+                                          recent.size()];
+            if (old_area.start_address <= address && address < old_area.end_address) {
+                in16 = true;
+                in4 = in4 || i < 4;
+            }
+        }
+        recent[recent_read_area_next[core]] = area;
+        recent_read_area_next[core] = (recent_read_area_next[core] + 1) % recent.size();
+        counters.asks.fetch_add(1, std::memory_order_relaxed);
+        counters.preemptive.fetch_add(area.preemtive ? 1 : 0, std::memory_order_relaxed);
+        counters.in_flight.fetch_add(area.in_flight ? 1 : 0, std::memory_order_relaxed);
+        counters.page_sized.fetch_add(
+            area.end_address - area.start_address <= LICHII_PAGESIZE ? 1 : 0,
+            std::memory_order_relaxed);
+        counters.in_last4.fetch_add(in4 ? 1 : 0, std::memory_order_relaxed);
+        counters.in_last16.fetch_add(in16 ? 1 : 0, std::memory_order_relaxed);
+        counters.bytes.fetch_add(area.end_address - area.start_address, std::memory_order_relaxed);
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+        u64 start = counters.window_start.load(std::memory_order_relaxed);
+        if (start == 0) {
+            counters.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - start < 10'000'000'000ULL ||
+            !counters.window_start.compare_exchange_strong(start, now,
+                                                           std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 asks = counters.asks.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_Memory,
+                 "Read areas {:.1f} s: {} asks, {} preemptive, {} in flight, {} of one page, "
+                 "average {} KiB; the address was in the core's last 4 areas {}, last 16 {}",
+                 static_cast<double>(now - start) / 1e9, asks,
+                 counters.preemptive.exchange(0, std::memory_order_relaxed),
+                 counters.in_flight.exchange(0, std::memory_order_relaxed),
+                 counters.page_sized.exchange(0, std::memory_order_relaxed),
+                 asks == 0 ? 0 : counters.bytes.exchange(0, std::memory_order_relaxed) / asks / 1024,
+                 counters.in_last4.exchange(0, std::memory_order_relaxed),
+                 counters.in_last16.exchange(0, std::memory_order_relaxed));
+    }
+
+    /// EDEN_NX2_READ_AREAS=1: a GPU write invalidates only the cores' read areas it overlaps.
+    [[nodiscard]] static bool ReadAreasTargeted() {
+        static const bool targeted = [] {
+            const char* value = std::getenv("EDEN_NX2_READ_AREAS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return targeted;
+    }
+
+    void InvalidateReadAreas(u64 device_begin, u64 size) {
+        if (!ReadAreasTargeted() || size == 0) {
+            return;
+        }
+        const u64 device_end = device_begin + size;
+        // Pairs with the core's publish-then-check in HandleRasterizerDownload: either the core
+        // sees this epoch and drops the area it is publishing, or this sees the published area.
+        arm_epoch.fetch_add(1, std::memory_order_seq_cst);
+        for (SharedReadArea& shared : shared_read_areas) {
+            const u64 start = shared.start.load(std::memory_order_seq_cst);
+            const u64 end = shared.end.load(std::memory_order_seq_cst);
+            if (start < device_end && device_begin < end) {
+                shared.invalidations.fetch_add(1, std::memory_order_release);
+            }
+        }
+    }
+
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
-        // Clean cached read areas also need invalidation when reactive flushing is enabled.
-        read_trap_generation.fetch_add(1, std::memory_order_release);
+        // Clean cached read areas also need invalidation when reactive flushing is enabled. With
+        // EDEN_NX2_READ_AREAS only the areas the write overlaps lose it (InvalidateReadAreas): this
+        // bump emptied every core's area at each GPU write, so most reads of cached memory asked
+        // the caches again (~10,000 a second in Castle Town), and waited for their locks.
+        if (!ReadAreasTargeted()) {
+            read_trap_generation.fetch_add(1, std::memory_order_release);
+        }
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
             return;
@@ -827,6 +946,33 @@ struct Memory::Impl {
         return T{};
     }
 
+    void RecordCpuStore(const u8* destination, const void* bytes, size_t count) {
+        if (!VideoCommon::SemRecorder::MayHostRange(destination, count)) {
+            return;
+        }
+        auto& device_manager = system.Host1x().MemoryManager();
+        if (!device_manager.IsPhysicalPointer(destination)) {
+            return;
+        }
+        Common::ScratchBuffer<u32> addresses;
+        const auto* source_bytes = static_cast<const u8*>(bytes);
+        for (size_t offset = 0; offset < count;) {
+            const auto* target = destination + offset;
+            const size_t amount = (std::min)(
+                count - offset, size_t{0x1000} - (reinterpret_cast<uintptr_t>(target) & 0xfff));
+            if (!VideoCommon::SemRecorder::MayHostRange(target, amount)) {
+                offset += amount;
+                continue;
+            }
+            device_manager.ApplyOpOnPointer(target, addresses, [&](DAddr device_address) {
+                VideoCommon::SemRecorder::TrackedBytes(
+                    bytes != nullptr ? "cpu-store" : "cpu-zero", device_address,
+                    source_bytes != nullptr ? source_bytes + offset : nullptr, amount, false);
+            });
+            offset += amount;
+        }
+    }
+
     /// @brief Writes a particular data type to memory at the given virtual address.
     /// @param vaddr The virtual address to write the data type to.
     /// @tparam T The data type to write to memory.
@@ -834,12 +980,18 @@ struct Memory::Impl {
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
         bool rasterizer_write = false;
-        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
-            LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() {
-            HandleRasterizerWrite(addr, sizeof(T));
-            rasterizer_write = true;
-        }); ptr) [[likely]] {
+        if (auto const ptr = GetPointerImpl(
+                addr,
+                [addr, data]() {
+                    LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8,
+                              addr, u64(data));
+                },
+                [&]() {
+                    HandleRasterizerWrite(addr, sizeof(T));
+                    rasterizer_write = true;
+                });
+            ptr) [[likely]] {
+            RecordCpuStore(ptr, &data, sizeof(T));
             std::memcpy(ptr, &data, sizeof(T));
             if (rasterizer_write) [[unlikely]] {
                 VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
@@ -857,7 +1009,11 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            if (stored) {
+                RecordCpuStore(ptr, &data, sizeof(T));
+            }
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
             return stored;
         }
@@ -873,7 +1029,11 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            if (stored) {
+                RecordCpuStore(ptr, &data, sizeof(data));
+            }
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(u128));
             return stored;
         }
@@ -921,6 +1081,9 @@ struct Memory::Impl {
             ReportForeignPointer(v_address, p);
             return;
         }
+        if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+            VideoCommon::Nx2Protect::NoteCpuRead(v_address);
+        }
         const size_t core = system.GetCurrentHostThreadID();
         if (core >= Core::Hardware::NUM_CPU_CORES) {
             // A service thread has no slot in the arrays below, and it does not use a slot of a
@@ -931,6 +1094,9 @@ struct Memory::Impl {
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
                 DisarmReadTraps(v_address, size);
+                if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                    VideoCommon::Nx2Protect::NoteCpuReadAsked();
+                }
                 (void)system.GPU().OnCPURead(address, size);
             });
             return;
@@ -941,6 +1107,15 @@ struct Memory::Impl {
             current_area = {};
             read_area_generations[core] = generation;
         }
+        SharedReadArea& shared = shared_read_areas[core];
+        const bool targeted = ReadAreasTargeted();
+        if (targeted) {
+            if (const u64 invalidations = shared.invalidations.load(std::memory_order_acquire);
+                seen_read_area_invalidations[core] != invalidations) {
+                current_area = {};
+                seen_read_area_invalidations[core] = invalidations;
+            }
+        }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
@@ -948,7 +1123,23 @@ struct Memory::Impl {
                 return;
             }
             DisarmReadTraps(v_address, size);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                VideoCommon::Nx2Protect::NoteCpuReadAsked();
+            }
+            const u64 epoch = targeted ? arm_epoch.load(std::memory_order_seq_cst) : 0;
             current_area = system.GPU().OnCPURead(address, size);
+            if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                NoteAskedArea(core, address, current_area);
+            }
+            if (targeted) {
+                // Publish the area, then look whether an invalidation ran meanwhile: it may have
+                // looked at the previous area, so this one is not kept.
+                shared.start.store(current_area.start_address, std::memory_order_seq_cst);
+                shared.end.store(current_area.end_address, std::memory_order_seq_cst);
+                if (arm_epoch.load(std::memory_order_seq_cst) != epoch) {
+                    current_area = {};
+                }
+            }
         });
     }
 
@@ -977,6 +1168,9 @@ struct Memory::Impl {
             ReportForeignPointer(v_address, p);
             return;
         }
+        if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+            VideoCommon::Nx2Protect::NoteCpuWrite(v_address);
+        }
         // Guard on sys_core;
         if (core == sys_core) [[unlikely]] {
             sys_core_guard.lock();
@@ -987,6 +1181,8 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            VideoCommon::SemRecorder::Add(
+                {.kind = "cpu-write-notify", .address = address, .size = size, .gpu = v_address});
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> LICHII_PAGEBITS;
             // Performance note:
@@ -997,6 +1193,9 @@ struct Memory::Impl {
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
+                if (VideoCommon::Nx2Protect::g_stats) [[unlikely]] {
+                    VideoCommon::Nx2Protect::NoteCpuWriteAsked(do_collection);
+                }
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
@@ -1041,6 +1240,22 @@ struct Memory::Impl {
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
+    /// EDEN_NX2_READ_AREAS: each core's read area as other threads see it, and how often a GPU
+    /// write overlapping it invalidated it (the core compares with the count it last saw).
+    struct SharedReadArea {
+        std::atomic<u64> start{};
+        std::atomic<u64> end{};
+        std::atomic<u64> invalidations{};
+    };
+    std::array<SharedReadArea, Core::Hardware::NUM_CPU_CORES> shared_read_areas{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> seen_read_area_invalidations{};
+    /// EDEN_NX2_PROTECT_STATS (NoteAskedArea): each core's last 16 read areas.
+    std::array<std::array<VideoCore::RasterizerDownloadArea, 16>, Core::Hardware::NUM_CPU_CORES>
+        recent_read_areas{};
+    std::array<size_t, Core::Hardware::NUM_CPU_CORES> recent_read_area_next{};
+    /// EDEN_NX2_READ_AREAS: counts InvalidateReadAreas calls, so a core that computed its area
+    /// while one ran drops it.
+    std::atomic<u64> arm_epoch{};
     std::atomic<u64> read_trap_generation{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
@@ -1246,6 +1461,10 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+}
+
+void Memory::InvalidateReadAreas(u64 device_begin, u64 size) {
+    impl->InvalidateReadAreas(device_begin, size);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {

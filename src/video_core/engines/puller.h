@@ -84,9 +84,33 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
-        /// When an unmet poll last drained (CanResumeAcquire)
+        /// When a poll last drained (the 1 ms valve, PollWithoutDrain)
         std::chrono::steady_clock::time_point last_drain;
         bool reported; ///< The 2 s warning was logged
+        /// GpuSplit::Starts when the acquire was sent: the positions below are of that start.
+        u32 split_start{};
+        /// GpuSplit::LastWriterPosition when the acquire was sent: compute and copy work before
+        /// it may release the word without the front's knowing (QMD releases).
+        u64 writers_before{};
+        /// A flush of the word out of the buffer cache, sent to the split's back: until the back
+        /// ran it, memory may hold an older value than the cache.
+        std::optional<u64> flush_position{};
+        /// GpuSplit::Position when the acquire was sent, and whether the fence work was sent
+        /// since: once the back ran everything before the acquire and it still waits, as after
+        /// the drain this replaces.
+        u64 sent_at{};
+        bool fences_released{};
+        /// Its waiter has a slot: a release the back runs latches it (Nx2SemaphoreWaiters::Add).
+        bool registered{};
+        // The scheduler already polled this acquire before resuming the channel.
+        bool met{};
+        bool stats_flushed{}; ///< EDEN_NX2_ACQUIRE_STATS: a cache flush was requested
+        bool stats_resumed{}; ///< The scheduler may ask again before clearing this acquire
+        /// EDEN_NX2_SYNC_SUSPEND: suspended before the back ran the entry of the fence-flagged
+        /// release it waits for, which ends at this position; cleared once a poll sees it ran.
+        std::optional<u64> early_position{};
+        std::chrono::steady_clock::time_point early_since{}; ///< When it was suspended so
+        u64 early_sent{}; ///< GpuSplit::Position then
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
@@ -100,6 +124,11 @@ public:
 
     [[nodiscard]] bool HasPendingAcquire() const {
         return pending_acquire.has_value();
+    }
+    /// EDEN_NX2_SYNC_SUSPEND: the ring position the back has to reach before the pending acquire
+    /// can be decided, if it was suspended before that (PendingAcquire::early_position).
+    [[nodiscard]] std::optional<u64> EarlyPosition() const {
+        return pending_acquire ? pending_acquire->early_position : std::nullopt;
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
@@ -160,7 +189,27 @@ private:
     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
+    template <bool Track>
+    void ProcessSemaphoreTriggerMethodImpl(DmaPusher& dma_pusher);
+    template <bool Track>
+    bool CanResumeAcquireImpl(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    /// Decides a Switch 2 acquire from the split's view of the semaphore words: passes it, or
+    /// suspends the channel on it. False when the view doesn't apply (drain as before).
+    template <bool Track, typename Observation>
+    bool AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire, Observation* observed);
+    /// EDEN_NX2_SYNC_SUSPEND: for an acquire whose view `answer` is a wait for the entry of a
+    /// fence-flagged release, suspends it before the back gets there where the baseline may
+    /// suspend it after that wait; may first wait for the work sent before the release (then
+    /// `answer` is asked again, and `waited` set). True when it suspended the acquire.
+    template <bool Track, typename Answer, typename Observation>
+    bool SuspendEarly(DmaPusher& dma_pusher, PendingAcquire& acquire, u64 device, Answer& answer,
+                      bool& waited, Observation* observed);
+    /// Suspends the channel on `acquire` (the view's path).
+    void Suspend(DmaPusher& dma_pusher, PendingAcquire& acquire);
+    /// CanResumeAcquire for an acquire the view decides, at `device`.
+    template <bool Track>
+    bool PollWithoutDrain(DmaPusher& dma_pusher, u64 device);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;

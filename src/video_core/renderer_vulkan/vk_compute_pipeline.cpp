@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/oot_whiteout_trace.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -331,6 +332,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             return;
         }
 
+        VideoCommon::OotWhiteout::Add(VideoCommon::OotWhiteout::Event::DriverBuilt, shader_hash);
         // Log compute pipeline creation
         if (GPU::Logging::IsActive()) {
             GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
@@ -394,6 +396,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     } else if (!build_queue.owner_builds) {
         RunBuild();
     }
+}
+
+PipelineHandles ComputePipeline::TakeHandles() {
+    ASSERT(IsBuildTaskDone());
+    // Drop cancelled build captures before their referenced caches and guest state go away.
+    build_task = {};
+    PipelineHandles handles;
+    handles.spv_modules[0] = std::move(spv_module);
+    handles.descriptor_set_layout = std::move(descriptor_set_layout);
+    handles.pipeline_layout = std::move(pipeline_layout);
+    handles.descriptor_update_template = std::move(descriptor_update_template);
+    handles.pipeline = std::move(pipeline);
+    return handles;
 }
 
 ComputePipeline::~ComputePipeline() {
@@ -463,10 +478,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
-            return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, gpu_memory, cbuf_address,
-                                   device.GetStorageBufferAlignment(), index),
-                               via_header_index);
+            return VideoCommon::TexturePairOrNull(
+                VideoCommon::EvaluateTextureHandle(info, desc.handle_program, gpu_memory,
+                                                   cbuf_address, device.GetStorageBufferAlignment(),
+                                                   index),
+                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
         const u32 index_offset{index << desc.size_shift};
@@ -512,8 +528,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             VideoCommon::SamplerId sampler{};
             VideoCommon::EvaluateTextureHandles(
                 info, desc.handle_program, gpu_memory, cbuf_address,
-                device.GetStorageBufferAlignment(), desc.count, [&](u32, u32 raw) {
-                    const auto handle{TexturePair(raw, via_header_index)};
+                device.GetStorageBufferAlignment(), desc.count, [&](u32, std::optional<u32> raw) {
+                    const auto handle{VideoCommon::TexturePairOrNull(raw, via_header_index)};
                     views.push_back({handle.first});
                     if (handle.second != last_sampler_index) {
                         sampler = texture_cache.GetSamplerId(handle.second, true);
@@ -521,7 +537,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                     }
                     samplers.push_back(sampler);
                 });
-            if (VideoCommon::HandleTableNotes::Wanted()) {
+            if (VideoCommon::HandleTableNotes::Wanted()) [[unlikely]] {
                 std::vector<u32> tics(desc.count);
                 for (u32 index = 0; index < desc.count; ++index) {
                     tics[index] = views[first + index].index;
@@ -532,7 +548,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             continue;
         }
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+            const auto handle{VideoCommon::HandleMustBeNull(info, desc, index)
                                   ? VideoCommon::NULL_TEXTURE_HANDLE
                                   : read_handle(desc, index)};
             views.push_back({handle.first});
@@ -724,8 +740,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             }
-            // Every GPU channel waits with the dispatch, so long waits are freezes.
             const auto waited = std::chrono::steady_clock::now() - begin;
+            if (VideoCommon::OotWhiteout::Enabled()) {
+                VideoCommon::OotWhiteout::Add(
+                    VideoCommon::OotWhiteout::Event::ComputeWait, ShaderHash(),
+                    static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(waited).count()));
+            }
+            // Every GPU channel waits with the dispatch, so long waits are freezes.
             if (waited > std::chrono::milliseconds{50}) {
                 LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}",
                          std::chrono::duration<double, std::milli>(waited).count(), shader_hash);

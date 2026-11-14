@@ -171,7 +171,8 @@ void StateAccess::CaptureChannel(Writer& writer, ChannelState& channel) {
                            : 0;
         }
         bytes.Put(types);
-        bytes.Put(pusher.dma_semaphore);
+        bytes.Put(pusher.dma_registers);
+        bytes.Put(pusher.inline_to_memory_registers);
         bytes.Put(pusher.puller.regs);
         bytes.Put(pusher.puller.bound_engines);
         Emit(writer, StateKind::Pusher, id, bytes);
@@ -229,7 +230,7 @@ void StateAccess::CaptureGlobals(Writer& writer, ChannelState* any_channel,
     }
     {
         Bytes bytes;
-        for (const auto& [address, state] : Tegra::NativeQmdScheduler::states) {
+        for (const auto& [address, state] : Tegra::NativeQmdScheduler::shared_states) {
             bytes.Put(address);
             bytes.Put(state);
         }
@@ -274,8 +275,9 @@ bool StateAccess::Restore(const Record& record, ChannelState* channel, ChannelSt
         u32 increment_once{};
         std::array<u32, 8> types{};
         if (!cursor.Get(pusher.dma_state) || !cursor.Get(increment_once) || !cursor.Get(types) ||
-            !cursor.Get(pusher.dma_semaphore) || !cursor.Get(pusher.puller.regs) ||
-            !cursor.Get(pusher.puller.bound_engines) || !cursor.Done()) {
+            !cursor.Get(pusher.dma_registers) || !cursor.Get(pusher.inline_to_memory_registers) ||
+            !cursor.Get(pusher.puller.regs) || !cursor.Get(pusher.puller.bound_engines) ||
+            !cursor.Done()) {
             return false;
         }
         pusher.dma_increment_once = increment_once != 0;
@@ -365,7 +367,7 @@ bool StateAccess::Restore(const Record& record, ChannelState* channel, ChannelSt
                cursor.Get(context->compute_positions) && cursor.Done();
     }
     case StateKind::QmdStates: {
-        auto& states = Tegra::NativeQmdScheduler::states;
+        auto& states = Tegra::NativeQmdScheduler::shared_states;
         states.clear();
         while (!cursor.Done()) {
             Tegra::NativeQmdScheduler::Address address{};

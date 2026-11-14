@@ -28,9 +28,11 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/wait_stats.h"
 
 namespace VideoCommon {
 template <typename Trait>
@@ -70,6 +72,10 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
+    /// A flush DeferFlush deferred waits for its submission (the split's back only).
+    [[nodiscard]] bool IsFlushPending() const noexcept {
+        return flush_pending;
+    }
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -287,6 +293,7 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            VideoCommon::Nx2FastDraw::NoteEffect(VideoCommon::Nx2FastDraw::Effect::HostWait);
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
@@ -360,6 +367,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    u64 deferred_wait_reasons{};
     u64 record_serial{};    ///< Commands recorded
     u64 submitted_serial{}; ///< record_serial at the last Flush or Finish
 
@@ -407,6 +415,8 @@ private:
         bool Record(T& command) {
             using FuncType = TypedCommand<T>;
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
+            // The offset is aligned within data, so data itself must be aligned at least as much.
+            static_assert(alignof(FuncType) <= DataAlignment, "Lambda needs more alignment");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
             if (command_offset > sizeof(data) - sizeof(FuncType)) {
@@ -442,7 +452,13 @@ private:
 
         size_t command_offset = 0;
         bool submit = false;
-        alignas(std::max_align_t) std::array<u8, 0x8000> data{};
+        /// Commands are constructed in data at offsets aligned for their type. Some hold
+        /// alignas(16) members (the ASTC decoder pass's BlockLinearSwizzle2DParams), and
+        /// std::max_align_t is only 8 on MSVC and clang-cl, so data asks for 16 itself rather
+        /// than depending on where the members before it happen to end.
+        static constexpr size_t DataAlignment =
+            alignof(std::max_align_t) > 16 ? alignof(std::max_align_t) : 16;
+        alignas(DataAlignment) std::array<u8, 0x8000> data{};
     };
 
     struct State {

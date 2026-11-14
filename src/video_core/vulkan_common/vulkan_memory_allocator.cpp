@@ -225,8 +225,12 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     return image;
 }
 
-vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
+vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                          bool render_target) const {
     vk::Image image;
+    if (render_target && !dedicated && CreateImageInRenderTargetPool(ci, image)) {
+        return image;
+    }
     const VkResult result = AllocateImage(ci, dedicated, true, image);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
@@ -234,8 +238,61 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
     return image;
 }
 
-VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                                        vk::Image &image) const {
+vk::Image MemoryAllocator::TryCreateImageWithinBudget(const VkImageCreateInfo& ci,
+                                                       bool render_target) const {
+    vk::Image image;
+    if (render_target && CreateImageInRenderTargetPool(ci, image)) {
+        return image;
+    }
+    const VkResult result = AllocateImage(ci, false, true, image, true);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return image;
+}
+
+vk::Image MemoryAllocator::CreateOptionalImage(const VkImageCreateInfo& ci) const {
+    vk::Image image;
+    const VkResult result = AllocateImage(ci, true, true, image, true);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return image;
+}
+
+vk::Buffer MemoryAllocator::CreateOptionalDownloadBuffer(const VkBufferCreateInfo& ci) const {
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags =
+            VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(MemoryUsage::Download),
+        .usage = MemoryUsageVma(MemoryUsage::Download),
+        .preferredFlags = MemoryUsagePreferredVmaFlags(MemoryUsage::Download),
+        .memoryTypeBits = valid_memory_types,
+    };
+    VkBuffer handle{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo alloc_info{};
+    const VkResult result =
+        vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        return {};
+    }
+    vk::Check(result);
+    VkMemoryPropertyFlags property_flags{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+    u8* data = static_cast<u8*>(alloc_info.pMappedData);
+    const std::span<u8> mapped = data ? std::span<u8>{data, ci.size} : std::span<u8>{};
+    const vk::MemoryLocation location{
+        .memory = alloc_info.deviceMemory,
+        .offset = alloc_info.offset,
+        .memory_type = alloc_info.memoryType,
+    };
+    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped,
+                      (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0, location,
+                      device.GetDispatchLoader());
+}
+
+VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo& ci, bool dedicated, bool may_fail,
+                                        vk::Image& image, bool optional_budget) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -270,6 +327,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const bool huge = IsTooLargeToBack(texels, bytes);
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (optional_budget && result != VK_SUCCESS) {
+        return result;
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -442,6 +502,51 @@ void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
         vmaFreeMemory(allocator, allocation);
     }
+}
+
+bool MemoryAllocator::CreateImageInRenderTargetPool(const VkImageCreateInfo& ci,
+                                                    vk::Image& image) const {
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                                                       VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT),
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = 0,
+        .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.f,
+    };
+    u32 memory_type{};
+    {
+        std::scoped_lock lk{buffer_type_mutex};
+        const std::array<u32, 5> key{static_cast<u32>(ci.imageType), static_cast<u32>(ci.format),
+                                     static_cast<u32>(ci.samples), static_cast<u32>(ci.usage),
+                                     static_cast<u32>(ci.flags)};
+        if (const auto it = image_memory_types.find(key); it != image_memory_types.end()) {
+            memory_type = it->second;
+        } else if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &memory_type) ==
+                   VK_SUCCESS) {
+            image_memory_types.emplace(key, memory_type);
+        } else {
+            return false;
+        }
+    }
+    const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::RenderTargets, memory_type);
+    if (pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.pool = pool;
+    VkImage handle{};
+    VmaAllocation allocation{};
+    // Over the budget, or the pool has no room: the usual path has the fallbacks for that.
+    if (vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                      device.GetDispatchLoader());
+    return true;
 }
 
 bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,

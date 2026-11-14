@@ -9,7 +9,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -20,16 +22,21 @@
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/evicted_pointer_slots.h"
+#include "video_core/draw_delta.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/evicted_pointer_slots.h"
+#include "video_core/nx2_cfg.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/graphics_stage_info.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
+#include "video_core/renderer_vulkan/pipeline_destroy_timing.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vulkan_common/vulkan_pipeline_handles.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -57,6 +64,17 @@ struct GraphicsPipelineCacheKey {
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_copyable_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_constructible_v<GraphicsPipelineCacheKey>);
+
+/// EDEN_NX2_CFG_LOOKUP: a digest of what GraphicsPipelineCacheKey::operator== compares first: the
+/// six shader hashes and the first 16 bytes of the fixed state (raw1, raw2 and the color formats,
+/// inside every FixedPipelineState::Size()). Keys that compare equal have equal digests, so a
+/// differing digest proves that two keys differ.
+[[nodiscard]] inline u64 TransitionDigest(const GraphicsPipelineCacheKey& key) noexcept {
+    // The smallest Size() ends at the blending attachments; operator== compares unique_hashes and
+    // then Size() bytes of the state.
+    static_assert(offsetof(FixedPipelineState, attachments) >= 2 * sizeof(u64));
+    return VideoCommon::Cfg::KeyDigest(key);
+}
 
 } // namespace Vulkan
 
@@ -118,7 +136,8 @@ struct KeptGraphicsStages {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
     std::array<std::vector<u8>, NUM_STAGES> spirv; ///< zstd, empty for absent stages
-    std::array<std::unique_ptr<Shader::Info>, NUM_STAGES> infos;
+    /// Shared with the pipelines whose stages translated the same way (GraphicsStageInfoPool)
+    GraphicsStageInfos infos;
     std::optional<MeshEmulationSetup> mesh_emulation;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
 
@@ -133,19 +152,52 @@ public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
-        VideoCore::ShaderNotify* shader_notify,
-        const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue,
+        VideoCore::ShaderNotify* shader_notify, const Device& device,
+        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
         DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        GraphicsStageInfos infos,
         std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+
+    /// The stage infos a pipeline of `pipeline_key` keeps for the stages its programs translated
+    /// to (`infos`, null for absent stages), from `pool`: shared with every pipeline whose stage
+    /// translated the same way.
+    [[nodiscard]] static GraphicsStageInfos InternStageInfos(
+        GraphicsStageInfoPool& pool, const GraphicsPipelineCacheKey& pipeline_key,
+        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+
+    /// Call only after shader jobs and all GPU uses have completed. Release build captures while
+    /// their scheduler, caches and guest memory are alive; only handles may outlive the renderer.
+    PipelineHandles TakeHandles();
+    PipelineOrigin destroy_origin{PipelineOrigin::Evicted};
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
     /// Draws resolved from the texture memo and in full since the last call.
     static std::pair<u64, u64> TakeTextureMemoCounts() noexcept;
+
+    struct CpuMemory {
+        size_t count{};
+        size_t object{};
+        size_t transitions{};
+        size_t descriptors{};
+        size_t allocator{};
+        size_t helper_spirv{};
+        size_t kept_spirv{}; ///< zstd SPIR-V kept for a rebuild after eviction
+
+        void Add(const CpuMemory& other) {
+            count += other.count;
+            object += other.object;
+            transitions += other.transitions;
+            descriptors += other.descriptors;
+            allocator += other.allocator;
+            helper_spirv += other.helper_spirv;
+            kept_spirv += other.kept_spirv;
+        }
+    };
+    /// Called only after builds, draws and command workers have released the pipeline.
+    CpuMemory RetainedCpuMemory() const;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     u64 DynamicAttributeTypes() const noexcept { return key.state.attribute_types; }
@@ -197,7 +249,7 @@ public:
 
     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
-        return stage_infos[0].is_task || stage_infos[0].is_mesh;
+        return stage_infos[0]->is_task || stage_infos[0]->is_mesh;
     }
 
     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
@@ -269,9 +321,11 @@ public:
         if (key == current_key) {
             return this;
         }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        if (VideoCommon::Cfg::g_lookup) {
+            return NextByDigest(current_key);
+        }
+        const auto it = std::ranges::find(transitions, current_key, &Transition::key);
+        return it != transitions.end() ? it->pipeline : nullptr;
     }
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
@@ -305,8 +359,8 @@ public:
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
-        transition_keys.clear();
         transitions.clear();
+        transition_digests.clear();
     }
 
     [[nodiscard]] bool WritesStorage() const noexcept {
@@ -395,9 +449,44 @@ public:
         return delta_mismatch;
     }
 
+    /// Reevaluate handles (including storage-backed programs), then compare TIC/TSC contents.
+    [[nodiscard]] VideoCommon::DrawDeltaTextureResult CheckDrawDeltaTextures();
+
+    /// EDEN_NX2_DRAW_REUSE: what the handles of the stages are computed from (constant buffer
+    /// slots, storage bindings), and the stages the last captured Configure resolved.
+    [[nodiscard]] const VideoCommon::DrawHandleInputs& DeltaHandleInputs() const noexcept {
+        return delta_handle_inputs;
+    }
+    [[nodiscard]] const std::array<bool, NUM_STAGES>& ConfiguredStages() const noexcept {
+        return configured_stages;
+    }
+
+    /// EDEN_NX2_DRAW_REUSE: evaluates the handles again (as Configure does) and compares them with
+    /// the ones the last captured Configure resolved; texture and sampler headers are not read
+    /// (the delta chain breaks on anything that writes them). BackedOff: the pipeline's recent
+    /// checks kept failing, so this one was skipped (DeltaCheckBackoff).
+    enum class DeltaHandleCheck : u8 { Held, Changed, BackedOff };
+    [[nodiscard]] DeltaHandleCheck CheckDeltaHandles();
+
     /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
+
+    /// EDEN_NX2_DRAWX_TWIN: whether a delta draw with this pipeline may keep what a resolve with
+    /// `other` kept: the same configure specialization (stages), no delta blocker, and per stage
+    /// the same interned stage info (GraphicsStageInfoPool shares an info only between programs
+    /// whose retained properties, descriptors and handle programs all match) or, on both sides,
+    /// one without texture, image, texture buffer or image buffer descriptors: such a stage adds
+    /// no view, sampler, handle, image descriptor or rescaling bit to what a resolve keeps, and a
+    /// delta draw binds its uniform and storage buffers from this pipeline's own infos.
+    /// EDEN_NX2_DRAWX_TWIN2: or a stage whose image descriptors (and the handle programs they use,
+    /// with the storage bindings those read) are the same; `by_descriptors` (optional) tells
+    /// whether a stage needed that.
+    [[nodiscard]] bool KeepsImageStateOf(const GraphicsPipeline& other,
+                                         bool* by_descriptors = nullptr) const noexcept;
+    /// EDEN_NX2_DRAWX_TWIN: takes what the last captured resolve of `source` (KeepsImageStateOf)
+    /// kept for delta draws: views, samplers, image descriptors, rescaling words, handles.
+    void TakeDeltaState(const GraphicsPipeline& source);
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
@@ -414,6 +503,10 @@ private:
     bool ConfigureImpl(bool is_indexed);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
+
+    /// The handles of the configured stages from current memory, in Configure's order, into
+    /// draw_delta_handles.
+    void EvaluateDeltaHandles();
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -436,8 +529,18 @@ private:
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
-    std::vector<GraphicsPipelineCacheKey> transition_keys;
-    std::vector<GraphicsPipeline*> transitions;
+    struct Transition {
+        GraphicsPipelineCacheKey key;
+        GraphicsPipeline* pipeline;
+    };
+    std::vector<Transition> transitions;
+    /// EDEN_NX2_CFG_LOOKUP: TransitionDigest of each transition's key, in the same order. A search
+    /// reads these 8-byte words instead of one ~600-byte Transition per entry.
+    std::vector<u64> transition_digests;
+
+    /// EDEN_NX2_CFG_LOOKUP: Next past the own key; the first transition whose key equals.
+    [[nodiscard]] GraphicsPipeline* NextByDigest(
+        const GraphicsPipelineCacheKey& current_key) noexcept;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};
@@ -445,8 +548,11 @@ private:
     std::array<std::vector<u32>, NUM_STAGES> spirv; ///< Until the build makes its modules
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
     std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
+    /// zstd, after the build: the mesh emulation's vertex and distribution SPIR-V, which the build
+    /// releases from mesh_emulation (TakeKeptStages puts them back)
+    std::array<std::vector<u8>, 2> kept_mesh_spirv;
 
-    std::array<Shader::Info, NUM_STAGES> stage_infos;
+    GraphicsStageInfos stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
@@ -464,6 +570,15 @@ private:
 
     DeltaBlocker delta_blocker{};
     bool delta_views_valid{};
+    VideoCommon::DrawDeltaTextures<Tegra::Texture::TICEntry, Tegra::Texture::TSCEntry>
+        draw_delta_textures;
+    std::vector<std::pair<u32, u32>> draw_delta_handles;
+    /// EDEN_NX2_DRAW_REUSE: the handles the last captured Configure resolved, what they are
+    /// computed from, and the back-off for pipelines whose handles keep changing.
+    std::vector<std::pair<u32, u32>> delta_handles;
+    bool delta_handles_valid{};
+    VideoCommon::DrawHandleInputs delta_handle_inputs;
+    VideoCommon::DeltaCheckBackoff delta_check_backoff;
     bool capture_delta{};
     bool verify_delta{};
     bool delta_mismatch{};
@@ -480,7 +595,7 @@ private:
     std::vector<VideoCommon::SamplerId> delta_samplers;
     /// A descriptor whose handles the captured Configure computed at draw time: the descriptor
     /// (stage, kind as ComputedHandleKind, index in its list) and its elements' values, count of
-    /// them from delta_computed_values[first_value].
+    /// them from delta_computed_values[first_value] (none where a read failed: the null texture).
     struct ComputedHandle {
         u8 stage;
         u8 kind;
@@ -490,7 +605,7 @@ private:
     };
     enum ComputedHandleKind : u8 { TextureBuffer, ImageBuffer, Texture, Image };
     std::vector<ComputedHandle> delta_computed_handles;
-    std::vector<u32> delta_computed_values;
+    std::vector<std::optional<u32>> delta_computed_values;
     /// Delta draws: the image descriptor entries (first entry and count per
     /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
     /// image changed its scale (TextureCache::ScaleEpoch).

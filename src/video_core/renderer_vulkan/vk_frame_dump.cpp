@@ -31,6 +31,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 
@@ -695,7 +697,8 @@ void FrameDump::Drain() {
     if (readbacks.empty()) {
         return;
     }
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
         const Target& target = readback.target;

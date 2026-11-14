@@ -30,6 +30,8 @@
 #undef __declspec
 #endif
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 namespace {
 constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -230,7 +232,9 @@ void Fsr4Upscaler::DestroyContext() {
     if (context == nullptr) {
         return;
     }
-    scheduler.Finish(); // recorded dispatches may still use it
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+        scheduler.Finish();
+    }); // recorded dispatches may still use it
     ffxContext ctx = context;
     api->destroy_context(&ctx, nullptr);
     context = nullptr;
@@ -319,7 +323,9 @@ void Fsr4Upscaler::CreateExposure() {
 
 void Fsr4Upscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
-        scheduler.Finish(); // the old output may still be in use
+        VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse, [&] {
+            scheduler.Finish();
+        }); // the old output may still be in use
     }
     output_image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,

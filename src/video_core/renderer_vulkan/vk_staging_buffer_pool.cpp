@@ -95,8 +95,11 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
         .pNext = nullptr,
         .flags = 0,
         .size = stream_buffer_size + STREAM_BUFFER_TAIL,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        // Transfer destination too: GPU-written list words are copied over their placeholders
+        // in the constant buffers streamed here (Nx2ListSlots::PatchUniform).
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -290,6 +293,31 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
         }
     }
     return bytes;
+}
+
+void StagingBufferPool::LogMemoryTrace() {
+    LOG_INFO(Render_Vulkan, "Memory trace: staging stream {} MiB",
+             stream_buffer.AllocationSize() >> 20);
+    for (const auto usage :
+         {MemoryUsage::Upload, MemoryUsage::Download, MemoryUsage::DeviceLocal}) {
+        u64 allocated{};
+        u64 busy{};
+        u64 deferred_bytes{};
+        u64 count{};
+        for (const auto& level : GetCache(usage)) {
+            for (const auto& entry : level.entries) {
+                const u64 bytes = entry.buffer.AllocationSize();
+                allocated += bytes;
+                busy += !scheduler.IsFree(entry.tick) ? bytes : 0;
+                deferred_bytes += entry.deferred ? bytes : 0;
+                ++count;
+            }
+        }
+        LOG_INFO(
+            Render_Vulkan,
+            "Memory trace: staging kind {} count {} allocated {} MiB busy {} MiB deferred {} MiB",
+            static_cast<u32>(usage), count, allocated >> 20, busy >> 20, deferred_bytes >> 20);
+    }
 }
 
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {

@@ -492,6 +492,13 @@ public:
     void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
 
     /**
+     * The GPU wrote [begin, begin + size) of device memory without copying it back at a fence:
+     * a core whose read area (the range its last reactive flush found nothing more to flush in)
+     * overlaps it asks the caches again at its next read there.
+     */
+    void InvalidateReadAreas(u64 device_begin, u64 size);
+
+    /**
      * Marks each page within the specified address range as debug or non-debug.
      * Debug addresses are not accessible from fastmem pointers.
      *

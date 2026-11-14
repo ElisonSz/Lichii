@@ -30,6 +30,8 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_protect.h"
+#include "video_core/nx2_sem_recorder.h"
 
 namespace Core {
 
@@ -355,6 +357,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
             continue;
         }
+        VideoCommon::SemRecorder::RemapHostPage(address + i * Memory::LICHII_PAGESIZE, ptr);
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::LICHII_PAGEBITS) + 1U;
         tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
         InsertCPUBacking(start_page_d + i, new_vaddress, asid);
@@ -891,6 +894,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
+    // EDEN_NX2_PROTECT_STATS: single ranges are the texture and shader caches' (the buffer
+    // cache's tracker passes batches).
+    const VideoCommon::Nx2Protect::TrackerScope tracker{VideoCommon::Nx2Protect::Tracker::Single};
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
 }
@@ -959,6 +965,8 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
+    const auto InvalidateReadAreas = &DeviceMemoryManager<Traits>::DeviceMethods::InvalidateReadAreas;
+    Memory::Memory* invalidated_inter = nullptr;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;
     u64 run_pages = 0;
@@ -978,6 +986,11 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
             continue;
         }
         auto* const inter = registered_processes[asid.id];
+        if (inter != nullptr && inter != invalidated_inter) {
+            // The read areas are device ranges: the whole write's, once per process.
+            InvalidateReadAreas(inter, addr, size);
+            invalidated_inter = inter;
+        }
         if (inter != run_inter || vpage != run_begin + run_pages) {
             release_run();
             run_inter = inter;

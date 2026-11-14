@@ -12,6 +12,7 @@
 #include "common/dynamic_library.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_base.h"
+#include "video_core/teardown_timing.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
@@ -120,29 +121,39 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Tegra::GPU& gpu;
 
-    std::shared_ptr<Common::DynamicLibrary> library;
-    vk::InstanceDispatch dld;
-#ifdef EGLANTINE_STREAMLINE
-    bool streamline_started; ///< NVIDIA Streamline starts before the instance.
-#endif
+    VideoCommon::TeardownClock teardown_clock;
+    VideoCommon::TeardownMarker teardown_library{teardown_clock, "driver owner handoff or join"};
+    struct DriverOwner;
+    struct DriverOwnerDeleter {
+        void operator()(DriverOwner* owner) const;
+    };
+    static DriverOwner* CreateDriverOwner(Core::Frontend::EmuWindow& window,
+                                          Core::Frontend::GraphicsContext* graphics_context);
+    std::unique_ptr<DriverOwner, DriverOwnerDeleter> driver_owner;
+    std::shared_ptr<Common::DynamicLibrary>& library;
+    vk::InstanceDispatch& dld;
 
     // Keep original handles for compatibility with existing code
-    vk::Instance instance;
-
-    vk::DebugUtilsMessenger debug_messenger;
-
-    vk::SurfaceKHR surface;
-
-    Device device;
-    MemoryAllocator memory_allocator;
+    vk::Instance& instance;
+    vk::DebugUtilsMessenger& debug_messenger;
+    vk::SurfaceKHR& surface;
+    Device& device;
+    VideoCommon::TeardownMarker teardown_memory{teardown_clock, "renderer state"};
+    MemoryAllocator& memory_allocator;
     StateTracker state_tracker;
+    VideoCommon::TeardownMarker teardown_scheduler{teardown_clock, "command scheduler"};
     Scheduler scheduler;
+    VideoCommon::TeardownMarker teardown_swapchain{teardown_clock, "swapchain"};
     Swapchain swapchain;
+    VideoCommon::TeardownMarker teardown_present{teardown_clock, "present manager"};
     PresentManager present_manager;
+    VideoCommon::TeardownMarker teardown_blits{teardown_clock, "screen blitters"};
     BlitScreen blit_swapchain;
     BlitScreen blit_capture;
     BlitScreen blit_applet;
+    VideoCommon::TeardownMarker teardown_rasterizer{teardown_clock, "rasterizer"};
     RasterizerVulkan rasterizer;
+    VideoCommon::TeardownMarker teardown_tail{teardown_clock, "applet frame, turbo and frame gen"};
 #ifdef HAS_LSFG
     FrameGen frame_gen;
 #endif

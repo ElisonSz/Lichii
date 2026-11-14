@@ -16,6 +16,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#include "video_core/wait_stats.h"
+
 namespace Vulkan {
 
 namespace {
@@ -677,7 +679,8 @@ void PostProcessChain::PrepareImages(const Device& device, Scheduler& scheduler)
             }
         }
     });
-    scheduler.Finish();
+    VideoCommon::WaitStats::WithReason(VideoCommon::WaitStats::Reason::ResourceReuse,
+                                       [&] { scheduler.Finish(); });
 
     m_images_ready = true;
 }

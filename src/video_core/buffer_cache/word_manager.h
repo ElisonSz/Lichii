@@ -20,7 +20,9 @@
 #include "common/div_ceil.h"
 #include "common/logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memtrack_translation.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_protect.h"
 
 namespace VideoCommon {
 
@@ -34,7 +36,19 @@ enum class Type {
     CachedCPU,
     Untracked,
     Preflushable,
+    /// EDEN_NX2_PROTECT_INLINE: uploaded in place (BufferCache::WriteGpuMemoryInPlace) since an
+    /// upload scan last covered the page. Only that switch sets it; nothing else reads it.
+    InPlace,
     Max
+};
+
+/// EDEN_NX2_PROTECT_INLINE: whether the pages of a range can take an in-place upload of the GPU
+/// thread's own writes (WordManager::CheckInPlace), or what stops them.
+enum class InPlaceCheck {
+    Clean,     ///< tracked (protected), nothing to upload or download, no in-place upload since a scan
+    Untracked, ///< a page is CPU-modified, cached-CPU-written or untracked
+    GpuState,  ///< a page holds GPU-written or preflushable data
+    Uploaded,  ///< a page was uploaded in place and no upload scan covered it since
 };
 
 /// Page untracking a thread applies itself once it drops the buffer cache's lock
@@ -47,7 +61,8 @@ public:
     using Ranges = std::vector<std::pair<VAddr, size_t>>;
     using Apply = void (*)(void* tracker, std::span<const std::pair<VAddr, size_t>>, s32 delta);
 
-    void Add(void* tracker, Apply apply, const Ranges& ranges, s32 delta) {
+    void Add(void* tracker, Apply apply, std::span<const std::pair<VAddr, size_t>> ranges,
+             s32 delta) {
         batches.push_back(Batch{tracker, apply, delta, collected.size(), ranges.size()});
         collected.insert(collected.end(), ranges.begin(), ranges.end());
     }
@@ -183,6 +198,38 @@ struct WordManager {
     /// @param dirty_addr    Base address to mark or unmark as modified
     /// @param size          Size in bytes to mark or unmark as modified
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
+        if (MemTrack::g_word) {
+            // CPU invalidations commonly touch only a few constant-buffer bytes. One page has
+            // at most one protection transition, so no range vector/sort/coalesce is needed.
+            const u64 local = dirty_addr - cpu_addr;
+            if (type == Type::CPU && enable && size != 0 && local < size_bytes &&
+                (cpu_addr & (BYTES_PER_PAGE - 1)) == 0 && size <= size_bytes - local &&
+                size <= BYTES_PER_PAGE - (local & (BYTES_PER_PAGE - 1))) {
+                const auto [index, page] = GetWordPage(local);
+                const u64 mask = u64{1} << page;
+                auto cpu_words = Span(Type::CPU);
+                auto untracked_words = Span(Type::Untracked);
+                auto cached_words = Span(Type::CachedCPU);
+                const bool changed = (untracked_words[index] & mask) == 0;
+                cpu_words[index] |= mask;
+                untracked_words[index] |= mask;
+                cached_words[index] &= ~mask;
+                NoteCleanWord(index);
+                if (changed) {
+                    const std::pair<VAddr, size_t> range{
+                        Common::AlignDown(dirty_addr, BYTES_PER_PAGE),
+                        static_cast<size_t>(BYTES_PER_PAGE)};
+                    const std::span<const std::pair<VAddr, size_t>> runs{&range, 1};
+                    // Untracking: a thread deferring its page caching applies it after the lock.
+                    if (t_deferred_page_caching != nullptr) {
+                        t_deferred_page_caching->Add(tracker, &ApplyDeferredRuns, runs, -1);
+                    } else {
+                        tracker->UpdatePagesCachedBatch(runs, -1);
+                    }
+                }
+                return;
+            }
+        }
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -275,8 +322,54 @@ struct WordManager {
             release();
         }
         if (!ranges.empty()) {
+            // EDEN_NX2_PROTECT_STATS: an upload scan tracks (protects) these pages again.
+            const Nx2Protect::SourceScope source{Nx2Protect::Source::Rearm};
+            if (Nx2Protect::g_stats) [[unlikely]] {
+                Nx2Protect::NoteRearm(ranges);
+            }
             ApplyCollectedRanges(ranges, 1);
         }
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE: InPlaceCheck::Clean when no page of [offset, offset + size) is
+    /// CPU-modified, cached-CPU-written, untracked, GPU-modified, preflushable or uploaded in place
+    /// since the last upload scan over it.
+    [[nodiscard]] InPlaceCheck CheckInPlace(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> gpu_words = Span(Type::GPU);
+        const std::span<const u64> cached_words = Span(Type::CachedCPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        const std::span<const u64> preflushable_words = Span(Type::Preflushable);
+        const std::span<const u64> in_place_words = Span(Type::InPlace);
+        InPlaceCheck result = InPlaceCheck::Clean;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (((cpu_words[index] | cached_words[index] | untracked_words[index]) & mask) != 0) {
+                result = InPlaceCheck::Untracked;
+                return true;
+            }
+            if (((gpu_words[index] | preflushable_words[index]) & mask) != 0) {
+                result = InPlaceCheck::GpuState;
+                return true;
+            }
+            if ((in_place_words[index] & mask) != 0) {
+                result = InPlaceCheck::Uploaded;
+                return true;
+            }
+            return false;
+        });
+        return result;
+    }
+
+    /// EDEN_NX2_PROTECT_INLINE: sets or clears the InPlace bits of the pages of the range.
+    void SetInPlace(u64 offset, u64 size, bool in_place) noexcept {
+        const std::span<u64> in_place_words = Span(Type::InPlace);
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (in_place) {
+                in_place_words[index] |= mask;
+            } else {
+                in_place_words[index] &= ~mask;
+            }
+        });
     }
 
     /// @brief Returns true when a region has been modified
@@ -352,6 +445,12 @@ struct WordManager {
         });
     }
 
+    /// DeferredPageCaching's apply: the tracker hears of the runs once the thread applies them.
+    static void ApplyDeferredRuns(void* deferred_tracker,
+                                  std::span<const std::pair<VAddr, size_t>> runs, s32 run_delta) {
+        static_cast<DeviceTracker*>(deferred_tracker)->UpdatePagesCachedBatch(runs, run_delta);
+    }
+
     void ApplyCollectedRanges(CollectedRanges& ranges, int delta) const {
         if (ranges.empty())
             return;
@@ -361,14 +460,7 @@ struct WordManager {
             if (t_deferred_page_caching != nullptr) {
                 ASSERT_MSG(delta < 0, "deferred page caching was asked to track pages");
                 if (delta < 0) {
-                    t_deferred_page_caching->Add(
-                        tracker,
-                        [](void* deferred_tracker, std::span<const std::pair<VAddr, size_t>> runs,
-                           s32 run_delta) {
-                            static_cast<DeviceTracker*>(deferred_tracker)
-                                ->UpdatePagesCachedBatch(runs, run_delta);
-                        },
-                        ranges, delta);
+                    t_deferred_page_caching->Add(tracker, &ApplyDeferredRuns, ranges, delta);
                     ranges.clear();
                     return;
                 }

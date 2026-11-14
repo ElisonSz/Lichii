@@ -133,7 +133,8 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     }
 }
 
-[[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
+template <typename Info>
+[[nodiscard]] inline u32 NumDescriptorEntries(const Info& info) {
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
            Shader::NumDescriptors(info.texture_buffer_descriptors) +
@@ -297,7 +298,8 @@ public:
         offset += sizeof(DescriptorUpdateEntry);
     }
 
-    void Add(const Shader::Info& info, VkShaderStageFlags stage) {
+    template <typename Info>
+    void Add(const Info& info, VkShaderStageFlags stage) {
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
 
@@ -407,9 +409,10 @@ public:
            VideoCore::Surface::IsPixelFormatETC2(format);
 }
 
+template <typename Info>
 inline void PushImageDescriptors(TextureCache& texture_cache,
-                                 GuestDescriptorQueue& guest_descriptor_queue,
-                                 const Shader::Info& info, RescalingPushConstant& rescaling,
+                                 GuestDescriptorQueue& guest_descriptor_queue, const Info& info,
+                                 RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);

@@ -123,6 +123,8 @@ struct ShaderJobStats {
     /// Over the CPU stages that reported their size: their estimates and the reported sizes.
     u64 estimated_cpu_bytes{};
     u64 reported_cpu_bytes{};
+    /// Most Background stages running at once
+    u64 peak_background_stages{};
 };
 
 struct ShaderJobConfig {
@@ -133,6 +135,11 @@ struct ShaderJobConfig {
     /// A Background job queued this long takes every other pick from the Soon jobs submitted
     /// after it.
     std::chrono::nanoseconds background_aging{std::chrono::seconds{2}};
+    /// At most this many Background stages run at once, CPU and driver stages together (0: no
+    /// limit). Low priority keeps background builds off a busy logical core, but not off its SMT
+    /// sibling or the shared cache, so a limit leaves the other cores to the emulator's threads
+    /// and keeps workers free for NeedNow and Soon stages.
+    size_t max_background_stages{};
     /// Worker threads are named <name>Cpu and <name>Driver.
     std::string name{"ShaderJobs"};
 };
@@ -191,9 +198,12 @@ private:
     void Finish(ShaderJobState& job, ShaderJobStatus status, std::vector<ShaderJob>& dead);
     void ReleaseBytes(ShaderJobState& job);
     void WakeHeldWorkers();
+    bool BackgroundStageAllowed(bool driver);
+    void EndStage(ShaderJobState& job);
 
     const u64 budget;
     const std::chrono::nanoseconds background_aging;
+    const size_t max_background_stages;
 
     mutable std::mutex mutex;
     std::condition_variable cpu_condition;
@@ -207,6 +217,8 @@ private:
     /// The queue's last Soon or Background pick was an aged Background job ahead of Soon jobs.
     bool cpu_aged_last{};
     bool driver_aged_last{};
+    /// Stages started as Background and still running, counted against max_background_stages
+    size_t background_stages{};
     ShaderJobStats stats;
     std::vector<std::thread> threads;
 };
