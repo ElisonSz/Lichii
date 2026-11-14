@@ -213,12 +213,14 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
                                  vk::ShaderModule spv_module_, u64 shader_hash_,
-                                 std::function<vk::ShaderModule()> emit)
+                                 std::vector<u8> kept_spirv_,
+                                 std::function<vk::ShaderModule(std::vector<u8>&)> emit)
     : device{device_},
       pipeline_cache(pipeline_cache_), binaries{binaries_}, binary_key{binary_key_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      kept_spirv(std::move(kept_spirv_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -377,7 +379,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                     }
                 };
                 try {
-                    spv_module = emit();
+                    spv_module = emit(kept_spirv);
                 } catch (const std::exception& exception) {
                     fail(exception.what());
                     return {};
@@ -723,9 +725,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
-            const auto whiteout_begin = VideoCommon::OotWhiteout::Enabled()
-                                            ? std::chrono::steady_clock::now()
-                                            : std::chrono::steady_clock::time_point{};
+            const auto begin = std::chrono::steady_clock::now();
             if (jobs) {
                 // Raised to NeedNow, and built here unless a driver worker builds it already
                 jobs->RunOrWait(job);
@@ -735,14 +735,22 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             } else {
                 RunBuild();
             }
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            }
+            const auto waited = std::chrono::steady_clock::now() - begin;
             if (VideoCommon::OotWhiteout::Enabled()) {
                 VideoCommon::OotWhiteout::Add(
                     VideoCommon::OotWhiteout::Event::ComputeWait, ShaderHash(),
-                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - whiteout_begin)
-                                         .count()));
+                    static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(waited).count()));
+            }
+            // Every GPU channel waits with the dispatch, so long waits are freezes.
+            if (waited > std::chrono::milliseconds{50}) {
+                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}",
+                         std::chrono::duration<double, std::milli>(waited).count(), shader_hash);
             }
         });
     }

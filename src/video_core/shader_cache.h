@@ -10,6 +10,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
@@ -44,6 +45,20 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+};
+
+/// A program of the current draw or dispatch, read back from GPU memory for a frame dump.
+struct CapturedProgram {
+    /// Maxwell program slot, or 6 for compute
+    u32 slot{};
+    u64 unique_hash{};
+    /// NativeProgramKey of a native program, 0 for a guest Maxwell program
+    u64 native_key{};
+    GPUVAddr address{};
+    /// The 128-byte header of a native graphics program, empty otherwise (a Maxwell program's
+    /// header is the start of its code)
+    std::vector<u8> header;
+    std::vector<u8> code;
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
@@ -88,6 +103,13 @@ public:
     /// them again (and fails); after an un-reject, forgets every rejection so they are retried.
     /// Runs on the thread that owns the cache, between frames.
     void RefreshDebugRejections(bool unrejected);
+
+    /// The programs of the current draw, for the stages with a hash in unique_hashes (the
+    /// pipeline's, after RefreshStages). On the thread that owns the cache, for frame dumps.
+    [[nodiscard]] std::vector<CapturedProgram> CaptureGraphicsPrograms(
+        const std::array<u64, NUM_PROGRAMS>& unique_hashes) const;
+    /// The program of the dispatch about to run, or nothing when it is not cached.
+    [[nodiscard]] std::optional<CapturedProgram> CaptureComputeProgram() const;
 
 protected:
     struct GraphicsEnvironments {

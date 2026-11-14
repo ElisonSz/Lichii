@@ -7,6 +7,7 @@
 #pragma once
 
 #include <chrono>
+#include <filesystem>
 #include <algorithm>
 #include <string>
 #include <type_traits>
@@ -149,6 +150,13 @@ void Start();
 
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
+
+/// Writes buffered lines to the log file, so a copy of it is complete.
+void Flush();
+
+/// The file this session logs to (eden_log.txt, or eden_log_2.txt when that one was busy); empty
+/// without a file log. The previous session's log is this path plus ".old.txt".
+[[nodiscard]] std::filesystem::path FilePath();
 
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);

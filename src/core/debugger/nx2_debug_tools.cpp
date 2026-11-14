@@ -25,6 +25,7 @@
 #include "common/stb.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/debugger/nx2_bug_bundle.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
@@ -162,11 +163,11 @@ bool IsVulkan() {
 
 /// Waits for a future in short slices so a stopping server does not wait out the timeout.
 template <typename T>
-bool WaitReady(const ToolState& state, std::future<T>& future, std::chrono::milliseconds timeout) {
+bool WaitReady(const std::atomic<bool>& stop, std::future<T>& future,
+               std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (future.wait_for(50ms) != std::future_status::ready) {
-        if (state.stopping.load(std::memory_order_relaxed) ||
-            std::chrono::steady_clock::now() >= deadline) {
+        if (stop.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
     }
@@ -234,7 +235,8 @@ json FrameTimes(ToolState& state, const json& params) {
 
 } // Anonymous namespace
 
-json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refresh_hz) {
+json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refresh_hz,
+                    size_t recent_limit) {
     const u64 capacity = g_nx2_present_times_ns.size();
     bool truncated = after < before || after - before > capacity;
     const u64 first = (std::max)(before + 1, after > capacity ? after - capacity + 1 : u64{1});
@@ -259,7 +261,8 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
 
     std::ranges::reverse(intervals);
     json recent = json::array();
-    for (size_t i = intervals.size() > 120 ? intervals.size() - 120 : 0; i < intervals.size(); ++i) {
+    for (size_t i = intervals.size() > recent_limit ? intervals.size() - recent_limit : 0;
+         i < intervals.size(); ++i) {
         recent.push_back(std::round(intervals[i] * 10.0) / 10.0);
     }
     std::ranges::sort(intervals);
@@ -297,28 +300,30 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
             {"min_ms", frames == 0 ? 0.0 : intervals.front()},
             {"vsync_buckets", {{"1", share(0)}, {"2", share(1)}, {"3", share(2)}, {"4+", share(3)}}},
             {"stutters", stutters},
+            {"longest_ms", json(std::vector<double>(intervals.rbegin(),
+                                                    intervals.rbegin() +
+                                                        static_cast<std::ptrdiff_t>(
+                                                            (std::min<size_t>)(frames, 10))))},
             {"intervals_ms", std::move(recent)},
             {"truncated", truncated}};
 }
 
-namespace {
 
-json Screenshot(ToolState& state, const json& params) {
-    auto& renderer = state.system.GPU().Renderer();
+Png CaptureScreenshot(System& system, u32 height, std::chrono::seconds timeout,
+                      const std::atomic<bool>& stop) {
+    auto& renderer = system.GPU().Renderer();
     if (renderer.IsScreenshotPending()) {
         throw std::runtime_error{"a screenshot is already pending: no frame was presented since"};
     }
-    const u32 height = Param<u32>(params, "height", 720, 144, 2160);
     const auto layout = Layout::DefaultFrameLayout(height * 16 / 9, height);
     const auto pixels = std::make_shared<std::vector<u8>>(size_t{layout.width} * layout.height * 4);
     const auto done = std::make_shared<std::promise<bool>>();
     auto future = done->get_future();
     renderer.RequestScreenshot(
         pixels->data(), [pixels, done](bool invert_y) { done->set_value(invert_y); }, layout);
-    const int timeout = Param<int>(params, "timeout_s", 5, 1, 30);
-    if (!WaitReady(state, future, std::chrono::seconds{timeout})) {
-        throw std::runtime_error{
-            fmt::format("no frame was presented within {} s (paused or loading?)", timeout)};
+    if (!WaitReady(stop, future, timeout)) {
+        throw std::runtime_error{fmt::format(
+            "no frame was presented within {} s (paused or loading?)", timeout.count())};
     }
     const bool invert_y = future.get();
     std::vector<u8> rgb(size_t{layout.width} * layout.height * 3);
@@ -331,13 +336,23 @@ json Screenshot(ToolState& state, const json& params) {
             target[2] = source[0];
         }
     }
-    std::vector<u8> png;
-    if (!stbi_write_png_to_func(AppendPng, &png, static_cast<int>(layout.width),
+    Png png{.bytes = {}, .width = layout.width, .height = layout.height};
+    if (!stbi_write_png_to_func(AppendPng, &png.bytes, static_cast<int>(layout.width),
                                 static_cast<int>(layout.height), 3, rgb.data(),
                                 static_cast<int>(layout.width * 3))) {
         throw std::runtime_error{"PNG encoding failed"};
     }
-    json result = {{"width", layout.width}, {"height", layout.height}};
+    return png;
+}
+
+namespace {
+
+json Screenshot(ToolState& state, const json& params) {
+    const Png shot = CaptureScreenshot(
+        state.system, Param<u32>(params, "height", 720, 144, 2160),
+        std::chrono::seconds{Param<int>(params, "timeout_s", 5, 1, 30)}, state.stopping);
+    const std::vector<u8>& png = shot.bytes;
+    json result = {{"width", shot.width}, {"height", shot.height}};
     if (params.value("save", false)) {
         std::filesystem::create_directories(state.dump_directory);
         const auto path =
@@ -453,6 +468,28 @@ json CaptureFrame(ToolState& state, const json& params) {
         {"entries", std::move(entries)},
         {"index_command",
          fmt::format("python3 -I tools/nx2/frame_dump_index.py \"{}\"", directory.generic_string())},
+    };
+}
+
+json CaptureBundle(ToolState& state, const json& params) {
+    BugBundle bundle{
+        state.system,
+        {.trigger = "debug_server",
+         .directory = state.dump_directory / "bug-reports",
+         .size_limit = Param<u64>(params, "size_limit_mib", BugBundle::DEFAULT_SIZE_LIMIT >> 20, 1,
+                                  100)
+                       << 20,
+         .capture_timeout = std::chrono::seconds{Param<int>(params, "timeout_s", 90, 5, 600)}}};
+    bundle.Capture(state.stopping);
+    const BugBundle::Result result = bundle.Write(params.value("description", std::string{}));
+    return {
+        {"path", result.path.generic_string()},
+        {"bytes", result.bytes},
+        {"dropped", result.dropped},
+        {"frame_error", result.frame_error},
+        {"manifest", result.manifest},
+        {"index_command", fmt::format("python3 -I tools/nx2/bundle_index.py \"{}\"",
+                                      result.path.generic_string())},
     };
 }
 
@@ -698,6 +735,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_tail", handler(LogTail)},
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
+        {"capture_bundle", handler(CaptureBundle)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
@@ -929,23 +967,14 @@ Service::Service(System& system, std::string title, u64 program_id, const Endpoi
                  std::string dump_directory)
     : state{std::make_shared<ToolState>(system, std::move(title), program_id,
                                         std::move(dump_directory))} {
-    VideoCore::Nx2Debug::BeginSession();
     Common::Log::SetRingCapacity(RING_LINES);
-    try {
-        server = std::make_unique<Server>(endpoint, MakeHandlers(state));
-    } catch (...) {
-        VideoCore::Nx2Debug::EndSession();
-        throw;
-    }
-    g_nx2_present_time_services.fetch_add(1, std::memory_order_relaxed);
+    server = std::make_unique<Server>(endpoint, MakeHandlers(state));
     LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", endpoint.host, server->Port(),
              state->dump_directory.generic_string());
 }
 
 Service::~Service() {
     state->stopping.store(true, std::memory_order_relaxed);
-    g_nx2_present_time_services.fetch_sub(1, std::memory_order_relaxed);
-    VideoCore::Nx2Debug::EndSession();
     server.reset();
 }
 

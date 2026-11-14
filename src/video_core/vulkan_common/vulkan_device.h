@@ -1119,6 +1119,12 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
@@ -1469,6 +1475,7 @@ private:
     u32 counted_local_memory_types{};
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

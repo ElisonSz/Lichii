@@ -238,6 +238,8 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
 
     struct OverlapResult {
         boost::container::small_vector<BufferId, 16> ids;
+        /// Large buffers that only touch the range: deleted, not joined
+        boost::container::small_vector<BufferId, 2> cut;
         DAddr begin;
         DAddr end;
         bool has_stream_leap = false;
@@ -1343,6 +1345,8 @@ private:
     std::array<std::array<Cfg::TranslationMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_translations{};
     u64 frame_tick = 0;
+    /// Buffers created since the last TickFrame; ResolveOverlaps does not cut these
+    std::vector<BufferId> frame_created_buffers;
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;

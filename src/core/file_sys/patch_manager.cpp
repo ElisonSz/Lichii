@@ -152,6 +152,44 @@ constexpr std::array<u8, 148> WATER_STEPS_ROUTINE{
     0x00, 0x38, 0x21, 0x1E, 0x01, 0x10, 0x3C, 0x1E, 0x00, 0x48, 0x21, 0x1E, 0x60, 0x09, 0x00,
     0xBD, 0xC0, 0x03, 0x5F, 0xD6, 0xE8, 0x03, 0x1F, 0x2A, 0xC0, 0x03, 0x5F, 0xD6,
 };
+// The game's sound engine assumes at least one whole 60 fps step per update: its fade and delay
+// timers and parameter ramps count updates from the step it is given each frame. Below a whole
+// step (FPS Unlock above 60 fps) some sounds are never released when an area unloads; they pile
+// up until the game's voice budget is full, and then most new sounds and the music stop until a
+// restart (#716, #1092). So above 60 fps FPS Unlock runs the sound manager job (main+0x415300,
+// phase in w2; phase 0 reads the step and updates the engine, phase 1 follows) at 60 Hz: its entry
+// goes to SOUND_GATE, which in phase 0 adds the step to an accumulator (timer state + 0xA0) and
+// runs the job only once a whole step has built up, else returns; the other phases follow that
+// frame's decision (flag at state + 0xA4). At 60 fps and below it runs every frame as before. The
+// job's step load (main+0x415334) goes to SOUND_FEED, max(step, 1.0), so the engine always gets
+// whole steps and sound still follows real time.
+constexpr std::array<u8, 4> SOUND_ENTRY_ORIGINAL{0x7F, 0x23, 0x03, 0xD5}; // pacibsp
+constexpr std::array<u8, 4> SOUND_ENTRY_BRANCH{0x40, 0xC5, 0xE0, 0x14};   // b main+0x3C46800
+constexpr std::array<u8, 4> SOUND_STEP_ORIGINAL{0x00, 0x11, 0x40, 0xBD};  // ldr s0, [x8, #0x10]
+constexpr std::array<u8, 4> SOUND_STEP_CALL{0xD3, 0xC3, 0xE0, 0x94};      // bl main+0x3C46280
+// adrp x16, state ; add x16, x16, #0xea0 ; cbnz w2, other ; adrp x9, time ; ldr x9, [x9, #0x890] ;
+// ldr x9, [x9] ; ldr s16, [x9, #0x10] ; fmov s17, #1.0 ; fcmp s16, s17 ; b.ge every_frame ;
+// ldr s18, [x16] ; fadd s18, s18, s16 ; fcmp s18, s17 ; b.lt wait ; fsub s18, s18, s17 ;
+// str s18, [x16] ; mov w9, #1 ; str w9, [x16, #4] ; b run ;
+// wait: str s18, [x16] ; str wzr, [x16, #4] ; ret ;
+// every_frame: nop (a remainder built up below a whole step carries over) ; mov w9, #1 ;
+// str w9, [x16, #4] ; b run ;
+// other: ldr w9, [x16, #4] ; cbz w9, skip ; run: pacibsp ; b main+0x415304 ; skip: ret
+// x9, x16 and s16-s18 are free at the job's entry.
+constexpr std::array<u8, 124> SOUND_GATE{
+    0xD0, 0x92, 0x00, 0xB0, 0x10, 0x82, 0x3A, 0x91, 0x02, 0x03, 0x00, 0x35, 0xC9, 0x81, 0x00, 0x90,
+    0x29, 0x49, 0x44, 0xF9, 0x29, 0x01, 0x40, 0xF9, 0x30, 0x11, 0x40, 0xBD, 0x11, 0x10, 0x2E, 0x1E,
+    0x00, 0x22, 0x31, 0x1E, 0xAA, 0x01, 0x00, 0x54, 0x12, 0x02, 0x40, 0xBD, 0x52, 0x2A, 0x30, 0x1E,
+    0x40, 0x22, 0x31, 0x1E, 0xCB, 0x00, 0x00, 0x54, 0x52, 0x3A, 0x31, 0x1E, 0x12, 0x02, 0x00, 0xBD,
+    0x29, 0x00, 0x80, 0x52, 0x09, 0x06, 0x00, 0xB9, 0x0A, 0x00, 0x00, 0x14, 0x12, 0x02, 0x00, 0xBD,
+    0x1F, 0x06, 0x00, 0xB9, 0xC0, 0x03, 0x5F, 0xD6, 0x1F, 0x20, 0x03, 0xD5, 0x29, 0x00, 0x80, 0x52,
+    0x09, 0x06, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x14, 0x09, 0x06, 0x40, 0xB9, 0x69, 0x00, 0x00, 0x34,
+    0x7F, 0x23, 0x03, 0xD5, 0xA4, 0x3A, 0x1F, 0x17, 0xC0, 0x03, 0x5F, 0xD6,
+};
+// ldr s0, [x8, #0x10] ; fmov s16, #1.0 ; fmaxnm s0, s0, s16 ; ret
+constexpr std::array<u8, 16> SOUND_FEED{
+    0x00, 0x11, 0x40, 0xBD, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
+};
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
@@ -165,6 +203,10 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
     BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
     BuiltinPatchRecord{0x3C46300, WATER_STEPS_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x415300, SOUND_ENTRY_BRANCH, SOUND_ENTRY_ORIGINAL},
+    BuiltinPatchRecord{0x415334, SOUND_STEP_CALL, SOUND_STEP_ORIGINAL},
+    BuiltinPatchRecord{0x3C46800, SOUND_GATE, {}, true},
+    BuiltinPatchRecord{0x3C46280, SOUND_FEED, {}, true},
 };
 
 constexpr std::array BUILTIN_PATCHES{
@@ -195,7 +237,8 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
         .state_offset = 0x4E9FE00,
-        .state_size = 0x98,
+        // Timer state at 0, the sound gate's accumulator and flag at 0xA0.
+        .state_size = 0xA8,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
     BuiltinPatch{

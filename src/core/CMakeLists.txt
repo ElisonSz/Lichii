@@ -45,10 +45,14 @@ add_library(core STATIC
     debugger/gdbstub.h
     debugger/gdbstub_arch.cpp
     debugger/gdbstub_arch.h
+    debugger/nx2_bug_bundle.cpp
+    debugger/nx2_bug_bundle.h
     debugger/nx2_debug_server.cpp
     debugger/nx2_debug_server.h
     debugger/nx2_debug_tools.cpp
     debugger/nx2_debug_tools.h
+    debugger/nx2_zip.cpp
+    debugger/nx2_zip.h
     device_memory.cpp
     device_memory.h
     device_memory_manager.h

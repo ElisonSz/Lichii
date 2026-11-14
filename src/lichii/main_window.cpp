@@ -48,6 +48,7 @@
 #include "lichii/recommended_settings_dialog.h"
 #include "lichii/shader_warm_dialog.h"
 #include "lichii/whats_new_dialog.h"
+#include "lichii/bug_report_dialog.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #ifdef LICHII_NX_TOOLS
 #include "core/file_sys/registered_cache.h"
@@ -114,6 +115,7 @@
 
 #include "qt_common/util/content.h"
 #include "qt_common/util/fs.h"
+#include "qt_common/util/game.h"
 #include "qt_common/util/meta.h"
 #include "qt_common/util/mod.h"
 #include "qt_common/util/path.h"
@@ -1387,6 +1389,7 @@ void MainWindow::InitializeHotkeys() {
                        QStringLiteral("Toggle Performance Overlay"));
     LinkActionShortcut(ui->action_Fullscreen, QStringLiteral("Fullscreen"));
     LinkActionShortcut(ui->action_Capture_Screenshot, QStringLiteral("Capture Screenshot"));
+    LinkActionShortcut(ui->action_Report_Bug, QStringLiteral("Report a Bug"));
     LinkActionShortcut(ui->action_TAS_Start, QStringLiteral("TAS Start/Stop"), true);
     LinkActionShortcut(ui->action_TAS_Record, QStringLiteral("TAS Record"), true);
     LinkActionShortcut(ui->action_TAS_Reset, QStringLiteral("TAS Reset"), true);
@@ -1730,6 +1733,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Desktop, &MainWindow::OnCreateHomeMenuDesktopShortcut);
     connect_menu(ui->action_Application_Menu, &MainWindow::OnCreateHomeMenuApplicationMenuShortcut);
     connect_menu(ui->action_Capture_Screenshot, &MainWindow::OnCaptureScreenshot);
+    connect_menu(ui->action_Report_Bug, &MainWindow::OnReportBug);
 
     // TAS
     connect_menu(ui->action_TAS_Start, &MainWindow::OnTasStartStop);
@@ -1852,6 +1856,7 @@ void MainWindow::UpdateMenuState() {
     }
 
     ui->action_Capture_Screenshot->setEnabled(emulation_running && !is_paused);
+    ui->action_Report_Bug->setEnabled(emulation_running && !is_paused);
 
     if (emulation_running && is_paused) {
         ui->action_Pause->setText(tr("&Continue"));
@@ -2436,6 +2441,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             std::filesystem::path{Common::U16StringFromBuffer(filename.utf16(), filename.size())}
                 .filename());
     }
+    // The name the user gave the game in Properties wins, as in the library.
+    if (auto custom_title = QtCommon::Game::ReadCustomTitle(title_id); !custom_title.empty()) {
+        title_name = std::move(custom_title);
+    }
     const bool is_64bit = QtCommon::system->Kernel().ApplicationProcess()->Is64Bit();
     const auto instruction_set_suffix = is_64bit ? tr("(64-bit)") : tr("(32-bit)");
     title_name = tr("%1 %2", "%1 is the title name. %2 indicates if the title is 64-bit or 32-bit")
@@ -2588,6 +2597,9 @@ void MainWindow::OnEmulationStopped() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         return;
     }
+    if (bug_report_dialog) {
+        bug_report_dialog->StopCapture();
+    }
     shutdown_timer.stop();
     emu_terminate_timer.stop();
     if (QtCommon::emu_thread) {
@@ -2679,6 +2691,9 @@ void MainWindow::ShutdownGame() {
         return;
     }
 
+    if (bug_report_dialog) {
+        bug_report_dialog->StopCapture();
+    }
     // TODO(crueter): make this common as well (frontend_common?)
     play_time_manager->Stop();
     OnShutdownBegin();
@@ -4229,7 +4244,22 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
 
     const auto result = dialog.exec();
 
+    // A rename only changes the shown name: no rescan of the library.
+    if (const auto renamed = dialog.RenamedTitle()) {
+        game_list->SetGameTitle(title_id, *renamed);
+    }
+    // The running game shows the new name in the window title too, also when the custom name was
+    // removed from a game that has no name of its own to show in the library.
+    if (dialog.TitleChanged() && emulation_running && title_id != 0 &&
+        title_id == QtCommon::system->GetApplicationProcessProgramID()) {
+        OnApplicationChanged(title_id);
+    }
+
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied) {
+        // Artwork saved before a failed save of the rest stays saved after Cancel: show it.
+        if (UISettings::values.is_game_list_reload_pending.exchange(false)) {
+            OnGameListRefresh();
+        }
         Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
         return;
     } else if (result == QDialog::Accepted) {
@@ -5103,6 +5133,16 @@ void MainWindow::OnCaptureScreenshot() {
     render_window->CaptureScreenshot(filename);
 }
 
+void MainWindow::OnReportBug() {
+    if (bug_report_dialog || QtCommon::emu_thread == nullptr || !QtCommon::emu_thread->IsRunning()) {
+        return;
+    }
+    BugReportDialog dialog(*QtCommon::system, this);
+    bug_report_dialog = &dialog;
+    dialog.exec();
+    bug_report_dialog = nullptr;
+}
+
 void MainWindow::KeepNextendoSessionAlive() {
     if (!Common::Nextendo::OnlinePlayActive() || nextendo_session_watcher.isRunning()) {
         return;
@@ -5167,11 +5207,22 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
     std::string title_name;
     std::string title_version;
 
+    // The loader's name stays when the game has no control metadata (a NUP without an installed
+    // control record), as on boot.
+    if (QtCommon::system->GetGameName(title_name) != Loader::ResultStatus::Success) {
+        title_name.clear();
+    }
+
     const FileSys::PatchManager pm(program_id, QtCommon::system->GetFileSystemController(),
                                    QtCommon::system->GetContentProvider());
     if (const auto metadata = pm.GetControlMetadata(); metadata.first != nullptr) {
         title_version = metadata.first->GetVersionString();
-        title_name = metadata.first->GetApplicationName();
+        if (auto metadata_name = metadata.first->GetApplicationName(); !metadata_name.empty()) {
+            title_name = std::move(metadata_name);
+        }
+    }
+    if (auto custom_title = QtCommon::Game::ReadCustomTitle(program_id); !custom_title.empty()) {
+        title_name = std::move(custom_title);
     }
     if (title_name.empty()) {
         title_name = fmt::format("{:016X}", program_id);

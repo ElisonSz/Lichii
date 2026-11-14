@@ -269,7 +269,7 @@ jobs:
       - name: Check the shipped programs carry a version resource
         run: |
           for exe in lichii eden-cli lichii-updater; do
-            if ! "$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe" | grep -q 'Type: VERSIONINFO'; then
+            if ! grep -q 'Type: VERSIONINFO' <<< "$("$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe")"; then
               echo "::error::$exe.exe has no version resource"
               exit 1
             fi

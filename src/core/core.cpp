@@ -81,6 +81,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -90,7 +91,6 @@ namespace Core {
 std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
-std::atomic<u32> g_nx2_present_time_services{};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -594,12 +594,14 @@ struct System::Impl {
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
         }
+        VideoCore::Nx2Debug::BeginSession();
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        VideoCore::Nx2Debug::EndSession();
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();

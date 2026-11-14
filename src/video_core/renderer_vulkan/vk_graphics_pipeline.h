@@ -113,8 +113,9 @@ inline bool DrawReuseProbeEnabled() {
 struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
-    u32 block_words{};    ///< output words per mesh workgroup
-    u32 max_primitives{}; ///< triangles per mesh workgroup
+    u32 block_words{};          ///< output words per mesh workgroup
+    u32 max_primitives{};       ///< primitives per mesh workgroup
+    u32 primitive_vertices{3};  ///< vertices per primitive: 1 points, 2 lines, 3 triangles
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -203,6 +204,13 @@ public:
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
+    const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
+    }
+    /// Each stage's SPIR-V (zstd), kept once the pipeline is built; empty for absent stages.
+    const std::array<std::vector<u8>, NUM_STAGES>& KeptSpirv() const noexcept {
+        return kept_spirv;
+    }
 
     struct SampledImage {
         u32 stage;
@@ -254,9 +262,10 @@ public:
         return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
     }
 
-    /// Vertices of the emulation's triangle list for one mesh workgroup.
+    /// Vertices of the emulation's point, line or triangle list for one mesh workgroup.
     [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
-        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
+        return mesh_emulation ? mesh_emulation->max_primitives * mesh_emulation->primitive_vertices
+                              : 0;
     }
 
     /// The emulation's setup (output layout), or null.

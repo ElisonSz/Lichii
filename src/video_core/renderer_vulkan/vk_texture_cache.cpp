@@ -247,6 +247,13 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
+    // RGBA8 is 4-16x the BC size: Ocarina of Time's uneven ASTC 8x8 images took ~3.4 GB instead
+    // of ~0.6 GB at area loads on a Steam Deck, where VRAM and system RAM are the same memory and
+    // the load peaks got the emulator killed. Integrated GPUs and cards under 6 GiB keep BC.
+    using namespace Common::Literals;
+    if (device.IsIntegrated() || device.GetDeviceLocalHeapSize() < 6_GiB) {
+        return false;
+    }
     return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
 }
 

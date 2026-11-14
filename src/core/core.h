@@ -120,10 +120,9 @@ namespace Core {
 
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
-/// Steady-clock time of each guest present, by present count; written only while the debug
-/// server runs (g_nx2_present_time_services: debug services alive), for its frame_times tool.
+/// Steady-clock time of each guest present, by present count, for the debug server's frame_times
+/// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
-extern std::atomic<u32> g_nx2_present_time_services;
 
 class CpuManager;
 class Debugger;

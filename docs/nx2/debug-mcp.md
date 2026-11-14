@@ -99,9 +99,8 @@ shutdown waits at most about 50 ms for a handler.
 
 Cost when unused: if `EDEN_NX2_DEBUG_SERVER` is unset, `MaybeStartService` returns at its first
 `getenv`. No thread, no socket, no log ring. The per-frame check is one relaxed atomic load,
-and each guest present checks one more relaxed flag: only a running server
-(`g_nx2_present_time_services`, counted by `Service`) makes it store a steady-clock timestamp in the 4096-entry ring
-`frame_times` reads. The runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
+and each guest present stores a steady-clock timestamp in the 4096-entry ring that
+`frame_times` and the bug bundle read. The runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
 server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
@@ -136,6 +135,7 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | `screenshot` | Owner takes and sends a screenshot | PNG of the next presented frame, as MCP image content | 1 |
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
 | `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled textures and bound buffers optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
+| `capture_bundle` | Owner zips logs, settings and screenshots by hand | The Report a Bug bundle: logs, settings, screenshot, frame times and a frame capture with shaders, in one zip | 1 |
 | `reject_shaders` | Rebuild the env, relaunch, replay to the spot, once per bisection step | Reject or restore hashes live; bisection becomes a loop of reject, screenshot | 1 |
 | `pause`, `resume`, `step_frames` | Not possible | Freeze on the broken frame, capture it, step one present | 2 |
 | `input`, `input_sequence` (buttons, sticks, frame-timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro (done) | 2 |
@@ -221,6 +221,15 @@ not list it.
 **`host_timing`** `{stats?}`. Turns the per-second `HostTiming wait` log line
 (`EDEN_NX2_HOSTTIMING_STATS`) on or off and returns the `previous` and current `stats` state.
 Read the lines with `log_tail` (`contains: "HostTiming wait"`).
+
+**`capture_bundle`** `{description?, size_limit_mib?, timeout_s?}` (`index?` in the adapter). It
+writes the bug-report bundle that Help → Report a Bug writes ([bug-bundle.md](bug-bundle.md)):
+logs, system and settings, screenshot, the last 10 s of frame times, and the next frame captured
+with its shaders, SPIR-V and pipeline keys, zipped under `size_limit_mib` (default 19, 1 to 100)
+into `<log dir>/bug-reports`. It waits up to `timeout_s` (default 90) for the frame capture and
+returns `path`, `bytes`, `dropped`, `frame_error`, `manifest` (the bundle's `bundle.json`) and
+`index_command`. In the adapter, `index` runs `bundle_index.py` on the zip and returns its
+`index.html`.
 
 **`reject_shaders`** `{hashes?, reject?, timeout_s?}`. This is `EDEN_NX2_REJECT_HASH` at
 runtime: the same keys (native program key or shader hash) and the same effect. Pipeline

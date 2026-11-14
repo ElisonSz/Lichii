@@ -93,6 +93,8 @@ public slots:
     void SetNupConversionRunning(bool running);
     void SetNxToolRunning(bool running);
     void RefreshGameDirectory();
+    /// Shows a new name for every library entry of the program, without a rescan.
+    void SetGameTitle(u64 program_id, const QString& title);
     void RefreshExternalContent();
     void UpdateIconSizes();
     void OnPopulate();

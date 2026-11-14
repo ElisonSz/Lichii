@@ -122,6 +122,23 @@ TOOLS = [
         },
     },
     {
+        "name": "capture_bundle",
+        "description": "The bug-report bundle the Report a bug hotkey writes (docs/nx2/bug-bundle.md): "
+                       "logs, system and settings, screenshot, frame times, and the next frame's "
+                       "capture with its shaders and pipelines, zipped under size_limit_mib into "
+                       "the log folder's bug-reports. Returns the path, bytes, dropped parts and "
+                       "the manifest. 'index' unpacks it with bundle_index.py and builds index.html.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "size_limit_mib": {"type": "integer", "minimum": 1, "maximum": 100},
+                "timeout_s": {"type": "integer", "minimum": 5, "maximum": 600},
+                "index": {"type": "boolean"},
+            },
+        },
+    },
+    {
         "name": "reject_shaders",
         "description": "EDEN_NX2_REJECT_HASH at runtime: rejects (or with reject=false restores) "
                        "native programs by native program key (shader dump names) or shader hash "
@@ -317,6 +334,8 @@ def default_timeout(name, params):
     """The emulator's own timeout_s default, so the adapter waits at least as long."""
     if name == "capture_frame":
         return 120
+    if name == "capture_bundle":
+        return 90
     if name == "frame_times":
         return math.ceil(params.get("seconds", 5)) + 1
     if name == "sample":
@@ -353,6 +372,8 @@ class Adapter:
             self.captures.add(os.path.realpath(result["directory"]))
             if index:
                 result["index"] = self.build_index(result["directory"])
+        if name == "capture_bundle" and index:
+            result["index"] = self.build_bundle_index(result["path"])
         return result, None
 
     def call_tool(self, name, arguments):
@@ -370,6 +391,14 @@ class Adapter:
         if done.returncode != 0:
             return f"frame_dump_index.py failed: {done.stderr.strip()[-2000:]}"
         return os.path.join(directory, "index.html")
+
+    def build_bundle_index(self, path):
+        script = os.path.join(HERE, "bundle_index.py")
+        done = subprocess.run([sys.executable, "-I", script, path], capture_output=True, text=True,
+                              timeout=600)
+        if done.returncode != 0:
+            return f"bundle_index.py failed: {done.stderr.strip()[-2000:]}"
+        return done.stdout.strip().splitlines()[-1]
 
     def capture_image(self, arguments):
         directory = os.path.realpath(arguments["directory"])

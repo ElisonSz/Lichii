@@ -5,6 +5,7 @@
 
 add_executable(tests
     common/addon_config.cpp
+    common/thread_worker.cpp
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
     video_core/draw_delta.cpp
@@ -31,6 +32,7 @@ add_executable(tests
     core/nx2_video_ready.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
+    core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp

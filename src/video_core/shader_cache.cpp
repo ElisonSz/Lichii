@@ -67,6 +67,70 @@ void ShaderCache::SyncGuestHost() {
     RemovePendingShaders();
 }
 
+namespace {
+
+std::vector<u8> ReadProgramBytes(Tegra::MemoryManager& gpu_memory, GPUVAddr address, size_t size) {
+    std::vector<u8> bytes(size);
+    gpu_memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
+    return bytes;
+}
+
+} // Anonymous namespace
+
+std::vector<CapturedProgram> ShaderCache::CaptureGraphicsPrograms(
+    const std::array<u64, NUM_PROGRAMS>& unique_hashes) const {
+    constexpr size_t native_header_size = 128;
+    std::vector<CapturedProgram> programs;
+    const auto& regs{maxwell3d->regs};
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    for (size_t index = 0; index < NUM_PROGRAMS; ++index) {
+        const ShaderInfo* const info = shader_infos[index];
+        if (unique_hashes[index] == 0 || !info || info->unique_hash != unique_hashes[index]) {
+            continue;
+        }
+        const auto& config{regs.pipelines[index]};
+        const GPUVAddr address{native ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) |
+                                            config.reserved[1]
+                                      : regs.program_region.Address() + config.offset};
+        CapturedProgram program{
+            .slot = static_cast<u32>(index), .unique_hash = info->unique_hash, .address = address};
+        if (const auto& lowered = info->lowered_native) {
+            const size_t size = lowered->source_size;
+            program.native_key = lowered->native_program_key;
+            program.header =
+                ReadProgramBytes(*gpu_memory, address, (std::min)(size, native_header_size));
+            if (size > native_header_size) {
+                program.code = ReadProgramBytes(*gpu_memory, address + native_header_size,
+                                                size - native_header_size);
+            }
+        } else {
+            program.code = ReadProgramBytes(*gpu_memory, address, info->size_bytes);
+        }
+        programs.push_back(std::move(program));
+    }
+    return programs;
+}
+
+std::optional<CapturedProgram> ShaderCache::CaptureComputeProgram() const {
+    const GPUVAddr address{kepler_compute->regs.code_loc.Address() +
+                           kepler_compute->launch_description.program_start};
+    const std::optional<VAddr> cpu_address{gpu_memory->GpuToCpuAddress(address)};
+    const ShaderInfo* const info = cpu_address ? TryGet(*cpu_address) : nullptr;
+    if (!info) {
+        return std::nullopt;
+    }
+    const auto& lowered = info->lowered_native;
+    return CapturedProgram{
+        .slot = static_cast<u32>(NUM_PROGRAMS),
+        .unique_hash = info->unique_hash,
+        .native_key = lowered ? lowered->native_program_key : 0,
+        .address = address,
+        .header = {},
+        .code = ReadProgramBytes(*gpu_memory, address,
+                                 lowered ? lowered->source_size : info->size_bytes),
+    };
+}
+
 void ShaderCache::RefreshDebugRejections(bool unrejected) {
     std::vector<std::pair<VAddr, VAddr>> ranges;
     {

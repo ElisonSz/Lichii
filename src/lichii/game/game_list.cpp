@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <functional>
 #include <utility>
 
 #include <QAbstractItemView>
@@ -365,6 +366,54 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     }
 
     emit PopulatingCompleted();
+}
+
+void GameList::SetGameTitle(u64 program_id, const QString& title) {
+    if (program_id == 0 || title.isEmpty()) {
+        return;
+    }
+    // Favorites are plain copies of a library entry that store their shown text, so they take it
+    // from an updated library entry afterwards.
+    QList<QStandardItem*> copies;
+    QVariant display;
+    QVariant sort;
+    const std::function<void(QStandardItem*)> visit = [&](QStandardItem* parent) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            QStandardItem* item = parent->child(row);
+            if (item->data(GameListItem::TypeRole).value<GameListItemType>() ==
+                GameListItemType::Game) {
+                if (item->data(GameListItemPath::ProgramIdRole).toULongLong() == program_id) {
+                    item->setData(title, GameListItemPath::TitleRole);
+                    // A copy is a plain item: only library entries report the game type.
+                    if (item->type() != static_cast<int>(GameListItemType::Game)) {
+                        copies.append(item);
+                    } else if (!display.isValid()) {
+                        display = item->data(Qt::DisplayRole);
+                        sort = item->data(GameListItem::SortRole);
+                    }
+                }
+            } else {
+                visit(item);
+            }
+        }
+    };
+    visit(item_model->invisibleRootItem());
+    if (display.isValid()) {
+        for (QStandardItem* copy : copies) {
+            copy->setData(display, Qt::DisplayRole);
+            copy->setData(sort, GameListItem::SortRole);
+        }
+    }
+    // A list sorted by name puts the renamed game in its new place. This only reorders the rows
+    // already shown: no rescan.
+    if (display.isValid() || !copies.isEmpty()) {
+        item_model->sort(tree_view->header()->sortIndicatorSection(),
+                         tree_view->header()->sortIndicatorOrder());
+    }
+    // A new name can match the search text, or stop matching it.
+    if (!search_field->filterText().isEmpty()) {
+        OnTextChanged(search_field->filterText());
+    }
 }
 
 void GameList::RefreshGameDirectory() {
